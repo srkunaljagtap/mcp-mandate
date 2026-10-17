@@ -12,6 +12,10 @@ categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 clap.workspace = true
+mcp-mandate-proxy.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

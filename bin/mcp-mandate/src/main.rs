@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use mcp_mandate_proxy::stdio::{self, ServerCommand};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -87,15 +89,85 @@ fn with(path: &Option<PathBuf>) -> String {
         .unwrap_or_default()
 }
 
+// stdout is reserved for protocol traffic (stdio MCP), so every message the
+// program prints goes to stderr.
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    // stdout is reserved for protocol traffic (stdio MCP), so messages go to
-    // stderr.
-    eprintln!(
-        "mcp-mandate: not implemented yet: {}",
-        cli.command.describe()
-    );
-    ExitCode::from(2)
+    match cli.command {
+        // Running without enforcing a policy the user asked for would look
+        // protected while not being so; refuse instead.
+        Command::Run {
+            policy: Some(_), ..
+        } => {
+            eprintln!(
+                "mcp-mandate: --policy isn't enforced yet, so mcp-mandate won't run as if it were"
+            );
+            ExitCode::from(2)
+        }
+        Command::Run {
+            policy: None,
+            server,
+        } => run(server),
+        other => {
+            eprintln!("mcp-mandate: not implemented yet: {}", other.describe());
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `mcp-mandate run`: relays a stdio MCP server until either side ends.
+fn run(server: Vec<OsString>) -> ExitCode {
+    init_logging();
+    let mut parts = server.into_iter();
+    let Some(program) = parts.next() else {
+        unreachable!("clap requires a server command");
+    };
+    let command = ServerCommand {
+        program,
+        args: parts.collect(),
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "couldn't start the async runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match runtime.block_on(stdio::run(&command)) {
+        Ok(code) => code,
+        Err(error) => {
+            tracing::error!(error = %report(&error), "mcp-mandate run failed");
+            1
+        }
+    };
+    // Exit now rather than dropping the runtime: a read of our own stdin may
+    // still be blocked inside it, and the client may never close stdin.
+    std::process::exit(code)
+}
+
+/// Logs go to stderr. `MCP_MANDATE_LOG` sets the level (`debug` shows every
+/// message); the default `info` logs only start, stop and dropped lines.
+fn init_logging() {
+    let filter =
+        EnvFilter::try_from_env("MCP_MANDATE_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_target(false)
+        .init();
+}
+
+/// An error and its causes on one line: "couldn't start `x`: permission denied".
+fn report(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 #[cfg(test)]

@@ -1,0 +1,23 @@
+[package]
+name = "mcp-mandate-proxy"
+description = "Transports for mcp-mandate: relays MCP traffic between agents and servers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+which.workspace = true
+
+# Process-group signals for stopping a server's whole process tree.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[lints]
+workspace = true

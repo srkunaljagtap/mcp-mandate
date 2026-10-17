@@ -7,8 +7,9 @@ Cursor, your own) and the MCP servers they call. Every tool call passes a
 deterministic check before it reaches a server, so an agent that was tricked
 by something it read can't act with your keys.
 
-> **Status: under construction.** v0.1.0 isn't released and nothing is
-> enforced yet. Don't rely on it for protection.
+> **Status: under construction.** v0.1.0 isn't released. `mcp-mandate run`
+> relays a stdio MCP server, but no checks are enforced yet. Don't rely on it
+> for protection.
 
 ## How it works
 
@@ -36,13 +37,26 @@ For each tool call the gate will:
 8. **Redact and label** the response: scrub secrets, mark untrusted output.
 9. **Record** a hash-chained audit entry for every decision.
 
-## Usage (planned)
+## Usage
+
+Working today: relay a local (stdio) MCP server. Messages pass through
+unchanged; lines that aren't JSON-RPC are dropped and logged.
+
+```sh
+mcp-mandate run -- npx -y <mcp-server>
+```
+
+Logs go to stderr, never stdout (stdout carries the MCP traffic). Set
+`MCP_MANDATE_LOG=debug` to log every message, or `warn` for quieter output;
+the default is `info`.
+
+Planned:
 
 ```sh
 # review a server and draft a policy for it
 mcp-mandate scout -- npx -y <mcp-server>
 
-# run it behind the gate
+# run it behind the gate (refused until policies are enforced)
 mcp-mandate run --policy policies/default.toml -- npx -y <mcp-server>
 
 # check that the audit log wasn't tampered with
@@ -72,6 +86,9 @@ command it already runs:
   authentication.
 - **No AI decides what to block.** The gate is plain rules; Scout's LLM
   review is optional and only drafts rules for you to approve.
+- **On Windows, stopping a server stops only the process mcp-mandate
+  started.** On Linux and macOS the server's whole process group is stopped,
+  including anything it launched (such as the `node` process behind `npx`).
 
 ## Build from source
 
@@ -92,9 +109,10 @@ cargo deny check        # licenses, advisories, sources (cargo install cargo-den
 | Path | What it is |
 |---|---|
 | `bin/mcp-mandate` | The `mcp-mandate` command: `run`, `gate`, `scout`, `audit` |
+| `crates/mcp-mandate-proxy` | Transports: relays MCP traffic (stdio today) and runs the server process |
 | `crates/mcp-mandate-scout` | Server review and the optional Claude API client |
 
-More crates (proxy, pinning, policy, taint, audit, identity) arrive as the
+More crates (pinning, policy, taint, audit, identity) arrive as the
 features do.
 
 ## Contributing and security
