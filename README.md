@@ -7,9 +7,9 @@ Cursor, your own) and the MCP servers they call. Every tool call passes a
 deterministic check before it reaches a server, so an agent that was tricked
 by something it read can't act with your keys.
 
-> **Status: under construction.** v0.1.0 isn't released. Pinning and policy
-> checks work for local (stdio) servers; the HTTP gateway, taint tracking,
-> secret redaction and the audit log don't exist yet. Don't rely on it for
+> **Status: under construction.** v0.1.0 isn't released. Pinning, policy,
+> taint tracking and secret redaction work for local (stdio) servers; the
+> HTTP gateway and the audit log don't exist yet. Don't rely on it for
 > protection.
 
 ## How it works
@@ -38,7 +38,8 @@ For each tool call the gate will:
 8. **Redact and label** the response: scrub secrets, mark untrusted output.
 9. **Record** a hash-chained audit entry for every decision.
 
-Steps 2, 3, 4 and 7 work today for stdio servers.
+Steps 2, 3, 4, 5, 7 and 8 work today for stdio servers (step 8 redacts
+secrets, not yet other personal data).
 
 ## Quick start
 
@@ -105,8 +106,22 @@ was hidden or blocked.
   question) are denied unless the policy allows them.
 - **Unknown requests** are denied, so a new protocol feature can't slip
   through unchecked.
+- **Taint.** Once a tool that reads untrusted content answers (a web
+  fetch, an inbox, anything a stranger could have written), or a resource is
+  read, the session is tainted for the rest of its life. Tools that can send
+  data out are then held, so a model hijacked by what it read can't complete
+  an exfiltration. Which tools are which comes from your policy's
+  `reads_untrusted` and `sends_out` labels, or else the tool's pinned
+  `openWorldHint`; a tool that says nothing counts as both.
+- **Secrets.** API keys, tokens, private keys and password assignments are
+  replaced with `[REDACTED: kind]` in everything the server sends (except
+  image and audio data), and a tool call whose arguments carry one is
+  blocked unless its rule sets `allow_secrets = true`. Add your own patterns
+  under `[[secrets.patterns]]`. Personal data such as emails isn't redacted
+  yet.
 - **Modes.** `enforce` (the default) blocks; `observe` logs what would be
-  blocked and lets everything through, for trying a policy on real traffic.
+  blocked, hidden or redacted and lets everything through, for trying a
+  policy on real traffic.
 
 A blocked tool call comes back to the agent as a tool error that says why
 (for example, "Blocked by mcp-mandate: tool `x` changed since it was
@@ -154,6 +169,7 @@ cargo deny check        # licenses, advisories, sources (cargo install cargo-den
 | `crates/mcp-mandate-pin` | Fingerprints and the pins file |
 | `crates/mcp-mandate-policy` | The policy file and argument checks |
 | `crates/mcp-mandate-proxy` | Transports: relays stdio traffic through the gate and runs the server process |
+| `crates/mcp-mandate-taint` | Which tools read untrusted content or send data out; secret detection and redaction |
 | `crates/mcp-mandate-scout` | Server review and the optional Claude API client |
 | `policies/` | Example and shared policies |
 

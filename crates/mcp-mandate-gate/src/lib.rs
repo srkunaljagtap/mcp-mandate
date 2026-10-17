@@ -10,8 +10,14 @@
 //! - Server to client: lists are filtered down to approved items, the
 //!   server's instructions are removed unless approved, and requests the
 //!   server makes (sampling, elicitation) follow the policy.
+//! - Taint: once a tool that reads untrusted content (or a resource) has
+//!   answered, the session is tainted and tools that can send data out are
+//!   held for the rest of the session.
+//! - Secrets: redacted from everything the server sends, and blocked in
+//!   tool-call arguments.
 //!
-//! In observe mode every decision is logged but nothing is blocked or hidden.
+//! In observe mode every decision is logged but nothing is blocked, hidden
+//! or redacted.
 
 pub mod jsonrpc;
 
@@ -19,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 
 use mcp_mandate_pin::{Kind, Pins, Verdict};
 use mcp_mandate_policy::{Action as Rule, Mode, Policy};
+use mcp_mandate_taint::{Labels, SecretDetector, SecretPattern, Traits};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
@@ -53,17 +60,34 @@ enum Reply {
 pub struct Gate {
     policy: Policy,
     pins: Option<Pins>,
+    secrets: SecretDetector,
     /// Client requests whose responses the gate inspects, by id.
-    pending: HashMap<String, String>,
+    pending: HashMap<String, Pending>,
     session: Session,
 }
 
-/// What this session has checked against the pins.
+/// A client request whose response the gate inspects.
+enum Pending {
+    /// `initialize` or a list, checked against the pins.
+    List(String),
+    /// A tool call, whose output may taint the session.
+    ToolCall(String),
+    /// A resource read, whose content may taint the session.
+    ResourceRead,
+}
+
+/// An approved tool.
+struct ToolInfo {
+    /// Its compiled input schema (`None` when it can't be compiled, e.g. it
+    /// needs a remote `$ref`).
+    validator: Option<jsonschema::Validator>,
+    traits: Traits,
+}
+
+/// What this session has checked against the pins, and whether it's tainted.
 #[derive(Default)]
 struct Session {
-    /// Approved tools and their compiled input schema (`None` when the
-    /// schema can't be compiled, e.g. it needs a remote `$ref`).
-    tools: HashMap<String, Option<jsonschema::Validator>>,
+    tools: HashMap<String, ToolInfo>,
     prompts: HashSet<String>,
     resources: HashSet<String>,
     /// Approved resource templates and the fixed URI prefix before their
@@ -71,10 +95,12 @@ struct Session {
     templates: HashMap<String, String>,
     /// Items whose content no longer matches their pin.
     changed: HashSet<(Kind, String)>,
+    /// What tainted the session, once something has. It stays tainted.
+    taint: Option<String>,
 }
 
 impl Session {
-    fn approve(&mut self, kind: Kind, name: &str, item: &Value) {
+    fn approve(&mut self, kind: Kind, name: &str, item: &Value, labels: Labels) {
         self.changed.remove(&(kind, name.to_owned()));
         match kind {
             Kind::Tool => {
@@ -82,8 +108,11 @@ impl Session {
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"}));
-                let validator = jsonschema::validator_for(&schema).ok();
-                self.tools.insert(name.to_owned(), validator);
+                let info = ToolInfo {
+                    validator: jsonschema::validator_for(&schema).ok(),
+                    traits: Traits::of(item, labels),
+                };
+                self.tools.insert(name.to_owned(), info);
             }
             Kind::Prompt => {
                 self.prompts.insert(name.to_owned());
@@ -129,12 +158,27 @@ impl Gate {
     /// A gate enforcing `policy`. Without `pins`, nothing a server offers is
     /// approved.
     pub fn new(policy: Policy, pins: Option<Pins>) -> Self {
+        let custom = policy
+            .secrets
+            .patterns
+            .iter()
+            .map(|(name, regex)| SecretPattern {
+                name: name.clone(),
+                regex: regex.clone(),
+            })
+            .collect();
         Self {
+            secrets: SecretDetector::new(custom),
             policy,
             pins,
             pending: HashMap::new(),
             session: Session::default(),
         }
+    }
+
+    /// What tainted the session, if anything has.
+    pub fn taint(&self) -> Option<&str> {
+        self.session.taint.as_deref()
     }
 
     pub fn mode(&self) -> Mode {
@@ -154,16 +198,16 @@ impl Gate {
     /// Decides what happens to one message from the server.
     pub fn from_server(&mut self, frame: &[u8]) -> Vec<Action> {
         match classify(frame) {
-            Ok(Message::Response { id, .. }) => match self.pending.remove(&id_key(&id)) {
-                Some(method) => self.server_response(frame, &method),
-                None => to_client(frame),
-            },
+            Ok(Message::Response { id, .. }) => {
+                let pending = self.pending.remove(&id_key(&id));
+                self.server_response(frame, pending)
+            }
             Ok(Message::Request { id, method }) => self.server_request(frame, &id, &method),
             Ok(Message::Notification { method }) => {
                 if method.ends_with("/list_changed") {
                     info!(%method, "the server says a list changed; the new list will be checked against the pins");
                 }
-                to_client(frame)
+                self.server_response(frame, None)
             }
             Ok(Message::Batch { len }) => self.batch(len, Action::ToClient(frame.to_vec())),
             Err(error) => drop_line(&error, "server→client", frame),
@@ -185,7 +229,8 @@ impl Gate {
                     let reason = "too many requests are waiting for the server".to_owned();
                     return self.block_client(frame, id, method, reason, Reply::Error);
                 }
-                self.pending.insert(id_key(id), method.to_owned());
+                self.pending
+                    .insert(id_key(id), Pending::List(method.to_owned()));
                 to_server(frame)
             }
             "tools/call" => self.tool_call(frame, id),
@@ -212,17 +257,29 @@ impl Gate {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        match self.check_tool_call(name, &arguments) {
+        let verdict = if self.pending.len() >= MAX_PENDING {
+            Err("too many requests are waiting for the server".to_owned())
+        } else {
+            self.check_tool_call(name, &arguments)
+        };
+        let actions = match verdict {
             Ok(()) => {
                 debug!(tool = name, "allowed a tool call");
                 to_server(frame)
             }
             Err(reason) => self.block_client(frame, id, "tools/call", reason, Reply::ToolError),
+        };
+        // Whatever reaches the server (in observe mode, even a call that
+        // would be blocked) is tracked, so its output can taint the session.
+        if forwards_to_server(&actions) {
+            self.pending
+                .insert(id_key(id), Pending::ToolCall(name.to_owned()));
         }
+        actions
     }
 
     fn check_tool_call(&self, name: &str, arguments: &Value) -> Result<(), String> {
-        let Some(validator) = self.session.tools.get(name) else {
+        let Some(info) = self.session.tools.get(name) else {
             return Err(self.not_verified(Kind::Tool, name));
         };
         let decision = self.policy.for_tool(name);
@@ -235,10 +292,25 @@ impl Gate {
             }
             Rule::Deny => return Err(format!("tool `{name}` is denied by policy")),
         }
+        if let Some(source) = &self.session.taint
+            && info.traits.sends_out
+        {
+            return Err(format!(
+                "this session has read untrusted content ({source}) and tool `{name}` can send data out, so it needs your approval, and approvals aren't supported yet"
+            ));
+        }
         decision
             .check_arguments(arguments)
             .map_err(|problem| format!("tool `{name}`: {problem}"))?;
-        match validator {
+        if self.policy.secrets.block_in_arguments
+            && !decision.allow_secrets
+            && let Some(kind) = self.secrets.find_in_json(arguments)
+        {
+            return Err(format!(
+                "tool `{name}`: its arguments contain what looks like a secret ({kind})"
+            ));
+        }
+        match &info.validator {
             Some(validator) => validator.validate(arguments).map_err(|error| {
                 format!("tool `{name}`: its arguments don't match its schema: {error}")
             }),
@@ -260,12 +332,24 @@ impl Gate {
 
     fn resource_request(&mut self, frame: &[u8], id: &Value, method: &str) -> Vec<Action> {
         let params = params(frame);
-        let reason = match params.get("uri").and_then(Value::as_str) {
-            Some(uri) if self.session.resource_allowed(uri) => return to_server(frame),
-            Some(uri) => self.not_verified(Kind::Resource, uri),
-            None => "the request doesn't name a resource".to_owned(),
+        let actions = match params.get("uri").and_then(Value::as_str) {
+            Some(uri) if self.session.resource_allowed(uri) => to_server(frame),
+            Some(uri) => {
+                let reason = self.not_verified(Kind::Resource, uri);
+                self.block_client(frame, id, method, reason, Reply::Error)
+            }
+            None => {
+                let reason = "the request doesn't name a resource".to_owned();
+                self.block_client(frame, id, method, reason, Reply::Error)
+            }
         };
-        self.block_client(frame, id, method, reason, Reply::Error)
+        if method == "resources/read"
+            && forwards_to_server(&actions)
+            && self.pending.len() < MAX_PENDING
+        {
+            self.pending.insert(id_key(id), Pending::ResourceRead);
+        }
+        actions
     }
 
     /// Why an item can't be used: never pinned, changed, or not yet listed.
@@ -285,25 +369,82 @@ impl Gate {
         }
     }
 
-    fn server_response(&mut self, frame: &[u8], method: &str) -> Vec<Action> {
+    /// Checks a response (or notification) from the server: filters lists,
+    /// records taint, and redacts secrets.
+    fn server_response(&mut self, frame: &[u8], pending: Option<Pending>) -> Vec<Action> {
+        let redact = self.policy.secrets.redact_responses;
+        if pending.is_none() && !redact {
+            return to_client(frame);
+        }
         let Ok(mut message) = serde_json::from_slice::<Value>(frame) else {
             return to_client(frame);
         };
-        let modified = match method {
-            "initialize" => self.check_initialize(&mut message),
-            "tools/list" => self.filter_list(&mut message, Kind::Tool),
-            "prompts/list" => self.filter_list(&mut message, Kind::Prompt),
-            "resources/list" => self.filter_list(&mut message, Kind::Resource),
-            "resources/templates/list" => self.filter_list(&mut message, Kind::ResourceTemplate),
-            _ => false,
+        let mut modified = match pending {
+            Some(Pending::List(method)) => match method.as_str() {
+                "initialize" => self.check_initialize(&mut message),
+                "tools/list" => self.filter_list(&mut message, Kind::Tool),
+                "prompts/list" => self.filter_list(&mut message, Kind::Prompt),
+                "resources/list" => self.filter_list(&mut message, Kind::Resource),
+                "resources/templates/list" => {
+                    self.filter_list(&mut message, Kind::ResourceTemplate)
+                }
+                _ => false,
+            },
+            Some(Pending::ToolCall(tool)) => {
+                // A tool that's no longer approved counts as untrusted.
+                let reads_untrusted = self
+                    .session
+                    .tools
+                    .get(&tool)
+                    .is_none_or(|info| info.traits.reads_untrusted);
+                if reads_untrusted {
+                    self.mark_tainted(format!("the output of tool `{tool}`"));
+                }
+                false
+            }
+            Some(Pending::ResourceRead) => {
+                if self.policy.taint.resources_are_untrusted {
+                    self.mark_tainted("a resource from the server".to_owned());
+                }
+                false
+            }
+            None => false,
         };
-        // The only place the gate rewrites a message: everything else is
+        if redact {
+            modified |= self.redact(&mut message);
+        }
+        // The only places the gate rewrites a message: everything else is
         // forwarded byte for byte.
         if modified {
             vec![Action::ToClient(encode(&message))]
         } else {
             to_client(frame)
         }
+    }
+
+    /// Taints the session (once; it stays tainted).
+    fn mark_tainted(&mut self, source: String) {
+        if self.session.taint.is_none() {
+            warn!(%source, "the session read untrusted content: tools that can send data out are now held");
+            self.session.taint = Some(source);
+        }
+    }
+
+    /// Redacts secrets anywhere in `message` (in observe mode, only logs
+    /// them). Returns whether the message changed.
+    fn redact(&self, message: &mut Value) -> bool {
+        if self.observe() {
+            if let Some(kind) = self.secrets.find_in_json(message) {
+                warn!(%kind, "would redact a secret from a server message (observe mode)");
+            }
+            return false;
+        }
+        let kinds = self.secrets.redact_json(message);
+        if kinds.is_empty() {
+            return false;
+        }
+        warn!(?kinds, "redacted secrets from a server message");
+        true
     }
 
     /// Logs the negotiated protocol and removes unapproved instructions.
@@ -380,8 +521,13 @@ impl Gate {
             .map_or(Verdict::Unknown, |pins| pins.check(kind, name, item));
         match verdict {
             Verdict::Approved => {
-                self.session.approve(kind, name, item);
-                if kind == Kind::Tool && self.policy.for_tool(name).action == Rule::Deny {
+                let decision = self.policy.for_tool(name);
+                let labels = Labels {
+                    reads_untrusted: decision.reads_untrusted,
+                    sends_out: decision.sends_out,
+                };
+                self.session.approve(kind, name, item, labels);
+                if kind == Kind::Tool && decision.action == Rule::Deny {
                     debug!(item = name, "{hide} a tool the policy denies");
                     return false;
                 }
@@ -485,6 +631,10 @@ fn drop_line(error: &ParseError, direction: &str, frame: &[u8]) -> Vec<Action> {
 
 fn to_server(frame: &[u8]) -> Vec<Action> {
     vec![Action::ToServer(frame.to_vec())]
+}
+
+fn forwards_to_server(actions: &[Action]) -> bool {
+    matches!(actions, [Action::ToServer(_)])
 }
 
 fn to_client(frame: &[u8]) -> Vec<Action> {

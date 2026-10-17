@@ -12,8 +12,16 @@
 //! action = "allow"
 //! no_shell_metacharacters = ["message"]
 //!
+//! [[tools]]
+//! match = "send_*"
+//! sends_out = true               # held once the session is tainted
+//!
 //! [server_requests]
 //! sampling = "deny"
+//!
+//! [secrets]
+//! redact_responses = true
+//! block_in_arguments = true
 //! ```
 //!
 //! When several rules match a tool, the most restrictive action wins
@@ -109,10 +117,80 @@ struct PolicyFile {
     /// Requests mcp-mandate doesn't know how to check.
     #[serde(default = "deny")]
     unknown_requests: Action,
+    #[serde(default)]
+    secrets: SecretsFile,
+    #[serde(default)]
+    taint: Taint,
 }
 
 fn deny() -> Action {
     Action::Deny
+}
+
+/// Combines two optional answers, keeping whichever is set when only one is.
+fn either(
+    current: Option<bool>,
+    rule: Option<bool>,
+    combine: fn(bool, bool) -> bool,
+) -> Option<bool> {
+    match (current, rule) {
+        (Some(current), Some(rule)) => Some(combine(current, rule)),
+        (current, None) => current,
+        (None, rule) => rule,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct SecretsFile {
+    redact_responses: bool,
+    block_in_arguments: bool,
+    patterns: Vec<SecretPatternFile>,
+}
+
+impl Default for SecretsFile {
+    fn default() -> Self {
+        Self {
+            redact_responses: true,
+            block_in_arguments: true,
+            patterns: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretPatternFile {
+    name: String,
+    regex: String,
+}
+
+/// How secrets (API keys, tokens, private keys) are handled.
+#[derive(Debug, Clone)]
+pub struct Secrets {
+    /// Replace secrets in what servers send with `[REDACTED: kind]`.
+    pub redact_responses: bool,
+    /// Block tool calls whose arguments carry a secret (unless the tool's
+    /// rule sets `allow_secrets`).
+    pub block_in_arguments: bool,
+    /// Extra patterns, as (name, compiled regex), on top of the built-in ones.
+    pub patterns: Vec<(String, regex::Regex)>,
+}
+
+/// What taints a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Taint {
+    /// Reading a server's resources (`resources/read`) taints the session.
+    pub resources_are_untrusted: bool,
+}
+
+impl Default for Taint {
+    fn default() -> Self {
+        Self {
+            resources_are_untrusted: true,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -124,6 +202,9 @@ struct ToolRuleFile {
     max_argument_bytes: Option<usize>,
     #[serde(default)]
     no_shell_metacharacters: Vec<String>,
+    reads_untrusted: Option<bool>,
+    sends_out: Option<bool>,
+    allow_secrets: Option<bool>,
 }
 
 struct ToolRule {
@@ -132,6 +213,9 @@ struct ToolRule {
     action: Option<Action>,
     max_argument_bytes: Option<usize>,
     no_shell_metacharacters: Vec<String>,
+    reads_untrusted: Option<bool>,
+    sends_out: Option<bool>,
+    allow_secrets: Option<bool>,
 }
 
 /// A loaded, checked policy.
@@ -142,6 +226,8 @@ pub struct Policy {
     pub defaults: Defaults,
     pub server_requests: ServerRequests,
     pub unknown_requests: Action,
+    pub secrets: Secrets,
+    pub taint: Taint,
     rules: Vec<ToolRule>,
 }
 
@@ -165,6 +251,12 @@ pub enum PolicyError {
         #[source]
         source: globset::Error,
     },
+    #[error("secret pattern `{name}` isn't a valid regular expression")]
+    SecretPattern {
+        name: String,
+        #[source]
+        source: regex::Error,
+    },
 }
 
 /// What the policy says about one tool.
@@ -174,6 +266,12 @@ pub struct ToolDecision {
     pub max_argument_bytes: usize,
     /// Arguments whose string values may not contain shell metacharacters.
     pub no_shell_metacharacters: BTreeSet<String>,
+    /// Taint labels; `None` when no rule says (the tool's own annotations
+    /// then decide).
+    pub reads_untrusted: Option<bool>,
+    pub sends_out: Option<bool>,
+    /// Whether calls may carry secrets in their arguments.
+    pub allow_secrets: bool,
     /// The patterns of the rules that matched, for logs.
     pub matched: Vec<String>,
 }
@@ -224,7 +322,24 @@ impl Policy {
                     action: rule.action,
                     max_argument_bytes: rule.max_argument_bytes,
                     no_shell_metacharacters: rule.no_shell_metacharacters,
+                    reads_untrusted: rule.reads_untrusted,
+                    sends_out: rule.sends_out,
+                    allow_secrets: rule.allow_secrets,
                 })
+            })
+            .collect::<Result<_, PolicyError>>()?;
+        let patterns = file
+            .secrets
+            .patterns
+            .into_iter()
+            .map(|pattern| {
+                let regex = regex::Regex::new(&pattern.regex).map_err(|source| {
+                    PolicyError::SecretPattern {
+                        name: pattern.name.clone(),
+                        source,
+                    }
+                })?;
+                Ok((pattern.name, regex))
             })
             .collect::<Result<_, PolicyError>>()?;
         Ok(Self {
@@ -233,6 +348,12 @@ impl Policy {
             defaults: file.defaults,
             server_requests: file.server_requests,
             unknown_requests: file.unknown_requests,
+            secrets: Secrets {
+                redact_responses: file.secrets.redact_responses,
+                block_in_arguments: file.secrets.block_in_arguments,
+                patterns,
+            },
+            taint: file.taint,
             rules,
         })
     }
@@ -244,8 +365,12 @@ impl Policy {
             action: self.defaults.tools,
             max_argument_bytes: self.defaults.max_argument_bytes,
             no_shell_metacharacters: BTreeSet::new(),
+            reads_untrusted: None,
+            sends_out: None,
+            allow_secrets: false,
             matched: Vec::new(),
         };
+        let mut allow_secrets: Option<bool> = None;
         for rule in self.rules.iter().filter(|rule| rule.matcher.is_match(tool)) {
             decision.matched.push(rule.pattern.clone());
             if let Some(rule_action) = rule.action {
@@ -257,10 +382,18 @@ impl Policy {
             decision
                 .no_shell_metacharacters
                 .extend(rule.no_shell_metacharacters.iter().cloned());
+            // For taint labels "yes" is the strict answer; for secrets, "no".
+            decision.reads_untrusted =
+                either(decision.reads_untrusted, rule.reads_untrusted, |a, b| {
+                    a || b
+                });
+            decision.sends_out = either(decision.sends_out, rule.sends_out, |a, b| a || b);
+            allow_secrets = either(allow_secrets, rule.allow_secrets, |a, b| a && b);
         }
         if let Some(action) = action {
             decision.action = action;
         }
+        decision.allow_secrets = allow_secrets.unwrap_or(false);
         decision
     }
 }
@@ -318,6 +451,63 @@ mod tests {
         assert_eq!(policy.server_requests.roots, Action::Allow);
         assert_eq!(policy.unknown_requests, Action::Deny);
         assert_eq!(policy.pins, None);
+        assert!(policy.secrets.redact_responses);
+        assert!(policy.secrets.block_in_arguments);
+        assert!(policy.taint.resources_are_untrusted);
+        let decision = policy.for_tool("anything");
+        assert_eq!((decision.reads_untrusted, decision.sends_out), (None, None));
+        assert!(!decision.allow_secrets);
+    }
+
+    #[test]
+    fn taint_labels_and_secret_permission_take_the_strict_answer() {
+        let policy = policy(
+            r#"
+            [[tools]]
+            match = "*"
+            sends_out = false
+            allow_secrets = true
+
+            [[tools]]
+            match = "send_*"
+            sends_out = true
+
+            [[tools]]
+            match = "deploy"
+            allow_secrets = true
+
+            [[tools]]
+            match = "d*"
+            allow_secrets = false
+            "#,
+        );
+        assert_eq!(policy.for_tool("read_file").sends_out, Some(false));
+        assert_eq!(policy.for_tool("send_email").sends_out, Some(true));
+        assert!(policy.for_tool("read_file").allow_secrets);
+        assert!(!policy.for_tool("deploy").allow_secrets);
+    }
+
+    #[test]
+    fn compiles_custom_secret_patterns_and_rejects_bad_ones() {
+        let policy = policy(
+            r#"
+            [[secrets.patterns]]
+            name = "internal-token"
+            regex = "itk_[a-z0-9]{16}"
+            "#,
+        );
+        assert_eq!(policy.secrets.patterns[0].0, "internal-token");
+        assert!(
+            policy.secrets.patterns[0]
+                .1
+                .is_match("itk_0123456789abcdef")
+        );
+
+        let broken = Policy::parse(
+            "[[secrets.patterns]]\nname = \"x\"\nregex = \"(\"\n",
+            Path::new("."),
+        );
+        assert!(matches!(broken, Err(PolicyError::SecretPattern { .. })));
     }
 
     #[test]

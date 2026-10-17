@@ -51,3 +51,37 @@ sampling = "deny"
 elicitation = "deny"
 # The server asks which folders it may work in.
 roots = "allow"
+
+# --- Taint and secrets -------------------------------------------------------
+
+# Labels for taint tracking (examples). Once a tool that reads untrusted
+# content has answered, tools that can send data out are held for the rest
+# of the session. Without a label, the tool's pinned `openWorldHint`
+# decides, and a tool that says nothing counts as both.
+[[tools]]
+match = "fetch_*"
+reads_untrusted = true
+
+[[tools]]
+match = "send_*"
+sends_out = true
+
+[[tools]]
+# This tool's arguments may contain a secret (e.g. it stores a deploy token).
+match = "set_deploy_token"
+allow_secrets = true
+
+[secrets]
+# Replace secrets in what the server sends with [REDACTED: kind].
+redact_responses = true
+# Block tool calls whose arguments carry a secret (unless allow_secrets).
+block_in_arguments = true
+
+# Your own secret shapes, on top of the built-in ones (example).
+[[secrets.patterns]]
+name = "internal-token"
+regex = "itk_[a-z0-9]{32}"
+
+[taint]
+# Reading a server's resources taints the session.
+resources_are_untrusted = true

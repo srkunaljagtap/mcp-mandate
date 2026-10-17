@@ -1044,6 +1044,7 @@ dependencies = [
  "jsonschema",
  "mcp-mandate-pin",
  "mcp-mandate-policy",
+ "mcp-mandate-taint",
  "serde",
  "serde_json",
  "thiserror",
@@ -1066,6 +1067,7 @@ name = "mcp-mandate-policy"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "regex",
  "serde",
  "serde_json",
  "thiserror",
@@ -1095,6 +1097,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "mcp-mandate-taint"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde_json",
 ]
 
 [[package]]

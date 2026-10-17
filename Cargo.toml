@@ -18,6 +18,7 @@ mcp-mandate-gate = { path = "crates/mcp-mandate-gate", version = "0.1.0" }
 mcp-mandate-pin = { path = "crates/mcp-mandate-pin", version = "0.1.0" }
 mcp-mandate-policy = { path = "crates/mcp-mandate-policy", version = "0.1.0" }
 mcp-mandate-proxy = { path = "crates/mcp-mandate-proxy", version = "0.1.0" }
+mcp-mandate-taint = { path = "crates/mcp-mandate-taint", version = "0.1.0" }
 mcp-mandate-scout = { path = "crates/mcp-mandate-scout", version = "0.1.0" }
 
 anyhow = "1.0.104"
@@ -27,6 +28,7 @@ globset = "0.4.20"
 # No default features: they would let a server's schema `$ref` make the gate
 # fetch URLs or read local files.
 jsonschema = { version = "0.59.0", default-features = false }
+regex = "1.13.1"
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
