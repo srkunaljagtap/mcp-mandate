@@ -6,3 +6,7 @@
 
 # Per-machine Claude Code settings (permission approvals)
 .claude/settings.local.json
+
+# Local-only working notes (not for GitHub)
+CLAUDE.md
+notes/

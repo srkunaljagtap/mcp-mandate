@@ -1,4 +1,19 @@
-//! Core building blocks for the agent.
+//! Core building blocks for the agent: the Claude API client, request and
+//! response types, and errors.
+
+mod client;
+mod error;
+mod types;
+
+// Re-export so callers write `agent_core::Client`, not
+// `agent_core::client::Client`. The module layout stays private and free to
+// change.
+pub use client::Client;
+pub use error::Error;
+pub use types::{
+    ContentBlock, Effort, Message, MessagesRequest, MessagesResponse, OutputConfig, Role,
+    StopReason, Usage,
+};
 
 /// This crate's version, baked in at compile time from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

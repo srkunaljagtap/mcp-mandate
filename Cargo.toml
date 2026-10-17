@@ -16,6 +16,14 @@ rust-version = "1.99"
 [workspace.dependencies]
 agent-core = { path = "crates/agent-core" }
 
+anyhow = "1.0.104"                                          # easy errors for the binary
+dotenvy = "0.15.7"                                          # loads .env into the environment
+reqwest = { version = "0.13.5", features = ["json"] }       # HTTP client (rustls TLS by default)
+serde = { version = "1.0.229", features = ["derive"] }      # #[derive(Serialize, Deserialize)]
+serde_json = "1.0.154"                                      # JSON encoding/decoding
+thiserror = "2.0.21"                                        # typed errors for the library
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }  # async runtime
+
 # Lint levels applied to every crate that has `[lints] workspace = true`.
 [workspace.lints.rust]
 unsafe_code = "forbid"
