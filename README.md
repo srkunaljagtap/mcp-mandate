@@ -1,4 +1,4 @@
-# rust-agent
+# mandate
 
 A command-line coding assistant written in Rust and powered by Claude. It can
 read and write files and run commands inside a project folder.
@@ -32,4 +32,4 @@ cargo clippy --all-targets -- -D warnings     # lint, treating warnings as error
 | Path | What it is |
 |---|---|
 | `crates/agent-core` | Library: Claude API client, message types, agent loop |
-| `crates/agent-cli` | Binary: the `rust-agent` command you run |
+| `crates/agent-cli` | Binary: the `mandate` command you run |

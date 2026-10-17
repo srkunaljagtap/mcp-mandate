@@ -20,7 +20,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One-line name and version, shown when the CLI starts.
 pub fn banner() -> String {
-    format!("rust-agent v{VERSION}")
+    format!("mandate v{VERSION}")
 }
 
 #[cfg(test)]
@@ -30,7 +30,7 @@ mod tests {
     #[test]
     fn banner_includes_name_and_version() {
         let banner = banner();
-        assert!(banner.starts_with("rust-agent v"));
+        assert!(banner.starts_with("mandate v"));
         assert!(banner.ends_with(VERSION));
     }
 }

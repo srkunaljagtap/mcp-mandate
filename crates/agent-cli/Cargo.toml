@@ -1,13 +1,13 @@
 [package]
 name = "agent-cli"
-description = "Command-line interface for rust-agent"
+description = "Command-line interface for mandate"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-# The package is agent-cli, but the program you run is called rust-agent.
+# The package is agent-cli, but the program you run is called mandate.
 [[bin]]
-name = "rust-agent"
+name = "mandate"
 path = "src/main.rs"
 
 [dependencies]

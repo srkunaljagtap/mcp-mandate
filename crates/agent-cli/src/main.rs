@@ -19,11 +19,11 @@ async fn main() -> anyhow::Result<()> {
 
     let prompt = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     if prompt.trim().is_empty() {
-        bail!("usage: rust-agent <prompt>   e.g. rust-agent \"Say hi in five words\"");
+        bail!("usage: mandate <prompt>   e.g. mandate \"Say hi in five words\"");
     }
 
     // Status goes to stderr and the answer to stdout, so
-    // `rust-agent "..." > answer.txt` saves only Claude's reply.
+    // `mandate "..." > answer.txt` saves only Claude's reply.
     eprintln!("{} · {MODEL}", agent_core::banner());
 
     let client = Client::from_env()?;
