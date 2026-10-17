@@ -1,80 +1,32 @@
-//! JSON-RPC 2.0 framing for MCP's stdio transport: one message per line.
-//!
-//! Frames are forwarded exactly as received. They're parsed only to learn
-//! what they are, so the proxy can never alter a message by re-encoding it.
+//! Classifying JSON-RPC 2.0 messages without copying their payloads.
 
 use std::borrow::Cow;
 use std::fmt;
 
 use serde::Deserialize;
 use serde::de::IgnoredAny;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use serde_json::Value;
 
-/// Largest single message accepted, newline included. Tool results can carry
-/// base64 images, so this is generous; anything bigger ends the session
-/// instead of being buffered without limit.
-pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-
-#[derive(Debug, thiserror::Error)]
-pub enum FrameError {
-    #[error("message is larger than {limit} bytes")]
-    TooLarge { limit: usize },
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-}
-
-/// Reads one newline-terminated frame into `buf`, newline included.
-///
-/// Returns `Ok(false)` at end of stream. A last frame without a trailing
-/// newline is still returned.
-pub async fn read_frame<R>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-    limit: usize,
-) -> Result<bool, FrameError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    buf.clear();
-    loop {
-        let (used, complete) = {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                return Ok(!buf.is_empty());
-            }
-            let (used, complete) = match available.iter().position(|&byte| byte == b'\n') {
-                Some(newline) => (newline + 1, true),
-                None => (available.len(), false),
-            };
-            if buf.len() + used > limit {
-                return Err(FrameError::TooLarge { limit });
-            }
-            buf.extend_from_slice(&available[..used]);
-            (used, complete)
-        };
-        reader.consume(used);
-        if complete {
-            return Ok(true);
-        }
-    }
-}
-
-/// What a frame is, as far as routing and logging are concerned.
+/// What a message is, as far as routing and checking are concerned.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     /// Expects a response with the same id.
     Request {
-        id: serde_json::Value,
+        id: Value,
         method: String,
     },
     /// Fire-and-forget; no response.
-    Notification { method: String },
+    Notification {
+        method: String,
+    },
     Response {
-        id: serde_json::Value,
+        id: Value,
         is_error: bool,
     },
     /// Several messages in one JSON array (allowed by older MCP versions).
-    Batch { len: usize },
+    Batch {
+        len: usize,
+    },
 }
 
 impl fmt::Display for Message {
@@ -127,14 +79,14 @@ pub fn classify(frame: &[u8]) -> Result<Message, ParseError> {
     }
 }
 
-/// The parts of a message the proxy looks at. Everything else (`params`,
-/// the body of `result`) is skipped by the parser without being copied.
+/// The parts of a message classification looks at. Everything else
+/// (`params`, the body of `result`) is skipped without being copied.
 #[derive(Deserialize)]
 struct Envelope<'a> {
     #[serde(borrow)]
     jsonrpc: Cow<'a, str>,
     #[serde(default)]
-    id: Option<serde_json::Value>,
+    id: Option<Value>,
     #[serde(default, borrow)]
     method: Option<Cow<'a, str>>,
     #[serde(default)]
@@ -164,7 +116,7 @@ impl Envelope<'_> {
             (None, Some(id)) => Ok(Message::Response { id, is_error }),
             // An error about a request that couldn't be read has a null id.
             (None, None) if is_error => Ok(Message::Response {
-                id: serde_json::Value::Null,
+                id: Value::Null,
                 is_error,
             }),
             (None, None) => Err(ParseError::NotJsonRpc("no `method` and no `id`")),
@@ -206,7 +158,7 @@ mod tests {
         assert_eq!(
             parse(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#),
             Message::Response {
-                id: serde_json::Value::Null,
+                id: Value::Null,
                 is_error: true
             }
         );
@@ -244,32 +196,5 @@ mod tests {
             parse(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#).to_string(),
             "request tools/list (id 3)"
         );
-    }
-
-    async fn frames(input: &[u8], limit: usize) -> Result<Vec<Vec<u8>>, FrameError> {
-        let mut reader = tokio::io::BufReader::with_capacity(4, input);
-        let mut frame = Vec::new();
-        let mut frames = Vec::new();
-        while read_frame(&mut reader, &mut frame, limit).await? {
-            frames.push(frame.clone());
-        }
-        Ok(frames)
-    }
-
-    #[tokio::test]
-    async fn splits_lines_and_keeps_their_endings() {
-        let frames = frames(b"{\"a\":1}\n{\"b\":2}\r\n{\"c\":3}", 1024)
-            .await
-            .unwrap();
-        assert_eq!(
-            frames,
-            [&b"{\"a\":1}\n"[..], b"{\"b\":2}\r\n", b"{\"c\":3}"]
-        );
-    }
-
-    #[tokio::test]
-    async fn refuses_frames_over_the_limit() {
-        let error = frames(b"0123456789\n", 8).await.unwrap_err();
-        assert!(matches!(error, FrameError::TooLarge { limit: 8 }));
     }
 }

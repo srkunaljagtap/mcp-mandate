@@ -14,18 +14,27 @@ repository = "https://github.com/srkunaljagtap/mcp-mandate"
 # Dependency versions are declared once here; crates opt in with
 # `name.workspace = true`.
 [workspace.dependencies]
+mcp-mandate-gate = { path = "crates/mcp-mandate-gate", version = "0.1.0" }
+mcp-mandate-pin = { path = "crates/mcp-mandate-pin", version = "0.1.0" }
+mcp-mandate-policy = { path = "crates/mcp-mandate-policy", version = "0.1.0" }
 mcp-mandate-proxy = { path = "crates/mcp-mandate-proxy", version = "0.1.0" }
 mcp-mandate-scout = { path = "crates/mcp-mandate-scout", version = "0.1.0" }
 
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 dotenvy = "0.15.7"
+globset = "0.4.20"
+# No default features: they would let a server's schema `$ref` make the gate
+# fetch URLs or read local files.
+jsonschema = { version = "0.59.0", default-features = false }
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+toml = "1.1.8"
+tokio = { version = "1.53.3", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 which = "8.0.6"

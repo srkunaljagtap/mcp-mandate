@@ -1,0 +1,53 @@
+# An example mcp-mandate policy for one MCP server. Every setting is shown
+# with its default unless marked otherwise.
+
+# "enforce" blocks what this policy doesn't allow. "observe" logs what would
+# be blocked but lets everything through: use it to try a policy on real
+# traffic first.
+mode = "enforce"
+
+# The pins file written by `mcp-mandate pin`, relative to this file. Without
+# it, nothing the server offers is approved. (Not a default.)
+pins = "everything.pins.toml"
+
+# Requests mcp-mandate doesn't know how to check.
+unknown_requests = "deny"
+
+[defaults]
+# For tools no rule below gives an action: "allow", "hold" or "deny".
+tools = "deny"
+# Largest tool-call arguments, as JSON bytes.
+max_argument_bytes = 65536
+
+# Tool rules. `match` is a glob on the tool name. When several rules match a
+# tool, the most restrictive action wins (deny over hold over allow), so
+# order doesn't matter. (Not defaults: examples.)
+
+[[tools]]
+match = "echo"
+action = "allow"
+# These arguments may not contain ; & | $ ` < > ( ) { } or line breaks.
+no_shell_metacharacters = ["message"]
+
+[[tools]]
+match = "get*"
+action = "allow"
+max_argument_bytes = 4096
+
+[[tools]]
+# "hold" means a person must approve each call. Approvals aren't supported
+# yet, so held calls are blocked with a reason saying so.
+match = "write_*"
+action = "hold"
+
+[[tools]]
+match = "printEnv"
+action = "deny"
+
+[server_requests]
+# The server asks the client's model to generate text.
+sampling = "deny"
+# The server asks you a question.
+elicitation = "deny"
+# The server asks which folders it may work in.
+roots = "allow"

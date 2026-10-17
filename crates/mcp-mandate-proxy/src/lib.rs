@@ -1,6 +1,6 @@
 //! Transports for mcp-mandate. Every MCP message between an agent and a
-//! server passes through here, which is where the gate's checks will hook in.
+//! server passes through here on its way to and from the gate.
 
-pub mod jsonrpc;
+pub mod framing;
 mod process;
 pub mod stdio;

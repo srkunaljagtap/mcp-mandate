@@ -8,7 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-serde.workspace = true
+mcp-mandate-gate.workspace = true
+mcp-mandate-pin.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -18,6 +19,9 @@ which.workspace = true
 # Process-group signals for stopping a server's whole process tree.
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+
+[dev-dependencies]
+mcp-mandate-policy.workspace = true
 
 [lints]
 workspace = true

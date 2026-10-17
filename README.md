@@ -7,9 +7,10 @@ Cursor, your own) and the MCP servers they call. Every tool call passes a
 deterministic check before it reaches a server, so an agent that was tricked
 by something it read can't act with your keys.
 
-> **Status: under construction.** v0.1.0 isn't released. `mcp-mandate run`
-> relays a stdio MCP server, but no checks are enforced yet. Don't rely on it
-> for protection.
+> **Status: under construction.** v0.1.0 isn't released. Pinning and policy
+> checks work for local (stdio) servers; the HTTP gateway, taint tracking,
+> secret redaction and the audit log don't exist yet. Don't rely on it for
+> protection.
 
 ## How it works
 
@@ -37,48 +38,88 @@ For each tool call the gate will:
 8. **Redact and label** the response: scrub secrets, mark untrusted output.
 9. **Record** a hash-chained audit entry for every decision.
 
-## Usage
+Steps 2, 3, 4 and 7 work today for stdio servers.
 
-Working today: relay a local (stdio) MCP server. Messages pass through
-unchanged; lines that aren't JSON-RPC are dropped and logged.
+## Quick start
 
-```sh
-mcp-mandate run -- npx -y <mcp-server>
-```
-
-Logs go to stderr, never stdout (stdout carries the MCP traffic). Set
-`MCP_MANDATE_LOG=debug` to log every message, or `warn` for quieter output;
-the default is `info`.
-
-Planned:
+**1. Pin the server.** This starts it once, records what it offers (tools,
+prompts, resources and its instructions) and stops it:
 
 ```sh
-# review a server and draft a policy for it
-mcp-mandate scout -- npx -y <mcp-server>
-
-# run it behind the gate (refused until policies are enforced)
-mcp-mandate run --policy policies/default.toml -- npx -y <mcp-server>
-
-# check that the audit log wasn't tampered with
-mcp-mandate audit verify
+mcp-mandate pin --out everything.pins.toml -- npx -y @modelcontextprotocol/server-everything@1.0.0
 ```
 
-In your MCP client's config, put `mcp-mandate run --` in front of the server
-command it already runs:
+Read the pins file before going further: everything pinned in it is trusted.
+Pin a package *version* (`@1.0.0` above); without one, `npx` fetches the
+newest release on every run, so the code can change while its descriptions
+don't, and mcp-mandate warns about it.
+
+**2. Write a policy.** Start from [policies/example.toml](policies/example.toml):
+
+```toml
+pins = "everything.pins.toml"
+
+[[tools]]
+match = "echo"
+action = "allow"
+```
+
+**3. Run the server behind the gate:**
+
+```sh
+mcp-mandate run --policy policy.toml -- npx -y @modelcontextprotocol/server-everything@1.0.0
+```
+
+In your MCP client's config, put `mcp-mandate run --policy <file> --` in
+front of the server command it already runs:
 
 ```json
 {
   "mcpServers": {
-    "github": {
+    "everything": {
       "command": "mcp-mandate",
-      "args": ["run", "--", "npx", "-y", "<mcp-server>"]
+      "args": ["run", "--policy", "/path/to/policy.toml", "--",
+               "npx", "-y", "@modelcontextprotocol/server-everything@1.0.0"]
     }
   }
 }
 ```
 
+Logs go to stderr, never stdout (stdout carries the MCP traffic). Set
+`MCP_MANDATE_LOG=debug` to log every decision; the default `info` logs what
+was hidden or blocked.
+
+## What's checked today
+
+- **Pinning.** Tools, prompts, resources, resource templates and the server's
+  instructions are compared with their pins. Anything changed since approval
+  (a "rug pull") or never approved is hidden from lists, and calls to it are
+  blocked. A server with no pins file gets nothing through.
+- **Policy.** Each tool is allowed, held or denied (default: denied). When
+  several rules match, the most restrictive wins. Denied tools are hidden
+  from the model.
+- **Arguments.** Size limits, shell metacharacters in the arguments you
+  name, and the tool's own JSON Schema.
+- **Requests from the server.** `sampling/createMessage` (the server asks the
+  client's model to write) and `elicitation/create` (the server asks you a
+  question) are denied unless the policy allows them.
+- **Unknown requests** are denied, so a new protocol feature can't slip
+  through unchecked.
+- **Modes.** `enforce` (the default) blocks; `observe` logs what would be
+  blocked and lets everything through, for trying a policy on real traffic.
+
+A blocked tool call comes back to the agent as a tool error that says why
+(for example, "Blocked by mcp-mandate: tool `x` changed since it was
+approved"). "Hold" needs a person's approval, which isn't supported yet, so a
+held call is blocked with a reason saying so.
+
 ## What it doesn't do
 
+- **It only sees MCP traffic routed through it.** Your agent's built-in tools
+  (shell commands, file edits, web fetches) and any MCP server configured
+  directly in the client bypass the gate entirely. Use your agent's own
+  permission settings for those, and route every MCP server through
+  mcp-mandate.
 - **It guards MCP messages, not the server process.** A local server runs
   with your operating-system permissions and could read files directly
   without making an MCP call. Use OS sandboxing to contain that.
@@ -108,12 +149,13 @@ cargo deny check        # licenses, advisories, sources (cargo install cargo-den
 
 | Path | What it is |
 |---|---|
-| `bin/mcp-mandate` | The `mcp-mandate` command: `run`, `gate`, `scout`, `audit` |
-| `crates/mcp-mandate-proxy` | Transports: relays MCP traffic (stdio today) and runs the server process |
+| `bin/mcp-mandate` | The `mcp-mandate` command: `run`, `pin`, `gate`, `scout`, `audit` |
+| `crates/mcp-mandate-gate` | The checks: decides what crosses between client and server, for any transport |
+| `crates/mcp-mandate-pin` | Fingerprints and the pins file |
+| `crates/mcp-mandate-policy` | The policy file and argument checks |
+| `crates/mcp-mandate-proxy` | Transports: relays stdio traffic through the gate and runs the server process |
 | `crates/mcp-mandate-scout` | Server review and the optional Claude API client |
-
-More crates (pinning, policy, taint, audit, identity) arrive as the
-features do.
+| `policies/` | Example and shared policies |
 
 ## Contributing and security
 

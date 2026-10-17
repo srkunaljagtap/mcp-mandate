@@ -1,0 +1,20 @@
+[package]
+name = "mcp-mandate-gate"
+description = "The mcp-mandate gate: decides what crosses between an MCP client and server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jsonschema.workspace = true
+mcp-mandate-pin.workspace = true
+mcp-mandate-policy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
