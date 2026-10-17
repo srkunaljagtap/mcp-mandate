@@ -30,6 +30,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::framing::{FrameError, MAX_MESSAGE_BYTES, read_frame};
+use crate::inventory::{self, Rpc, result_of};
 use crate::process::{ServerProcess, Signals, TERM_GRACE};
 
 /// How long a server gets to exit on its own after its input closes.
@@ -40,10 +41,6 @@ const DRAIN_GRACE: Duration = Duration::from_secs(5);
 const QUEUE: usize = 256;
 /// How long `inventory` waits for a server to answer everything it's asked.
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
-/// Most pages of one list `inventory` follows.
-const MAX_PAGES: usize = 100;
-/// The MCP protocol version `inventory` asks for.
-const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// The MCP server to run: a program and its arguments.
 #[derive(Debug, Clone)]
@@ -62,33 +59,7 @@ impl fmt::Display for ServerCommand {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ProxyError {
-    #[error("couldn't find `{program}` (is it installed and on PATH?)")]
-    NotFound {
-        program: String,
-        #[source]
-        source: which::Error,
-    },
-    #[error("couldn't start `{program}`")]
-    Spawn {
-        program: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("lost track of the MCP server process")]
-    Wait(#[source] std::io::Error),
-    #[error("the MCP server didn't answer within {} seconds", .0.as_secs())]
-    Timeout(Duration),
-    #[error("the MCP server closed its output before answering `{0}`")]
-    Closed(String),
-    #[error("the MCP server answered `{method}` with an error: {message}")]
-    Server { method: String, message: String },
-    #[error("couldn't read from the MCP server")]
-    Frame(#[from] FrameError),
-    #[error("couldn't write to the MCP server")]
-    Io(#[from] std::io::Error),
-}
+pub use crate::ProxyError;
 
 #[derive(Debug, Clone, Copy)]
 enum Side {
@@ -359,7 +330,7 @@ pub async fn inventory(command: &ServerCommand) -> Result<Inventory, ProxyError>
         frame: Vec::new(),
         next_id: 0,
     };
-    let listed = timeout(INVENTORY_TIMEOUT, client.inventory()).await;
+    let listed = timeout(INVENTORY_TIMEOUT, inventory::collect(&mut client)).await;
     drop(client); // closes the server's input
     if timeout(EXIT_GRACE, server.wait()).await.is_err() {
         let _ = server.terminate(TERM_GRACE).await;
@@ -375,76 +346,7 @@ struct InventoryClient {
     next_id: u64,
 }
 
-impl InventoryClient {
-    async fn inventory(&mut self) -> Result<Inventory, ProxyError> {
-        let init = self
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "mcp-mandate", "version": env!("CARGO_PKG_VERSION")}
-                }),
-            )
-            .await?;
-        self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
-            .await?;
-
-        let offers = |capability: &str| {
-            init.get("capabilities")
-                .and_then(|caps| caps.get(capability))
-                .is_some()
-        };
-        let mut inventory = Inventory {
-            instructions: init
-                .get("instructions")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            ..Inventory::default()
-        };
-        if offers("tools") {
-            inventory.tools = self.list_all("tools/list", "tools").await?;
-        }
-        if offers("prompts") {
-            inventory.prompts = self.list_all("prompts/list", "prompts").await?;
-        }
-        if offers("resources") {
-            inventory.resources = self.list_all("resources/list", "resources").await?;
-            // Templates are optional even for servers with resources.
-            inventory.resource_templates = self
-                .list_all("resources/templates/list", "resourceTemplates")
-                .await
-                .unwrap_or_default();
-        }
-        Ok(inventory)
-    }
-
-    /// Calls a list method, following `nextCursor` across pages.
-    async fn list_all(&mut self, method: &str, field: &str) -> Result<Vec<Value>, ProxyError> {
-        let mut items = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_PAGES {
-            let params = match &cursor {
-                Some(cursor) => json!({"cursor": cursor}),
-                None => json!({}),
-            };
-            let result = self.request(method, params).await?;
-            if let Some(page) = result.get(field).and_then(Value::as_array) {
-                items.extend(page.iter().cloned());
-            }
-            match result.get("nextCursor").and_then(Value::as_str) {
-                Some(next) => cursor = Some(next.to_owned()),
-                None => return Ok(items),
-            }
-        }
-        warn!(
-            method,
-            pages = MAX_PAGES,
-            "stopped listing after too many pages"
-        );
-        Ok(items)
-    }
-
+impl Rpc for InventoryClient {
     /// Sends a request and waits for its response, answering any requests
     /// the server makes meanwhile with an error so it isn't left waiting.
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, ProxyError> {
@@ -474,20 +376,17 @@ impl InventoryClient {
             if message.get("id") != Some(&json!(id)) {
                 continue;
             }
-            if let Some(error) = message.get("error") {
-                return Err(ProxyError::Server {
-                    method: method.to_owned(),
-                    message: error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("no message")
-                        .to_owned(),
-                });
-            }
-            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+            return result_of(method, &message);
         }
     }
 
+    async fn notify(&mut self, method: &str) -> Result<(), ProxyError> {
+        self.send(&json!({"jsonrpc": "2.0", "method": method}))
+            .await
+    }
+}
+
+impl InventoryClient {
     async fn send(&mut self, message: &Value) -> Result<(), ProxyError> {
         let mut bytes = serde_json::to_vec(message).expect("JSON values always serialize");
         bytes.push(b'\n');

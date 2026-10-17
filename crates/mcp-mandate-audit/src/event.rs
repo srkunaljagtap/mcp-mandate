@@ -75,6 +75,15 @@ pub struct Event {
     pub server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_sha256: Option<String>,
+    /// A remote server's URL (scheme, host and path; no query).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Who opened the session on the HTTPS gateway (the token's `sub`), and
+    /// the OAuth client they used (`azp` or `client_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
 

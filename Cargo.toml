@@ -23,21 +23,32 @@ mcp-mandate-taint = { path = "crates/mcp-mandate-taint", version = "0.1.0" }
 mcp-mandate-scout = { path = "crates/mcp-mandate-scout", version = "0.1.0", default-features = false }
 
 anyhow = "1.0.104"
+aws-lc-rs = "1.18.2"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "tracing"] }
+base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 dotenvy = "0.15.7"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 globset = "0.4.20"
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
 # No default features: they would let a server's schema `$ref` make the gate
 # fetch URLs or read local files.
 jsonschema = { version = "0.59.0", default-features = false }
+# Only the aws-lc-rs backend: the other one relies on the `rsa` crate, which
+# has an unfixed timing side channel (RUSTSEC-2023-0071).
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
 regex = "1.13.1"
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal"] }
-reqwest = { version = "0.13.5", features = ["json"] }
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
 toml = "1.1.8"
-tokio = { version = "1.53.3", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.3", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = "0.26.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 which = "8.0.6"

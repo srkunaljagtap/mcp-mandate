@@ -225,6 +225,7 @@ struct ToolRuleFile {
     allow_secrets: Option<bool>,
 }
 
+#[derive(Clone)]
 struct ToolRule {
     pattern: String,
     matcher: GlobMatcher,
@@ -237,6 +238,7 @@ struct ToolRule {
 }
 
 /// A loaded, checked policy.
+#[derive(Clone)]
 pub struct Policy {
     pub mode: Mode,
     /// The pins file, resolved against the policy file's folder.

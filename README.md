@@ -8,9 +8,9 @@ deterministic check before it reaches a server, so an agent that was tricked
 by something it read can't act with your keys.
 
 > **Status: under construction.** v0.1.0 isn't released. Pinning, policy,
-> taint tracking, secret redaction, the audit log and Scout work for local
-> (stdio) servers; the HTTP gateway doesn't exist yet. Don't rely on it for
-> protection.
+> taint tracking, secret redaction, the audit log, Scout and the HTTPS
+> gateway work, but haven't been through the hardening and review planned
+> before release. Don't rely on it for protection yet.
 
 ## How it works
 
@@ -38,8 +38,10 @@ For each tool call the gate will:
 8. **Redact and label** the response: scrub secrets, mark untrusted output.
 9. **Record** a hash-chained audit entry for every decision.
 
-Steps 2, 3, 4, 5, 7, 8 and 9 work today for stdio servers (step 8 redacts
-secrets, not yet other personal data).
+All nine steps work today: step 1 on the [HTTPS gateway](#the-https-gateway)
+(local servers run as you), and step 6 as a credential of the gateway's own
+for each server (not yet one per user). Step 8 redacts secrets, not yet
+other personal data.
 
 ## Quick start
 
@@ -145,6 +147,53 @@ A blocked tool call comes back to the agent as a tool error that says why
 approved"). "Hold" needs a person's approval, which isn't supported yet, so a
 held call is blocked with a reason saying so.
 
+## The HTTPS gateway
+
+For remote MCP servers (a URL rather than a program on your machine),
+`mcp-mandate gate` runs as a service that agents connect to over HTTPS:
+
+```
+agent ──HTTPS + your OIDC token──▶ mcp-mandate gate ──HTTPS + the gateway's own credential──▶ MCP server
+```
+
+```sh
+mcp-mandate pin --gateway gateway.toml --server github --out github.pins.toml
+mcp-mandate gate --config gateway.toml
+```
+
+Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
+[policies/gateway.example.toml](policies/gateway.example.toml).
+
+- **Who's calling.** Every request needs a bearer token from your OIDC
+  identity provider. The gateway checks:
+  - the signature, against the provider's published keys (asymmetric
+    algorithms only, never shared-secret `HS*`, and the key's type must
+    match the token's algorithm);
+  - the issuer;
+  - the audience (the gateway, or the server being used);
+  - the subject, the expiry and the not-before time.
+
+  Any token that passes may use every configured server, so decide who can
+  get one in your identity provider. A missing or bad token gets `401` with
+  a link to the gateway's OAuth metadata (RFC 9728), which MCP clients use
+  to find your provider and sign in.
+- **The server never sees your token.** The gateway removes it and signs in
+  with its own credential for that one server: a secret from an environment
+  variable or file (never the config file itself), or short-lived OAuth
+  client-credential tokens. Only the headers MCP needs are passed on, and
+  redirects aren't followed, so a server can't bounce the credential
+  elsewhere.
+- **Sessions** belong to the caller who opened them, and each has its own
+  gate: its own taint, its own audit session. The server's session id is
+  never shown to the client. Idle sessions close after 30 minutes.
+- **Every message**, including streamed (SSE) ones, goes through the gate
+  exactly as with `mcp-mandate run`. Each session's audit log entries name
+  the caller (`sub`) and their OAuth client.
+- **HTTPS:** mcp-mandate serves TLS itself with your certificate, or plain
+  HTTP behind a proxy that handles TLS (`terminated_by_proxy = true`). Plain
+  HTTP is otherwise allowed only on localhost. Servers must use `https://`
+  unless they're on localhost.
+
 ## Scout
 
 Scout reviews a server before you trust it. It starts the server once,
@@ -238,6 +287,11 @@ mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
   without making an MCP call. Use OS sandboxing to contain that.
 - **It doesn't replace** your identity provider or the servers' own
   authentication.
+- **Behind the gateway, a server sees the gateway, not you.** Every caller
+  acts with the gateway's credential for that server. Per-user credentials
+  (token exchange) come later.
+- **The gateway keeps sessions in memory.** Run one instance, or send each
+  client to the same one (sticky sessions). A restart ends every session.
 - **No AI decides what to block.** The gate is plain rules; Scout's LLM
   review is optional and only drafts rules for you to approve.
 - **On Windows, stopping a server stops only the process mcp-mandate
@@ -267,10 +321,10 @@ cargo deny check        # licenses, advisories, sources (cargo install cargo-den
 | `crates/mcp-mandate-gate` | The checks: decides what crosses between client and server, for any transport |
 | `crates/mcp-mandate-pin` | Fingerprints and the pins file |
 | `crates/mcp-mandate-policy` | The policy file and argument checks |
-| `crates/mcp-mandate-proxy` | Transports: relays stdio traffic through the gate and runs the server process |
+| `crates/mcp-mandate-proxy` | Transports: the stdio relay (running the server process) and the HTTPS gateway (identity, sessions, upstream credentials) |
 | `crates/mcp-mandate-taint` | Which tools read untrusted content or send data out; secret detection and redaction |
 | `crates/mcp-mandate-scout` | Scout: the rule scan, draft policies and the optional Claude review |
-| `policies/` | Example and shared policies |
+| `policies/` | Example policies and gateway configuration |
 
 ## Contributing and security
 

@@ -9,8 +9,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use mcp_mandate_audit::{self as audit, Log, Recorder, VerifyError};
 use mcp_mandate_gate::Gate;
-use mcp_mandate_pin::{Kind, Pins, unpinned_package};
+use mcp_mandate_pin::{Inventory, Kind, Pins, unpinned_package};
 use mcp_mandate_policy::{Mode, Policy};
+use mcp_mandate_proxy::ProxyError;
+use mcp_mandate_proxy::gateway::{self, GatewayConfig};
 use mcp_mandate_proxy::stdio::{self, ServerCommand};
 use mcp_mandate_scout as scout;
 use tracing::{error, info, warn};
@@ -47,15 +49,14 @@ enum Command {
         /// shows now).
         #[arg(long)]
         force: bool,
-        /// The server command and its arguments, after `--`.
-        #[arg(last = true, required = true)]
-        server: Vec<OsString>,
+        #[command(flatten)]
+        target: Target,
     },
-    /// Serve the gate over Streamable HTTP for remote MCP servers.
+    /// Serve the gate over HTTPS for remote MCP servers.
     Gate {
         /// Gateway configuration file (TOML).
         #[arg(long)]
-        config: Option<PathBuf>,
+        config: PathBuf,
     },
     /// Review an MCP server's tools and draft a policy for it. Starts the
     /// server once to list what it offers.
@@ -73,15 +74,39 @@ enum Command {
         /// resource definitions to the Claude API; needs ANTHROPIC_API_KEY.
         #[arg(long)]
         llm: bool,
-        /// The server command and its arguments, after `--`.
-        #[arg(last = true, required = true)]
-        server: Vec<OsString>,
+        #[command(flatten)]
+        target: Target,
     },
     /// Work with the audit log.
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
     },
+}
+
+/// The server to list: a local command after `--`, or a remote server
+/// from a gateway configuration.
+#[derive(Debug, clap::Args)]
+struct Target {
+    /// A gateway configuration, to use one of its remote servers (with
+    /// `--server`) and the gateway's credential for it.
+    #[arg(long, requires = "remote")]
+    gateway: Option<PathBuf>,
+    /// The remote server's name in the gateway configuration.
+    #[arg(
+        long = "server",
+        id = "remote",
+        value_name = "NAME",
+        requires = "gateway"
+    )]
+    remote: Option<String>,
+    /// A local server's command and its arguments, after `--`.
+    #[arg(
+        last = true,
+        required_unless_present = "gateway",
+        conflicts_with = "gateway"
+    )]
+    server: Vec<OsString>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -110,15 +135,15 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Run { policy, server } => run(&policy, server_command(server)),
-        Command::Pin { out, force, server } => pin(&out, force, &server_command(server)),
-        Command::Gate { config } => not_yet(&format!("serve the HTTP gateway{}", with(&config))),
+        Command::Pin { out, force, target } => pin(&out, force, target),
+        Command::Gate { config } => gate(&config),
         Command::Scout {
             out,
             force,
             pins,
             llm,
-            server,
-        } => scout(&out, force, pins.as_deref(), llm, &server_command(server)),
+            target,
+        } => scout(&out, force, pins.as_deref(), llm, target),
         Command::Audit {
             command:
                 AuditCommand::Verify {
@@ -128,11 +153,6 @@ fn main() -> ExitCode {
                 },
         } => verify(log, policy, anchor.as_deref()),
     }
-}
-
-fn not_yet(what: &str) -> ExitCode {
-    eprintln!("mcp-mandate: not implemented yet: {what}");
-    ExitCode::from(2)
 }
 
 /// `mcp-mandate run`: relays a stdio MCP server through the gate until
@@ -302,18 +322,19 @@ fn count(n: u64, one: &str, many: &str) -> String {
 /// `mcp-mandate scout`: lists what the server offers, scans it (and with
 /// `--llm` has Claude review it), writes a draft policy and prints a report.
 /// Exits 0 whatever it finds; the findings are in the report.
-fn scout(
-    out: &Path,
-    force: bool,
-    pins: Option<&Path>,
-    llm: bool,
-    command: &ServerCommand,
-) -> ExitCode {
+fn scout(out: &Path, force: bool, pins: Option<&Path>, llm: bool, target: Target) -> ExitCode {
     init_logging();
     if out.exists() && !force {
         error!(out = %out.display(), "the draft already exists; pass --force to replace it");
         return ExitCode::from(2);
     }
+    let source = match Source::from(target) {
+        Ok(source) => source,
+        Err(problem) => {
+            error!("{problem}");
+            return ExitCode::from(2);
+        }
+    };
     let pinned = match pins.map(Pins::load).transpose() {
         Ok(pinned) => pinned,
         Err(error) => {
@@ -329,11 +350,10 @@ fn scout(
             return ExitCode::from(2);
         }
     };
-    warn_if_unpinned(command);
     let Some(runtime) = runtime() else {
         return ExitCode::FAILURE;
     };
-    let inventory = match runtime.block_on(stdio::inventory(command)) {
+    let inventory = match source.list(&runtime) {
         Ok(inventory) => inventory,
         Err(error) => {
             error!(error = %report(&error), "couldn't list what the server offers");
@@ -346,7 +366,7 @@ fn scout(
     }
     let review = review(&runtime, reviewer, &inventory, &mut findings);
 
-    let server = command.to_string();
+    let server = source.label();
     let pins = pins.map(|pins| pins_reference(out, pins));
     let draft = scout::Draft::new(&inventory, &findings, &server, pins.as_deref());
     if let Err(error) = std::fs::write(out, &draft.text) {
@@ -471,7 +491,7 @@ fn review(
 }
 
 /// `mcp-mandate pin`: records what the server offers into a pins file.
-fn pin(out: &Path, force: bool, command: &ServerCommand) -> ExitCode {
+fn pin(out: &Path, force: bool, target: Target) -> ExitCode {
     init_logging();
     if out.exists() && !force {
         error!(
@@ -480,18 +500,24 @@ fn pin(out: &Path, force: bool, command: &ServerCommand) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    warn_if_unpinned(command);
+    let source = match Source::from(target) {
+        Ok(source) => source,
+        Err(problem) => {
+            error!("{problem}");
+            return ExitCode::from(2);
+        }
+    };
     let Some(runtime) = runtime() else {
         return ExitCode::FAILURE;
     };
-    let inventory = match runtime.block_on(stdio::inventory(command)) {
+    let inventory = match source.list(&runtime) {
         Ok(inventory) => inventory,
         Err(error) => {
             error!(error = %report(&error), "couldn't list what the server offers");
             return ExitCode::FAILURE;
         }
     };
-    let pins = Pins::from_inventory(command.to_string(), &inventory);
+    let pins = Pins::from_inventory(source.label(), &inventory);
     if let Err(error) = pins.save(out) {
         error!(error = %report(&error), "couldn't write the pins file");
         return ExitCode::FAILURE;
@@ -568,11 +594,73 @@ fn runtime() -> Option<tokio::runtime::Runtime> {
     }
 }
 
-fn with(path: &Option<PathBuf>) -> String {
-    path.as_deref()
-        .map(Path::display)
-        .map(|path| format!(" using {path}"))
-        .unwrap_or_default()
+/// Where `pin` and `scout` list a server: a local command, or a remote
+/// server from a gateway configuration (signing in as the gateway does).
+enum Source {
+    Local(ServerCommand),
+    Remote(Box<gateway::ServerConfig>),
+}
+
+impl Source {
+    fn from(target: Target) -> Result<Self, String> {
+        let (Some(config), Some(name)) = (target.gateway, target.remote) else {
+            let command = server_command(target.server);
+            warn_if_unpinned(&command);
+            return Ok(Self::Local(command));
+        };
+        // Pins aren't loaded: the server may not be pinned yet.
+        let gateway = GatewayConfig::load_without_pins(&config).map_err(|error| report(&error))?;
+        let server = gateway
+            .servers
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| format!("{} has no server named `{name}`", config.display()))?;
+        Ok(Self::Remote(Box::new(server)))
+    }
+
+    /// What the server is, for people: its command, or its URL without a
+    /// query (which could hold a secret).
+    fn label(&self) -> String {
+        match self {
+            Self::Local(command) => command.to_string(),
+            Self::Remote(server) => {
+                let mut url = server.url.clone();
+                url.set_query(None);
+                url.to_string()
+            }
+        }
+    }
+
+    fn list(&self, runtime: &tokio::runtime::Runtime) -> Result<Inventory, ProxyError> {
+        match self {
+            Self::Local(command) => runtime.block_on(stdio::inventory(command)),
+            Self::Remote(server) => runtime.block_on(gateway::inventory(server)),
+        }
+    }
+}
+
+/// `mcp-mandate gate`: serves the HTTPS gateway until stopped.
+fn gate(config: &Path) -> ExitCode {
+    init_logging();
+    let config = match GatewayConfig::load(config) {
+        Ok(config) => config,
+        Err(error) => {
+            error!(error = %report(&error), "couldn't load the gateway configuration");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(runtime) = runtime() else {
+        return ExitCode::FAILURE;
+    };
+    let code = match runtime.block_on(gateway::run(config)) {
+        Ok(code) => code,
+        Err(error) => {
+            error!(error = %report(&error), "the gateway failed");
+            1
+        }
+    };
+    // As in `run`: exit without waiting for the runtime's other tasks.
+    std::process::exit(code)
 }
 
 /// Logs go to stderr. `MCP_MANDATE_LOG` sets the level (`debug` shows every
@@ -605,7 +693,7 @@ fn report(error: &dyn Error) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
-    use mcp_mandate_pin::Inventory;
+
     use serde_json::json;
 
     #[test]
