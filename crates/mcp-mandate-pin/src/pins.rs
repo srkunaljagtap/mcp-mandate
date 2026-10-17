@@ -19,7 +19,7 @@ const HEADER: &str = "\
 ";
 
 /// The kinds of item a server lists for the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
     Tool,
     Prompt,

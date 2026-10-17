@@ -8,8 +8,8 @@ deterministic check before it reaches a server, so an agent that was tricked
 by something it read can't act with your keys.
 
 > **Status: under construction.** v0.1.0 isn't released. Pinning, policy,
-> taint tracking, secret redaction and the audit log work for local (stdio)
-> servers; the HTTP gateway doesn't exist yet. Don't rely on it for
+> taint tracking, secret redaction, the audit log and Scout work for local
+> (stdio) servers; the HTTP gateway doesn't exist yet. Don't rely on it for
 > protection.
 
 ## How it works
@@ -42,6 +42,13 @@ Steps 2, 3, 4, 5, 7, 8 and 9 work today for stdio servers (step 8 redacts
 secrets, not yet other personal data).
 
 ## Quick start
+
+**0. Review the server (optional).** [Scout](#scout) looks for poisoned
+descriptions and drafts a policy:
+
+```sh
+mcp-mandate scout -- npx -y @modelcontextprotocol/server-everything@1.0.0
+```
 
 **1. Pin the server.** This starts it once, records what it offers (tools,
 prompts, resources and its instructions) and stops it:
@@ -138,6 +145,48 @@ A blocked tool call comes back to the agent as a tool error that says why
 approved"). "Hold" needs a person's approval, which isn't supported yet, so a
 held call is blocked with a reason saying so.
 
+## Scout
+
+Scout reviews a server before you trust it. It starts the server once,
+reads everything the server shows the model (instructions, tools and their
+parameter descriptions, prompts, resources), prints a report and writes a
+draft policy. It only proposes; nothing changes until you use the draft.
+
+```sh
+mcp-mandate scout --pins everything.pins.toml --out everything.draft.toml \
+  -- npx -y @modelcontextprotocol/server-everything@1.0.0
+```
+
+- **The scan** looks for:
+  - text aimed at the model ("do not tell the user", `<IMPORTANT>` blocks,
+    orders such as "always call this tool first");
+  - credential files (`~/.ssh`, `.env`, cloud credentials), and secrets
+    such as environment variables or API keys;
+  - requests to send data to an address;
+  - invisible or direction-changing characters, and encoded blobs;
+  - arguments that take a command line.
+- **The draft** is built by risk:
+  - tools whose annotations say read-only and closed-world are allowed;
+  - tools that can change things or reach the outside world are held, with
+    taint labels set from their annotations;
+  - a medium finding holds a tool, and a high finding denies it.
+
+  Every rule names a tool exactly (never a pattern), and its comments say
+  why. With `--pins`, the draft names the pins file and the report flags
+  anything that isn't pinned or has changed.
+- **Claude's review** (`--llm`) is a second opinion on what patterns can't
+  judge, such as a description that doesn't match the tool's schema.
+  - It's off unless you pass `--llm`, and it sends the server's definitions
+    to the Claude API with your own key (`ANTHROPIC_API_KEY`, or a `.env`
+    file; see `.env.example`).
+  - The key is never put in the environment the reviewed server inherits.
+  - It can only make the draft stricter, never looser: the descriptions it
+    reads were written by the server and may try to talk it into "safe".
+  - If it fails or declines, the draft uses the scan alone.
+  - Building with `cargo build --no-default-features` leaves it out.
+
+Scout exits 0 whenever it ran; the findings are in the report.
+
 ## The audit log
 
 Each message that crosses the gate gets one JSON line: when, which session,
@@ -220,7 +269,7 @@ cargo deny check        # licenses, advisories, sources (cargo install cargo-den
 | `crates/mcp-mandate-policy` | The policy file and argument checks |
 | `crates/mcp-mandate-proxy` | Transports: relays stdio traffic through the gate and runs the server process |
 | `crates/mcp-mandate-taint` | Which tools read untrusted content or send data out; secret detection and redaction |
-| `crates/mcp-mandate-scout` | Server review and the optional Claude API client |
+| `crates/mcp-mandate-scout` | Scout: the rule scan, draft policies and the optional Claude review |
 | `policies/` | Example and shared policies |
 
 ## Contributing and security

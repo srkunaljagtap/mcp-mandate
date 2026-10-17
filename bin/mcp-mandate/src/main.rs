@@ -12,6 +12,7 @@ use mcp_mandate_gate::Gate;
 use mcp_mandate_pin::{Kind, Pins, unpinned_package};
 use mcp_mandate_policy::{Mode, Policy};
 use mcp_mandate_proxy::stdio::{self, ServerCommand};
+use mcp_mandate_scout as scout;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -56,8 +57,22 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Review an MCP server's tools and draft a policy for it.
+    /// Review an MCP server's tools and draft a policy for it. Starts the
+    /// server once to list what it offers.
     Scout {
+        /// Where to write the draft policy.
+        #[arg(long, default_value = "mcp-mandate.draft.toml")]
+        out: PathBuf,
+        /// Replace an existing draft.
+        #[arg(long)]
+        force: bool,
+        /// A pins file to check the server against and to name in the draft.
+        #[arg(long)]
+        pins: Option<PathBuf>,
+        /// Also have Claude review the server. Sends its tool, prompt and
+        /// resource definitions to the Claude API; needs ANTHROPIC_API_KEY.
+        #[arg(long)]
+        llm: bool,
         /// The server command and its arguments, after `--`.
         #[arg(last = true, required = true)]
         server: Vec<OsString>,
@@ -97,7 +112,13 @@ fn main() -> ExitCode {
         Command::Run { policy, server } => run(&policy, server_command(server)),
         Command::Pin { out, force, server } => pin(&out, force, &server_command(server)),
         Command::Gate { config } => not_yet(&format!("serve the HTTP gateway{}", with(&config))),
-        Command::Scout { server } => not_yet(&format!("review `{}`", join(&server))),
+        Command::Scout {
+            out,
+            force,
+            pins,
+            llm,
+            server,
+        } => scout(&out, force, pins.as_deref(), llm, &server_command(server)),
         Command::Audit {
             command:
                 AuditCommand::Verify {
@@ -278,6 +299,177 @@ fn count(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// `mcp-mandate scout`: lists what the server offers, scans it (and with
+/// `--llm` has Claude review it), writes a draft policy and prints a report.
+/// Exits 0 whatever it finds; the findings are in the report.
+fn scout(
+    out: &Path,
+    force: bool,
+    pins: Option<&Path>,
+    llm: bool,
+    command: &ServerCommand,
+) -> ExitCode {
+    init_logging();
+    if out.exists() && !force {
+        error!(out = %out.display(), "the draft already exists; pass --force to replace it");
+        return ExitCode::from(2);
+    }
+    let pinned = match pins.map(Pins::load).transpose() {
+        Ok(pinned) => pinned,
+        Err(error) => {
+            error!(error = %report(&error), "couldn't read the pins file");
+            return ExitCode::from(2);
+        }
+    };
+    // Checked before the server starts, so a missing key fails fast.
+    let reviewer = match reviewer(llm) {
+        Ok(reviewer) => reviewer,
+        Err(problem) => {
+            error!("{problem}");
+            return ExitCode::from(2);
+        }
+    };
+    warn_if_unpinned(command);
+    let Some(runtime) = runtime() else {
+        return ExitCode::FAILURE;
+    };
+    let inventory = match runtime.block_on(stdio::inventory(command)) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            error!(error = %report(&error), "couldn't list what the server offers");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut findings = scout::scan(&inventory);
+    if let Some(pinned) = &pinned {
+        findings.extend(scout::compare_with_pins(&inventory, pinned));
+    }
+    let review = review(&runtime, reviewer, &inventory, &mut findings);
+
+    let server = command.to_string();
+    let pins = pins.map(|pins| pins_reference(out, pins));
+    let draft = scout::Draft::new(&inventory, &findings, &server, pins.as_deref());
+    if let Err(error) = std::fs::write(out, &draft.text) {
+        error!(out = %out.display(), %error, "couldn't write the draft policy");
+        return ExitCode::FAILURE;
+    }
+    let text = scout::render(
+        &server,
+        &inventory,
+        &findings,
+        &draft,
+        &out.display().to_string(),
+        &review,
+    );
+    let _ = std::io::stdout().write_all(text.as_bytes());
+    ExitCode::SUCCESS
+}
+
+/// How the draft names the pins file: as given when the draft is written in
+/// the current folder (both paths then start from the same place), and
+/// otherwise as an absolute path.
+fn pins_reference(out: &Path, pins: &Path) -> String {
+    let here = out
+        .parent()
+        .is_none_or(|parent| parent.as_os_str().is_empty());
+    if here || pins.is_absolute() {
+        return pins.display().to_string();
+    }
+    std::path::absolute(pins)
+        .unwrap_or_else(|_| pins.to_owned())
+        .display()
+        .to_string()
+}
+
+/// The Claude client for `--llm`.
+#[cfg(feature = "llm")]
+fn reviewer(llm: bool) -> Result<Option<scout::claude::Client>, String> {
+    if !llm {
+        return Ok(None);
+    }
+    let key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .or_else(key_from_dotenv)
+        .ok_or_else(|| report(&scout::claude::Error::MissingApiKey))?;
+    scout::claude::Client::new(key)
+        .map(Some)
+        .map_err(|error| report(&error))
+}
+
+/// `ANTHROPIC_API_KEY` from a `.env` file, read without putting it in this
+/// process's environment: the server Scout starts inherits the environment
+/// and must never see the key.
+#[cfg(feature = "llm")]
+fn key_from_dotenv() -> Option<String> {
+    dotenvy::dotenv_iter()
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|(name, _)| name == "ANTHROPIC_API_KEY")
+        .map(|(_, key)| key)
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// Runs Claude's review when asked, adding its findings; returns a line for
+/// the report. A failed review adds nothing: Scout fails safe.
+#[cfg(feature = "llm")]
+fn review(
+    runtime: &tokio::runtime::Runtime,
+    reviewer: Option<scout::claude::Client>,
+    inventory: &mcp_mandate_pin::Inventory,
+    findings: &mut Vec<scout::Finding>,
+) -> String {
+    let Some(client) = reviewer else {
+        return "not run (add --llm to include it)".to_owned();
+    };
+    info!(
+        model = scout::MODEL,
+        "sending the server's definitions to the Claude API for review"
+    );
+    match runtime.block_on(scout::review(&client, inventory)) {
+        Ok(review) => {
+            let count = review.findings.len();
+            findings.extend(review.findings);
+            let mut line = format!(
+                "{count} finding{} from {}",
+                if count == 1 { "" } else { "s" },
+                review.model
+            );
+            if review.ignored > 0 {
+                line.push_str(&format!(
+                    " ({} more dropped: they named nothing the server offers, or had no valid severity)",
+                    review.ignored
+                ));
+            }
+            line
+        }
+        Err(error) => {
+            let error = report(&error);
+            warn!(%error, "Claude's review failed; the draft uses the rule scan only");
+            format!("failed ({error}); the draft uses the rule scan only")
+        }
+    }
+}
+
+#[cfg(not(feature = "llm"))]
+fn reviewer(llm: bool) -> Result<Option<std::convert::Infallible>, String> {
+    if llm {
+        Err("this build has no Claude review (it was built without the `llm` feature)".to_owned())
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(feature = "llm"))]
+fn review(
+    _: &tokio::runtime::Runtime,
+    _: Option<std::convert::Infallible>,
+    _: &mcp_mandate_pin::Inventory,
+    _: &mut Vec<scout::Finding>,
+) -> String {
+    "not available in this build".to_owned()
+}
+
 /// `mcp-mandate pin`: records what the server offers into a pins file.
 fn pin(out: &Path, force: bool, command: &ServerCommand) -> ExitCode {
     init_logging();
@@ -376,13 +568,6 @@ fn runtime() -> Option<tokio::runtime::Runtime> {
     }
 }
 
-fn join(args: &[OsString]) -> String {
-    args.iter()
-        .map(|arg| arg.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn with(path: &Option<PathBuf>) -> String {
     path.as_deref()
         .map(Path::display)
@@ -453,6 +638,25 @@ mod tests {
     fn run_requires_a_policy_and_a_server_command() {
         assert!(Cli::try_parse_from(["mcp-mandate", "run", "--", "cat"]).is_err());
         assert!(Cli::try_parse_from(["mcp-mandate", "run", "--policy", "p.toml"]).is_err());
+    }
+
+    #[test]
+    fn scout_writes_a_draft_and_needs_llm_to_call_claude() {
+        let cli = Cli::try_parse_from(["mcp-mandate", "scout", "--", "server"]).unwrap();
+        let Command::Scout { out, llm, pins, .. } = cli.command else {
+            panic!("expected the scout command");
+        };
+        assert_eq!(out, PathBuf::from("mcp-mandate.draft.toml"));
+        assert!(!llm, "the Claude review is opt-in");
+        assert_eq!(pins, None);
+    }
+
+    #[test]
+    fn the_draft_names_the_pins_file_so_it_resolves_from_the_draft() {
+        let here = pins_reference(Path::new("draft.toml"), Path::new("x.pins.toml"));
+        assert_eq!(here, "x.pins.toml");
+        let elsewhere = pins_reference(Path::new("drafts/d.toml"), Path::new("x.pins.toml"));
+        assert!(Path::new(&elsewhere).is_absolute(), "{elsewhere}");
     }
 
     #[test]

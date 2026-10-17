@@ -1,17 +1,29 @@
 [package]
 name = "mcp-mandate-scout"
-description = "Reviews MCP servers and drafts Mandate policies"
+description = "Reviews MCP servers and drafts mcp-mandate policies"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["llm"]
+# The optional Claude review, which needs an HTTPS client. Without it,
+# Scout runs the rule-based scan only.
+llm = ["dep:reqwest"]
+
 [dependencies]
-reqwest.workspace = true
+mcp-mandate-pin.workspace = true
+regex.workspace = true
+reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+mcp-mandate-policy.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
