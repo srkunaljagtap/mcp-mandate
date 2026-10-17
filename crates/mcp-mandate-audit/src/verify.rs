@@ -72,8 +72,24 @@ pub fn verify(path: &Path, anchor: Option<&str>) -> Result<Report, VerifyError> 
     let file = File::open(path).map_err(read_error)?;
     // Waits out any write in progress, so the last line is whole.
     file.lock_shared().map_err(read_error)?;
-    let mut reader = BufReader::new(&file);
+    let checked = check(BufReader::new(&file), anchor, &read_error);
+    let _ = file.unlock();
+    checked
+}
 
+/// Like [`verify`], for a log read from anywhere (a pipe, a download).
+pub fn verify_reader(reader: impl BufRead, anchor: Option<&str>) -> Result<Report, VerifyError> {
+    check(reader, anchor, &|source| VerifyError::Read {
+        path: PathBuf::from("(input)"),
+        source,
+    })
+}
+
+fn check(
+    mut reader: impl BufRead,
+    anchor: Option<&str>,
+    read_error: &dyn Fn(std::io::Error) -> VerifyError,
+) -> Result<Report, VerifyError> {
     let mut report = Report {
         entries: 0,
         sessions: 0,
@@ -138,8 +154,6 @@ pub fn verify(path: &Path, anchor: Option<&str>) -> Result<Report, VerifyError> 
         report.entries = number;
         report.head = sealed.hash;
     }
-    let _ = file.unlock();
-
     if let Some(anchor) = anchor
         && report.anchor_at.is_none()
         && anchor != GENESIS
@@ -269,5 +283,39 @@ mod tests {
             verify(&path, Some(&head)),
             Err(VerifyError::AnchorMissing { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::{seal, unseal};
+
+    proptest! {
+        #[test]
+        fn any_bytes_are_checked_without_panicking(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = unseal(&bytes);
+            let _ = verify_reader(&bytes[..], None);
+        }
+
+        #[test]
+        fn any_object_seals_and_unseals(fields in prop::collection::btree_map("[a-z]{1,8}", r"\PC{0,24}", 1..6)) {
+            let body = serde_json::to_vec(&fields).unwrap();
+            let (line, hash) = seal(body);
+            let sealed = unseal(&line[..line.len() - 1]).unwrap();
+            prop_assert_eq!(sealed.hash, hash);
+        }
+
+        #[test]
+        fn any_single_byte_edit_is_caught(fields in prop::collection::btree_map("[a-z]{1,8}", "[ -~]{0,24}", 1..6), at in any::<prop::sample::Index>(), byte in 32u8..127) {
+            let (mut line, _) = seal(serde_json::to_vec(&fields).unwrap());
+            line.pop();
+            let index = at.index(line.len());
+            prop_assume!(line[index] != byte);
+            line[index] = byte;
+            prop_assert!(unseal(&line).is_err());
+        }
     }
 }

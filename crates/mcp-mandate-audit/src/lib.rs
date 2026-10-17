@@ -21,7 +21,7 @@ mod verify;
 
 pub use event::{Event, EventKind, MessageKind, Origin, Verdict};
 pub use log::{AuditError, Log, Recorder};
-pub use verify::{Problem, Report, VerifyError, verify};
+pub use verify::{Problem, Report, VerifyError, verify, verify_reader};
 
 use sha2::{Digest, Sha256};
 

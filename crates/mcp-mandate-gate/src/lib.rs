@@ -14,8 +14,11 @@
 //! - Taint: once a tool that reads untrusted content (or a resource) has
 //!   answered, the session is tainted and tools that can send data out are
 //!   held for the rest of the session.
-//! - Secrets: redacted from everything the server sends, and blocked in
-//!   tool-call arguments.
+//! - Secrets: redacted from everything the server sends (keys included),
+//!   and blocked in what the client sends: tool and prompt arguments and
+//!   resource URIs.
+//! - Protocol: a response must answer a request the client is still
+//!   waiting for, and a message the gate can't read in full doesn't pass.
 //!
 //! - Audit: every message gets an entry (what it was, what the gate did and
 //!   why, and hashes, never content). A message whose entry can't be
@@ -108,6 +111,8 @@ enum Pending {
     ToolCall(String),
     /// A resource read, whose content may taint the session.
     ResourceRead,
+    /// Any other request: its response only needs to be expected.
+    Other(String),
 }
 
 /// An approved tool.
@@ -227,8 +232,32 @@ impl Gate {
         let message = classify(frame);
         self.begin(Origin::Client, frame, &message);
         let actions = match message {
-            Ok(Message::Request { id, method }) => self.client_request(frame, &id, &method),
-            Ok(Message::Notification { .. } | Message::Response { .. }) => to_server(frame),
+            Ok(Message::Request { id, method }) => {
+                if self.pending.len() >= MAX_PENDING {
+                    let reason = "too many requests are waiting for the server".to_owned();
+                    let reply = reply_for(&method);
+                    let actions = self.block_client(frame, &id, &method, reason, reply);
+                    return self.record(Origin::Client, frame, actions);
+                }
+                let actions = self.client_request(frame, &id, &method);
+                // Every request that reaches the server is expected to be
+                // answered once; any other response is dropped.
+                if forwards_to_server(&actions) {
+                    self.pending
+                        .entry(id_key(&id))
+                        .or_insert(Pending::Other(method));
+                }
+                actions
+            }
+            Ok(Message::Notification { method }) => {
+                if method == "notifications/cancelled"
+                    && let Some(id) = params(frame).get("requestId")
+                {
+                    self.pending.remove(&id_key(id));
+                }
+                to_server(frame)
+            }
+            Ok(Message::Response { .. }) => to_server(frame),
             Ok(Message::Batch { len }) => self.batch(len, Action::ToServer(frame.to_vec())),
             Err(ParseError::Empty) => return Vec::new(),
             Err(error) => self.drop_line(&error, "client→server", frame),
@@ -241,10 +270,10 @@ impl Gate {
         let message = classify(frame);
         self.begin(Origin::Server, frame, &message);
         let actions = match message {
-            Ok(Message::Response { id, .. }) => {
-                let pending = self.pending.remove(&id_key(&id));
-                self.server_response(frame, pending)
-            }
+            Ok(Message::Response { id, .. }) => match self.pending.remove(&id_key(&id)) {
+                Some(pending) => self.server_response(frame, Some(pending)),
+                None => self.unexpected_response(frame),
+            },
             Ok(Message::Request { id, method }) => self.server_request(frame, &id, &method),
             Ok(Message::Notification { method }) => {
                 if method.ends_with("/list_changed") {
@@ -503,14 +532,32 @@ impl Gate {
         let reason = match params.get("name").and_then(Value::as_str) {
             Some(name) => {
                 self.event.item = Some(clip(name, MAX_NAME));
-                if self.session.prompts.contains(name) {
+                if !self.session.prompts.contains(name) {
+                    self.not_verified(Kind::Prompt, name)
+                } else if let Some(kind) = params
+                    .get("arguments")
+                    .and_then(|arguments| self.secret_in(arguments))
+                {
+                    format!(
+                        "prompt `{name}`: its arguments contain what looks like a secret ({kind})"
+                    )
+                } else {
                     return to_server(frame);
                 }
-                self.not_verified(Kind::Prompt, name)
             }
             None => "the request doesn't name a prompt".to_owned(),
         };
         self.block_client(frame, id, "prompts/get", reason, Reply::Error)
+    }
+
+    /// A secret in what the client sends, when the policy blocks those.
+    fn secret_in(&self, value: &Value) -> Option<String> {
+        if !self.policy.secrets.block_in_arguments {
+            return None;
+        }
+        self.secrets
+            .find_in_json(value)
+            .map(|kind| kind.to_string())
     }
 
     fn resource_request(&mut self, frame: &[u8], id: &Value, method: &str) -> Vec<Action> {
@@ -518,13 +565,20 @@ impl Gate {
         if let Some(uri) = params.get("uri").and_then(Value::as_str) {
             self.event.item = Some(clip(uri, MAX_NAME));
         }
-        let actions = match params.get("uri").and_then(Value::as_str) {
-            Some(uri) if self.session.resource_allowed(uri) => to_server(frame),
-            Some(uri) => {
+        let uri = params.get("uri").and_then(Value::as_str);
+        // A template accepts any suffix, so a URI can carry data out.
+        let secret = uri.and_then(|uri| self.secret_in(&json!(uri)));
+        let actions = match (uri, secret) {
+            (Some(_), Some(kind)) => {
+                let reason = format!("the resource URI contains what looks like a secret ({kind})");
+                self.block_client(frame, id, method, reason, Reply::Error)
+            }
+            (Some(uri), None) if self.session.resource_allowed(uri) => to_server(frame),
+            (Some(uri), None) => {
                 let reason = self.not_verified(Kind::Resource, uri);
                 self.block_client(frame, id, method, reason, Reply::Error)
             }
-            None => {
+            (None, _) => {
                 let reason = "the request doesn't name a resource".to_owned();
                 self.block_client(frame, id, method, reason, Reply::Error)
             }
@@ -536,6 +590,20 @@ impl Gate {
             self.pending.insert(id_key(id), Pending::ResourceRead);
         }
         actions
+    }
+
+    /// A response to no request the client is waiting for: a server
+    /// answering twice, or making one up. Dropped (in observe mode, passed
+    /// on after the usual checks).
+    fn unexpected_response(&mut self, frame: &[u8]) -> Vec<Action> {
+        let reason = "a response to no request the client is waiting for";
+        self.note_block(reason, audit::Verdict::Drop);
+        if self.observe() {
+            warn!("would drop {reason} (observe mode)");
+            return self.server_response(frame, None);
+        }
+        warn!("dropped {reason}");
+        Vec::new()
     }
 
     /// Why an item can't be used: never pinned, changed, or not yet listed.
@@ -565,6 +633,7 @@ impl Gate {
                 self.event.item = Some(clip(tool, MAX_NAME));
             }
             Some(Pending::ResourceRead) => self.event.method = Some("resources/read".to_owned()),
+            Some(Pending::Other(method)) => self.event.method = Some(method.clone()),
             None => {}
         }
         let redact = self.policy.secrets.redact_responses;
@@ -572,7 +641,16 @@ impl Gate {
             return to_client(frame);
         }
         let Ok(mut message) = serde_json::from_slice::<Value>(frame) else {
-            return to_client(frame);
+            // Its envelope parsed but the whole message doesn't (nested too
+            // deeply, say): it can't be checked, so it doesn't pass.
+            let reason = "the message can't be read in full (it's nested too deeply), so it can't be checked";
+            self.note_block(reason, audit::Verdict::Drop);
+            if self.observe() {
+                warn!("would drop a server message: {reason} (observe mode)");
+                return to_client(frame);
+            }
+            warn!("dropped a server message: {reason}");
+            return Vec::new();
         };
         let mut modified = match pending {
             Some(Pending::List(method)) => match method.as_str() {
@@ -603,7 +681,7 @@ impl Gate {
                 }
                 false
             }
-            None => false,
+            Some(Pending::Other(_)) | None => false,
         };
         if redact {
             modified |= self.redact(&mut message);
@@ -769,7 +847,15 @@ impl Gate {
             _ => self.policy.unknown_requests,
         };
         match rule {
-            Rule::Allow => to_client(frame),
+            Rule::Allow => {
+                // A sampling request puts the server's text in front of the
+                // model, like a tool's output does.
+                if method == "sampling/createMessage" {
+                    self.mark_tainted("the server's `sampling/createMessage` request".to_owned());
+                }
+                // Checked like a response: secrets are redacted.
+                self.server_response(frame, None)
+            }
             Rule::Hold => {
                 let reason = format!(
                     "the server's `{method}` request needs your approval, and approvals aren't supported yet"

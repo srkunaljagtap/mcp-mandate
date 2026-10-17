@@ -275,6 +275,39 @@ against it later:
 mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
 ```
 
+## How it's tested
+
+- **Attack corpus.** [corpus/](corpus/) holds attacks as plain JSON that
+  any MCP security tool can replay: poisoned and changed tools, exfiltration
+  after untrusted reads, secrets in both directions, shell injection, and
+  protocol abuse. Every pull request runs all of them through the gate.
+  - Every attack must be stopped: blocked, hidden, redacted or dropped (54
+    today).
+  - Every benign case must pass untouched, so normal use isn't blocked (16
+    today).
+  - Every known gap must still behave as documented (below), so a fix gets
+    noticed.
+- **Fuzzing.** Property tests feed random input to every parser (messages,
+  framing, event streams, policy, pins and audit log files) on every pull
+  request. They also check that a secret planted anywhere in a server's
+  message never reaches the client. Coverage-guided fuzzing
+  ([fuzz/](fuzz/), cargo-fuzz) runs each parser weekly.
+- **Latency.** CI fails if the gate adds more than 5 ms per message at the
+  median, measured with every check on and the audit log being written.
+  Typically it adds about 30 µs.
+- **Real processes and servers.** End-to-end tests run the binary against
+  scripted servers, a fake identity provider and fake remote servers. On
+  Linux, macOS and Windows, stopping a server also stops everything it
+  started: its process group, or a Windows Job Object.
+
+**Known gaps** (each proven by a corpus case):
+
+- A tool whose annotations falsely claim it's closed-world doesn't taint the
+  session unless the policy labels it `reads_untrusted = true`. Scout's
+  `secret-access` and `send-to-address` checks help find such tools.
+- A secret with no recognizable shape passes. Add your own shapes under
+  `[[secrets.patterns]]`.
+
 ## What it doesn't do
 
 - **It only sees MCP traffic routed through it.** Your agent's built-in tools
@@ -294,9 +327,8 @@ mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
   client to the same one (sticky sessions). A restart ends every session.
 - **No AI decides what to block.** The gate is plain rules; Scout's LLM
   review is optional and only drafts rules for you to approve.
-- **On Windows, stopping a server stops only the process mcp-mandate
-  started.** On Linux and macOS the server's whole process group is stopped,
-  including anything it launched (such as the `node` process behind `npx`).
+- **Known gaps** found by the attack corpus are listed in
+  [How it's tested](#how-its-tested).
 
 ## Build from source
 
@@ -325,6 +357,8 @@ cargo deny check        # licenses, advisories, sources (cargo install cargo-den
 | `crates/mcp-mandate-taint` | Which tools read untrusted content or send data out; secret detection and redaction |
 | `crates/mcp-mandate-scout` | Scout: the rule scan, draft policies and the optional Claude review |
 | `policies/` | Example policies and gateway configuration |
+| `corpus/` | The attack corpus: attacks, benign cases and known gaps, as JSON |
+| `fuzz/` | Coverage-guided fuzz targets (cargo-fuzz, nightly) |
 
 ## Contributing and security
 

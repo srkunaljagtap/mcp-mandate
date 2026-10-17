@@ -16,7 +16,7 @@
 mod config;
 mod identity;
 mod session;
-mod sse;
+pub mod sse;
 mod tls;
 mod upstream;
 

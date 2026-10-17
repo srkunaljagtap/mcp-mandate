@@ -40,6 +40,8 @@ jsonschema = { version = "0.59.0", default-features = false }
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
 regex = "1.13.1"
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal"] }
+# Random-input tests on stable Rust; the defaults would add process forking.
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -52,6 +54,8 @@ tokio-rustls = "0.26.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 which = "8.0.6"
+# Windows Job Objects, to stop a server together with everything it starts.
+win32job = "2.0.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

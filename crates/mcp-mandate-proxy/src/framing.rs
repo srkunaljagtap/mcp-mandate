@@ -82,3 +82,41 @@ mod tests {
         assert!(matches!(error, FrameError::TooLarge { limit: 8 }));
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn frames_are_the_same_whatever_the_chunk_size(lines in prop::collection::vec("[ -~]{0,40}", 1..8), capacity in 1usize..16) {
+            let input: Vec<u8> = lines.iter().flat_map(|line| format!("{line}\n").into_bytes()).collect();
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let frames = runtime.block_on(async {
+                let mut reader = tokio::io::BufReader::with_capacity(capacity, &input[..]);
+                let mut frame = Vec::new();
+                let mut frames = Vec::new();
+                while read_frame(&mut reader, &mut frame, 1024).await.unwrap() {
+                    frames.push(String::from_utf8(frame.clone()).unwrap());
+                }
+                frames
+            });
+            let expected: Vec<String> = lines.iter().map(|line| format!("{line}\n")).collect();
+            prop_assert_eq!(frames, expected);
+        }
+
+        #[test]
+        fn oversized_input_is_refused_not_buffered(length in 65usize..512) {
+            let input = vec![b'x'; length];
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let result = runtime.block_on(async {
+                let mut reader = tokio::io::BufReader::with_capacity(8, &input[..]);
+                let mut frame = Vec::new();
+                read_frame(&mut reader, &mut frame, 64).await
+            });
+            prop_assert!(result.is_err());
+        }
+    }
+}

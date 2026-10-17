@@ -169,3 +169,38 @@ mod tests {
         assert!(!String::from_utf8(unsafe_id).unwrap().contains("data: x"));
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn any_stream_parses_without_panicking_or_overflowing(chunks in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..64), 0..16)) {
+            let mut parser = Parser::new(128);
+            for chunk in chunks {
+                match parser.push(&chunk) {
+                    Ok(events) => {
+                        for event in events {
+                            prop_assert!(event.data.len() <= 128);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        #[test]
+        fn what_is_written_reads_back_whatever_the_chunking(message in "[ -~]{1,200}", id in "[0-9a-z]{0,8}", split in any::<prop::sample::Index>()) {
+            let written = encode(Some(&id).filter(|id| !id.is_empty()).map(String::as_str), message.as_bytes());
+            let cut = split.index(written.len());
+            let mut parser = Parser::new(1024);
+            let mut events = parser.push(&written[..cut]).unwrap();
+            events.extend(parser.push(&written[cut..]).unwrap());
+            prop_assert_eq!(events.len(), 1);
+            prop_assert_eq!(&events[0].data, message.trim_ascii_end().as_bytes());
+        }
+    }
+}

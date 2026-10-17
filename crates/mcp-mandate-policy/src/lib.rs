@@ -643,3 +643,25 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn any_text_parses_or_fails_without_panicking(text in r"\PC{0,256}") {
+            let _ = Policy::parse(&text, Path::new("."));
+        }
+
+        #[test]
+        fn any_tool_name_gets_a_decision(name in r"\PC{0,64}", pattern in r"[a-z*?_\[\]{},-]{0,16}") {
+            let text = format!("[[tools]]\nmatch = {}\naction = \"allow\"\n", toml::Value::String(pattern));
+            if let Ok(policy) = Policy::parse(&text, Path::new(".")) {
+                let _ = policy.for_tool(&name);
+            }
+        }
+    }
+}

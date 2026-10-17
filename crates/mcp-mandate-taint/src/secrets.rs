@@ -153,6 +153,8 @@ fn skip(key: &str, binary: bool) -> bool {
     key == "blob" || (binary && key == "data")
 }
 
+/// Visits every string in `value`: values and object keys alike (a key can
+/// carry a secret as well as a value can).
 fn walk(value: &Value, visit: &mut impl FnMut(&str)) {
     match value {
         Value::String(text) => visit(text),
@@ -160,6 +162,7 @@ fn walk(value: &Value, visit: &mut impl FnMut(&str)) {
         Value::Object(map) => {
             let binary = is_binary_block(map);
             for (key, item) in map {
+                visit(key);
                 if !skip(key, binary) {
                     walk(item, visit);
                 }
@@ -175,10 +178,14 @@ fn walk_mut(value: &mut Value, visit: &mut impl FnMut(&mut String)) {
         Value::Array(items) => items.iter_mut().for_each(|item| walk_mut(item, visit)),
         Value::Object(map) => {
             let binary = is_binary_block(map);
-            for (key, item) in map.iter_mut() {
-                if !skip(key, binary) {
-                    walk_mut(item, visit);
+            // Keys can't be changed in place, so the map is rebuilt.
+            for (key, mut item) in std::mem::take(map) {
+                if !skip(&key, binary) {
+                    walk_mut(&mut item, visit);
                 }
+                let mut key = key;
+                visit(&mut key);
+                map.insert(key, item);
             }
         }
         _ => {}
@@ -286,6 +293,21 @@ mod tests {
         assert_eq!(
             detector.find_in_json(&json!({"args": ["x", "itk_0123456789abcdef"]})),
             Some("internal-token".to_owned())
+        );
+    }
+
+    #[test]
+    fn finds_and_redacts_secrets_in_object_keys() {
+        let detector = SecretDetector::new(Vec::new());
+        let mut message = json!({"result": {"AKIAIOSFODNN7EXAMPLE": {"note": "ok"}}});
+        assert_eq!(
+            detector.find_in_json(&message),
+            Some("aws-access-key-id".to_owned())
+        );
+        assert_eq!(detector.redact_json(&mut message), ["aws-access-key-id"]);
+        assert_eq!(
+            message,
+            json!({"result": {"[REDACTED: aws-access-key-id]": {"note": "ok"}}})
         );
     }
 }

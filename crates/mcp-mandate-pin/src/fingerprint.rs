@@ -86,3 +86,27 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+    use serde_json::{Map, Value};
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn key_order_never_changes_a_fingerprint(pairs in prop::collection::vec(("[a-z]{1,6}", r"\PC{0,12}"), 0..8)) {
+            let forward: Map<String, Value> = pairs.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+            let backward: Map<String, Value> = pairs.iter().rev().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+            // Later duplicates win in both, so compare only when keys are unique.
+            prop_assume!(forward.len() == pairs.len());
+            prop_assert_eq!(fingerprint(&Value::Object(forward)), fingerprint(&Value::Object(backward)));
+        }
+
+        #[test]
+        fn any_pins_text_parses_or_fails_without_panicking(text in r"\PC{0,256}") {
+            let _ = toml::from_str::<crate::Pins>(&text);
+        }
+    }
+}
