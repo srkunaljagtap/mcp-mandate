@@ -1027,6 +1027,7 @@ name = "mcp-mandate"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "mcp-mandate-audit",
  "mcp-mandate-gate",
  "mcp-mandate-pin",
  "mcp-mandate-policy",
@@ -1038,10 +1039,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-mandate-audit"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "mcp-mandate-gate"
 version = "0.1.0"
 dependencies = [
  "jsonschema",
+ "mcp-mandate-audit",
  "mcp-mandate-pin",
  "mcp-mandate-policy",
  "mcp-mandate-taint",
@@ -1078,6 +1090,7 @@ dependencies = [
 name = "mcp-mandate-proxy"
 version = "0.1.0"
 dependencies = [
+ "mcp-mandate-audit",
  "mcp-mandate-gate",
  "mcp-mandate-pin",
  "mcp-mandate-policy",

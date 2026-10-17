@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 clap.workspace = true
+mcp-mandate-audit.workspace = true
 mcp-mandate-gate.workspace = true
 mcp-mandate-pin.workspace = true
 mcp-mandate-policy.workspace = true

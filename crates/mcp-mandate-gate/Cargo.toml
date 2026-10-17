@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 jsonschema.workspace = true
+mcp-mandate-audit.workspace = true
 mcp-mandate-pin.workspace = true
 mcp-mandate-policy.workspace = true
 mcp-mandate-taint.workspace = true

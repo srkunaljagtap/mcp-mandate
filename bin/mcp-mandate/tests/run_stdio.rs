@@ -220,3 +220,37 @@ fn a_server_that_ignores_stop_requests_is_killed() {
         "the server's helper process survived"
     );
 }
+
+#[test]
+fn refuses_to_start_when_the_audit_log_cannot_be_opened() {
+    // A file where the log's folder should be.
+    let blocker = temp_file("blocker", "");
+    let policy = temp_file(
+        "unloggable.policy.toml",
+        &format!("[audit]\npath = \"{}/audit.jsonl\"\n", blocker.display()),
+    );
+    let done = run(
+        &[
+            "run",
+            "--policy",
+            &policy.display().to_string(),
+            "--",
+            "cat",
+        ],
+        &[],
+        PING,
+    );
+
+    assert_eq!(done.status.code(), Some(2));
+    assert!(done.stdout.is_empty());
+    assert!(
+        done.stderr.contains("couldn't open the audit log"),
+        "{}",
+        done.stderr
+    );
+    assert!(
+        !done.stderr.contains("started MCP server"),
+        "{}",
+        done.stderr
+    );
+}

@@ -85,3 +85,11 @@ regex = "itk_[a-z0-9]{32}"
 [taint]
 # Reading a server's resources taints the session.
 resources_are_untrusted = true
+
+# --- Audit log ---------------------------------------------------------------
+
+[audit]
+# Where every decision is recorded, relative to this file. Without it, the
+# log goes next to this file, named after it (example.toml →
+# example.audit.jsonl). (Not a default: an example.)
+path = "logs/everything.audit.jsonl"

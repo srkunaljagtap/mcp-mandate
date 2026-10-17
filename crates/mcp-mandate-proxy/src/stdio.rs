@@ -138,12 +138,16 @@ pub async fn run(command: &ServerCommand, gate: Gate) -> Result<i32, ProxyError>
         server_reader: tokio::spawn(read_side(
             BufReader::new(server_out),
             Side::Server,
-            gate,
+            Arc::clone(&gate),
             to_server,
             to_client,
         )),
     };
-    supervise(&mut server, &mut signals, tasks).await
+    let result = supervise(&mut server, &mut signals, tasks).await;
+    if let Ok(mut gate) = gate.lock() {
+        gate.end_session(result.as_ref().ok().copied());
+    }
+    result
 }
 
 /// Starts the server with piped stdin and stdout.
@@ -522,15 +526,25 @@ fn exit_code(status: ExitStatus) -> i32 {
 mod tests {
     use std::path::Path;
 
+    use mcp_mandate_audit::{AuditError, Event, Recorder};
     use mcp_mandate_policy::Policy;
 
     use super::*;
+
+    /// An audit log that keeps nothing.
+    struct Discard;
+
+    impl Recorder for Discard {
+        fn record(&mut self, _: &Event) -> Result<(), AuditError> {
+            Ok(())
+        }
+    }
 
     /// A gate for a server that was never pinned: protocol plumbing passes,
     /// every tool call is blocked.
     fn unpinned_gate() -> Arc<Mutex<Gate>> {
         let policy = Policy::parse("", Path::new(".")).unwrap();
-        Arc::new(Mutex::new(Gate::new(policy, None)))
+        Arc::new(Mutex::new(Gate::new(policy, None, Box::new(Discard))))
     }
 
     /// Feeds `input` to the client side; returns what was queued for the

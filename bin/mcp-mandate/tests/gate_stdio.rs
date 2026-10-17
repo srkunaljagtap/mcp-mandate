@@ -246,3 +246,117 @@ fn read_email_then_exfiltrate_is_held_and_planted_keys_are_redacted() {
     );
     assert!(logs.contains("redacted secrets"), "{logs}");
 }
+
+#[test]
+fn every_decision_is_chained_into_the_audit_log_and_verify_catches_an_edit() {
+    let approved = Inventory {
+        tools: vec![echo_tool("Echoes the message")],
+        ..Inventory::default()
+    };
+    let pins = temp_file(
+        "audit.pins.toml",
+        &Pins::from_inventory("test", &approved).to_toml(),
+    );
+    let policy = temp_file(
+        "audit.policy.toml",
+        &format!(
+            "pins = \"{}\"\n\n[[tools]]\nmatch = \"echo\"\naction = \"allow\"\n",
+            pins.display()
+        ),
+    );
+    // Next to the policy, named after it.
+    let log = policy.with_extension("audit.jsonl");
+    let _ = std::fs::remove_file(&log);
+
+    let listing =
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [echo_tool("Echoes the message")]}});
+    let echoed = json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "Echo: hi"}]}});
+    let (script, envs) = scripted_server(&[&listing.to_string(), &echoed.to_string()]);
+    let policy_arg = policy.display().to_string();
+    let mut session = Session::start(
+        &["run", "--policy", &policy_arg, "--", "sh", "-c", &script],
+        &envs,
+    );
+    session.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
+    session.recv();
+    session.send(&call(2, "echo", json!({"message": "hi"})));
+    assert_eq!(session.recv()["id"], 2);
+    session.send(&call(3, "rm_rf", json!({"path": "/"})));
+    tool_error(&session.recv());
+    let (status, logs) = session.finish();
+    assert!(status.success(), "{logs}");
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    let entries: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let summary: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry["event"].as_str().unwrap(),
+                entry["verdict"].as_str().unwrap_or("-"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("session-start", "-"),
+            ("message", "allow"), // tools/list
+            ("message", "allow"), // the listing
+            ("message", "allow"), // echo
+            ("message", "allow"), // its result
+            ("message", "block"), // rm_rf
+            ("session-end", "-"),
+        ]
+    );
+    let start = &entries[0];
+    assert_eq!(start["server"], "sh");
+    assert_eq!(
+        start["policy_sha256"],
+        mcp_mandate_audit::sha256_hex(&std::fs::read(&policy).unwrap())
+    );
+    assert_eq!(
+        entries[3]["args_sha256"],
+        fingerprint(&json!({"message": "hi"}))
+    );
+    assert_eq!(entries[6]["exit_code"], 0);
+    assert!(!text.contains("Echo: hi"), "no message content in the log");
+
+    let verify = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mcp-mandate"))
+            .args(["audit", "verify"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let log_arg = log.display().to_string();
+    let intact = verify(&[&log_arg]);
+    let report = String::from_utf8_lossy(&intact.stdout);
+    assert!(intact.status.success(), "{report}");
+    assert!(report.contains("intact"), "{report}");
+    assert!(report.contains("7 entries in 1 session"), "{report}");
+    let by_policy = verify(&[
+        "--policy",
+        &policy_arg,
+        "--anchor",
+        entries[6]["hash"].as_str().unwrap(),
+    ]);
+    assert!(by_policy.status.success());
+
+    // Someone turns the block into an allow.
+    std::fs::write(
+        &log,
+        text.replacen("\"verdict\":\"block\"", "\"verdict\":\"allow\"", 1),
+    )
+    .unwrap();
+    let tampered = verify(&[&log_arg]);
+    let report = String::from_utf8_lossy(&tampered.stdout);
+    assert_eq!(tampered.status.code(), Some(1), "{report}");
+    assert!(
+        report.contains("NOT INTACT: line 6: it doesn't match its own hash"),
+        "{report}"
+    );
+}

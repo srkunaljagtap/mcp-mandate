@@ -8,8 +8,8 @@ deterministic check before it reaches a server, so an agent that was tricked
 by something it read can't act with your keys.
 
 > **Status: under construction.** v0.1.0 isn't released. Pinning, policy,
-> taint tracking and secret redaction work for local (stdio) servers; the
-> HTTP gateway and the audit log don't exist yet. Don't rely on it for
+> taint tracking, secret redaction and the audit log work for local (stdio)
+> servers; the HTTP gateway doesn't exist yet. Don't rely on it for
 > protection.
 
 ## How it works
@@ -38,7 +38,7 @@ For each tool call the gate will:
 8. **Redact and label** the response: scrub secrets, mark untrusted output.
 9. **Record** a hash-chained audit entry for every decision.
 
-Steps 2, 3, 4, 5, 7 and 8 work today for stdio servers (step 8 redacts
+Steps 2, 3, 4, 5, 7, 8 and 9 work today for stdio servers (step 8 redacts
 secrets, not yet other personal data).
 
 ## Quick start
@@ -90,6 +90,13 @@ Logs go to stderr, never stdout (stdout carries the MCP traffic). Set
 `MCP_MANDATE_LOG=debug` to log every decision; the default `info` logs what
 was hidden or blocked.
 
+**4. Check the record.** Every decision is also written to an audit log
+next to the policy (`policy.toml` → `policy.audit.jsonl`):
+
+```sh
+mcp-mandate audit verify policy.audit.jsonl
+```
+
 ## What's checked today
 
 - **Pinning.** Tools, prompts, resources, resource templates and the server's
@@ -119,6 +126,9 @@ was hidden or blocked.
   blocked unless its rule sets `allow_secrets = true`. Add your own patterns
   under `[[secrets.patterns]]`. Personal data such as emails isn't redacted
   yet.
+- **Audit log.** Every message that crosses the gate is recorded with what
+  the gate did and why, in a hash chain that shows any later edit. See
+  [The audit log](#the-audit-log).
 - **Modes.** `enforce` (the default) blocks; `observe` logs what would be
   blocked, hidden or redacted and lets everything through, for trying a
   policy on real traffic.
@@ -127,6 +137,45 @@ A blocked tool call comes back to the agent as a tool error that says why
 (for example, "Blocked by mcp-mandate: tool `x` changed since it was
 approved"). "Hold" needs a person's approval, which isn't supported yet, so a
 held call is blocked with a reason saying so.
+
+## The audit log
+
+Each message that crosses the gate gets one JSON line: when, which session,
+which side sent it, the method and tool, what the gate did (`allow`,
+`modify`, `block` or `drop`) and why, and SHA-256 hashes of the message
+and of a tool call's arguments. Message content is never written, so the
+log doesn't become a second copy of everything your agent read. With a
+payload in hand, you can still find its entry by its hash. (A hash of a
+short, guessable value, such as a 6-digit code, can be reversed by trying
+every candidate.) Each session's first entry records the mcp-mandate
+version, the mode, and hashes of the policy, the pins file and the server
+command.
+
+```sh
+# What was blocked, and why
+jq -c 'select(.verdict == "block") | {time, item, reason}' policy.audit.jsonl
+```
+
+- **Where:** next to the policy, named after it (`policy.toml` →
+  `policy.audit.jsonl`), or wherever `[audit] path` says. Several sessions
+  can share one log. On Linux and macOS it's created readable only by you.
+  If your policies are in git, add `*.audit.jsonl` to `.gitignore`.
+- **If it can't be written** (full disk, deleted file), nothing passes:
+  requests are answered with an error saying the audit log can't be
+  written, until it can be again. A log that can't be opened stops
+  `mcp-mandate run` from starting. Observe mode only warns.
+- **Tamper evidence.** Each line holds the hash of its own bytes and of the
+  line before it, so editing, removing, adding or reordering lines breaks
+  the chain, and `mcp-mandate audit verify` names the first broken line.
+
+A chain can't show entries cut off its end, or a log rewritten from
+scratch with fresh hashes. To catch those, save the head hash that
+`verify` prints somewhere your agent's account can't write, and check
+against it later:
+
+```sh
+mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
+```
 
 ## What it doesn't do
 
@@ -165,6 +214,7 @@ cargo deny check        # licenses, advisories, sources (cargo install cargo-den
 | Path | What it is |
 |---|---|
 | `bin/mcp-mandate` | The `mcp-mandate` command: `run`, `pin`, `gate`, `scout`, `audit` |
+| `crates/mcp-mandate-audit` | The hash-chained audit log and its verification |
 | `crates/mcp-mandate-gate` | The checks: decides what crosses between client and server, for any transport |
 | `crates/mcp-mandate-pin` | Fingerprints and the pins file |
 | `crates/mcp-mandate-policy` | The policy file and argument checks |

@@ -1,8 +1,9 @@
 //! The gate: decides what crosses between an MCP client and an MCP server.
 //!
 //! It takes one complete JSON-RPC message at a time and says where it goes,
-//! never doing I/O itself, so every transport (stdio today, HTTPS later)
-//! shares exactly the same checks.
+//! so every transport (stdio today, HTTPS later) shares exactly the same
+//! checks. Its only I/O is recording each decision through the audit
+//! [`Recorder`] it's given.
 //!
 //! - Client to server: calls and reads (`tools/call`, `prompts/get`,
 //!   `resources/read`) pass only for items that are pinned, were listed and
@@ -16,6 +17,10 @@
 //! - Secrets: redacted from everything the server sends, and blocked in
 //!   tool-call arguments.
 //!
+//! - Audit: every message gets an entry (what it was, what the gate did and
+//!   why, and hashes, never content). A message whose entry can't be
+//!   written doesn't pass.
+//!
 //! In observe mode every decision is logged but nothing is blocked, hidden
 //! or redacted.
 
@@ -23,11 +28,12 @@ pub mod jsonrpc;
 
 use std::collections::{HashMap, HashSet};
 
-use mcp_mandate_pin::{Kind, Pins, Verdict};
+use mcp_mandate_audit::{self as audit, MessageKind, Origin, Recorder};
+use mcp_mandate_pin::{Kind, Pins, Verdict, fingerprint};
 use mcp_mandate_policy::{Action as Rule, Mode, Policy};
 use mcp_mandate_taint::{Labels, SecretDetector, SecretPattern, Traits};
 use serde_json::{Value, json};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::jsonrpc::{Message, ParseError, classify};
 
@@ -37,6 +43,13 @@ pub const BLOCKED_ERROR_CODE: i64 = -32000;
 
 /// Most client requests waiting for a server response that the gate tracks.
 const MAX_PENDING: usize = 4096;
+
+/// Limits on what one audit entry holds, since either side can send
+/// arbitrarily long names.
+const MAX_NAME: usize = 256;
+const MAX_REASON: usize = 1024;
+const MAX_CHANGES: usize = 50;
+const MAX_ID_BYTES: usize = 128;
 
 /// Where a message goes after the gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +69,22 @@ enum Reply {
     Error,
 }
 
+/// Why a request is blocked. The `detail` goes to the client only, never to
+/// the audit log, because it can quote the arguments.
+struct Refusal {
+    reason: String,
+    detail: Option<String>,
+}
+
+impl From<String> for Refusal {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            detail: None,
+        }
+    }
+}
+
 /// One session's gate.
 pub struct Gate {
     policy: Policy,
@@ -64,6 +93,11 @@ pub struct Gate {
     /// Client requests whose responses the gate inspects, by id.
     pending: HashMap<String, Pending>,
     session: Session,
+    audit: Box<dyn Recorder>,
+    /// The audit entry for the message being checked.
+    event: audit::Event,
+    /// Changes to it beyond [`MAX_CHANGES`], counted rather than listed.
+    more_changes: usize,
 }
 
 /// A client request whose response the gate inspects.
@@ -155,9 +189,9 @@ impl Session {
 }
 
 impl Gate {
-    /// A gate enforcing `policy`. Without `pins`, nothing a server offers is
-    /// approved.
-    pub fn new(policy: Policy, pins: Option<Pins>) -> Self {
+    /// A gate enforcing `policy` and recording every decision to `audit`.
+    /// Without `pins`, nothing a server offers is approved.
+    pub fn new(policy: Policy, pins: Option<Pins>, audit: Box<dyn Recorder>) -> Self {
         let custom = policy
             .secrets
             .patterns
@@ -173,6 +207,9 @@ impl Gate {
             pins,
             pending: HashMap::new(),
             session: Session::default(),
+            audit,
+            event: audit::Event::default(),
+            more_changes: 0,
         }
     }
 
@@ -185,19 +222,25 @@ impl Gate {
         self.policy.mode
     }
 
-    /// Decides what happens to one message from the client.
+    /// Decides what happens to one message from the client, and records it.
     pub fn from_client(&mut self, frame: &[u8]) -> Vec<Action> {
-        match classify(frame) {
+        let message = classify(frame);
+        self.begin(Origin::Client, frame, &message);
+        let actions = match message {
             Ok(Message::Request { id, method }) => self.client_request(frame, &id, &method),
             Ok(Message::Notification { .. } | Message::Response { .. }) => to_server(frame),
             Ok(Message::Batch { len }) => self.batch(len, Action::ToServer(frame.to_vec())),
-            Err(error) => drop_line(&error, "client→server", frame),
-        }
+            Err(ParseError::Empty) => return Vec::new(),
+            Err(error) => self.drop_line(&error, "client→server", frame),
+        };
+        self.record(Origin::Client, frame, actions)
     }
 
-    /// Decides what happens to one message from the server.
+    /// Decides what happens to one message from the server, and records it.
     pub fn from_server(&mut self, frame: &[u8]) -> Vec<Action> {
-        match classify(frame) {
+        let message = classify(frame);
+        self.begin(Origin::Server, frame, &message);
+        let actions = match message {
             Ok(Message::Response { id, .. }) => {
                 let pending = self.pending.remove(&id_key(&id));
                 self.server_response(frame, pending)
@@ -210,12 +253,125 @@ impl Gate {
                 self.server_response(frame, None)
             }
             Ok(Message::Batch { len }) => self.batch(len, Action::ToClient(frame.to_vec())),
-            Err(error) => drop_line(&error, "server→client", frame),
+            Err(ParseError::Empty) => return Vec::new(),
+            Err(error) => self.drop_line(&error, "server→client", frame),
+        };
+        self.record(Origin::Server, frame, actions)
+    }
+
+    /// Records the end of the session, with the code mcp-mandate exits with
+    /// when it ended normally.
+    pub fn end_session(&mut self, exit_code: Option<i32>) {
+        let event = audit::Event {
+            event: audit::EventKind::SessionEnd,
+            exit_code,
+            ..audit::Event::default()
+        };
+        if let Err(error) = self.audit.record(&event) {
+            warn!(error = %describe(&error), "couldn't record the end of the session in the audit log");
         }
     }
 
     fn observe(&self) -> bool {
         self.policy.mode == Mode::Observe
+    }
+
+    /// Starts the audit entry for a message.
+    fn begin(&mut self, from: Origin, frame: &[u8], message: &Result<Message, ParseError>) {
+        let (kind, method, id) = match message {
+            Ok(Message::Request { id, method }) => (MessageKind::Request, Some(method), Some(id)),
+            Ok(Message::Notification { method }) => (MessageKind::Notification, Some(method), None),
+            Ok(Message::Response { id, .. }) => (MessageKind::Response, None, Some(id)),
+            Ok(Message::Batch { .. }) => (MessageKind::Batch, None, None),
+            Err(_) => (MessageKind::Invalid, None, None),
+        };
+        self.more_changes = 0;
+        self.event = audit::Event {
+            from: Some(from),
+            kind: Some(kind),
+            method: method.map(|method| clip(method, MAX_NAME)),
+            id: id.map(audit_id),
+            sha256: Some(audit::sha256_hex(without_line_ending(frame))),
+            ..audit::Event::default()
+        };
+    }
+
+    /// Records what happened to `frame`. A message that can't be recorded
+    /// doesn't pass (in observe mode, it passes with a warning).
+    fn record(&mut self, from: Origin, frame: &[u8], actions: Vec<Action>) -> Vec<Action> {
+        let mut event = std::mem::take(&mut self.event);
+        let (verdict, forwarded) = judge(from, frame, &actions);
+        event.verdict = Some(verdict);
+        event.forwarded_sha256 =
+            forwarded.map(|bytes| audit::sha256_hex(without_line_ending(bytes)));
+        if self.more_changes > 0 {
+            event
+                .changes
+                .push(format!("and {} more", self.more_changes));
+        }
+        let Err(failure) = self.audit.record(&event) else {
+            return actions;
+        };
+        let failure = describe(&failure);
+        if self.observe() {
+            warn!(error = %failure, "couldn't record a decision in the audit log; letting it through (observe mode)");
+            return actions;
+        }
+        error!(error = %failure, "couldn't record a decision in the audit log, so the message doesn't pass; nothing will until the log can be written");
+        self.unrecorded(from, frame, event.method.as_deref())
+    }
+
+    /// Fails closed for a message the audit log couldn't take: answers a
+    /// request with an error, so nobody waits for it, and drops anything
+    /// else.
+    fn unrecorded(&mut self, from: Origin, frame: &[u8], method: Option<&str>) -> Vec<Action> {
+        let text = "Blocked by mcp-mandate: the audit log can't be written, so nothing passes until it can";
+        match (from, classify(frame)) {
+            (Origin::Client, Ok(Message::Request { id, method })) => {
+                self.pending.remove(&id_key(&id));
+                vec![Action::ToClient(encode(&blocked_reply(
+                    &id,
+                    text,
+                    reply_for(&method),
+                )))]
+            }
+            (Origin::Server, Ok(Message::Response { id, .. })) => {
+                let reply = reply_for(method.unwrap_or_default());
+                vec![Action::ToClient(encode(&blocked_reply(&id, text, reply)))]
+            }
+            (Origin::Server, Ok(Message::Request { id, .. })) => {
+                vec![Action::ToServer(encode(&rpc_error(&id, text)))]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Notes why the current message is blocked (or, in observe mode,
+    /// would be).
+    fn note_block(&mut self, reason: &str, would: audit::Verdict) {
+        self.event.reason = Some(clip(reason, MAX_REASON));
+        if self.observe() {
+            self.event.would = Some(would);
+        }
+    }
+
+    /// Notes a change to the current message (in observe mode, one that
+    /// would have been made).
+    fn note_change(&mut self, change: String) {
+        if self.observe() {
+            self.event.would = Some(audit::Verdict::Modify);
+        }
+        if self.event.changes.len() < MAX_CHANGES {
+            self.event.changes.push(clip(&change, MAX_REASON));
+        } else {
+            self.more_changes += 1;
+        }
+    }
+
+    fn drop_line(&mut self, error: &ParseError, direction: &str, frame: &[u8]) -> Vec<Action> {
+        self.event.reason = Some(clip(&error.to_string(), MAX_REASON));
+        warn!(direction, reason = %error, bytes = frame.len(), "dropped a line that isn't JSON-RPC");
+        Vec::new()
     }
 
     fn client_request(&mut self, frame: &[u8], id: &Value, method: &str) -> Vec<Action> {
@@ -257,8 +413,12 @@ impl Gate {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        self.event.item = Some(clip(name, MAX_NAME));
+        self.event.args_sha256 = Some(fingerprint(&arguments));
         let verdict = if self.pending.len() >= MAX_PENDING {
-            Err("too many requests are waiting for the server".to_owned())
+            Err(Refusal::from(
+                "too many requests are waiting for the server".to_owned(),
+            ))
         } else {
             self.check_tool_call(name, &arguments)
         };
@@ -267,7 +427,7 @@ impl Gate {
                 debug!(tool = name, "allowed a tool call");
                 to_server(frame)
             }
-            Err(reason) => self.block_client(frame, id, "tools/call", reason, Reply::ToolError),
+            Err(refusal) => self.block_client(frame, id, "tools/call", refusal, Reply::ToolError),
         };
         // Whatever reaches the server (in observe mode, even a call that
         // would be blocked) is tracked, so its output can taint the session.
@@ -278,9 +438,9 @@ impl Gate {
         actions
     }
 
-    fn check_tool_call(&self, name: &str, arguments: &Value) -> Result<(), String> {
+    fn check_tool_call(&self, name: &str, arguments: &Value) -> Result<(), Refusal> {
         let Some(info) = self.session.tools.get(name) else {
-            return Err(self.not_verified(Kind::Tool, name));
+            return Err(self.not_verified(Kind::Tool, name).into());
         };
         let decision = self.policy.for_tool(name);
         match decision.action {
@@ -288,43 +448,66 @@ impl Gate {
             Rule::Hold => {
                 return Err(format!(
                     "tool `{name}` needs your approval (the policy holds it), and approvals aren't supported yet"
-                ));
+                )
+                .into());
             }
-            Rule::Deny => return Err(format!("tool `{name}` is denied by policy")),
+            Rule::Deny => return Err(format!("tool `{name}` is denied by policy").into()),
         }
         if let Some(source) = &self.session.taint
             && info.traits.sends_out
         {
             return Err(format!(
                 "this session has read untrusted content ({source}) and tool `{name}` can send data out, so it needs your approval, and approvals aren't supported yet"
-            ));
+            )
+            .into());
         }
         decision
             .check_arguments(arguments)
-            .map_err(|problem| format!("tool `{name}`: {problem}"))?;
+            .map_err(|problem| Refusal::from(format!("tool `{name}`: {problem}")))?;
         if self.policy.secrets.block_in_arguments
             && !decision.allow_secrets
             && let Some(kind) = self.secrets.find_in_json(arguments)
         {
             return Err(format!(
                 "tool `{name}`: its arguments contain what looks like a secret ({kind})"
-            ));
+            )
+            .into());
         }
-        match &info.validator {
-            Some(validator) => validator.validate(arguments).map_err(|error| {
-                format!("tool `{name}`: its arguments don't match its schema: {error}")
-            }),
-            None => Err(format!(
-                "tool `{name}` has an input schema mcp-mandate can't check"
-            )),
-        }
+        let Some(validator) = &info.validator else {
+            return Err(
+                format!("tool `{name}` has an input schema mcp-mandate can't check").into(),
+            );
+        };
+        validator.validate(arguments).map_err(|error| {
+            // Where and which rule failed, but not the value: the error's
+            // own text quotes the arguments.
+            let at = error.instance_path().to_string();
+            let at = if at.is_empty() {
+                "the top level".to_owned()
+            } else {
+                at
+            };
+            Refusal {
+                reason: format!(
+                    "tool `{name}`: its arguments don't match its schema (`{}` at {at})",
+                    error.kind().keyword()
+                ),
+                detail: Some(error.to_string()),
+            }
+        })
     }
 
     fn prompt_get(&mut self, frame: &[u8], id: &Value) -> Vec<Action> {
         let params = params(frame);
+        self.event.args_sha256 = params.get("arguments").map(fingerprint);
         let reason = match params.get("name").and_then(Value::as_str) {
-            Some(name) if self.session.prompts.contains(name) => return to_server(frame),
-            Some(name) => self.not_verified(Kind::Prompt, name),
+            Some(name) => {
+                self.event.item = Some(clip(name, MAX_NAME));
+                if self.session.prompts.contains(name) {
+                    return to_server(frame);
+                }
+                self.not_verified(Kind::Prompt, name)
+            }
             None => "the request doesn't name a prompt".to_owned(),
         };
         self.block_client(frame, id, "prompts/get", reason, Reply::Error)
@@ -332,6 +515,9 @@ impl Gate {
 
     fn resource_request(&mut self, frame: &[u8], id: &Value, method: &str) -> Vec<Action> {
         let params = params(frame);
+        if let Some(uri) = params.get("uri").and_then(Value::as_str) {
+            self.event.item = Some(clip(uri, MAX_NAME));
+        }
         let actions = match params.get("uri").and_then(Value::as_str) {
             Some(uri) if self.session.resource_allowed(uri) => to_server(frame),
             Some(uri) => {
@@ -372,6 +558,15 @@ impl Gate {
     /// Checks a response (or notification) from the server: filters lists,
     /// records taint, and redacts secrets.
     fn server_response(&mut self, frame: &[u8], pending: Option<Pending>) -> Vec<Action> {
+        match &pending {
+            Some(Pending::List(method)) => self.event.method = Some(method.clone()),
+            Some(Pending::ToolCall(tool)) => {
+                self.event.method = Some("tools/call".to_owned());
+                self.event.item = Some(clip(tool, MAX_NAME));
+            }
+            Some(Pending::ResourceRead) => self.event.method = Some("resources/read".to_owned()),
+            None => {}
+        }
         let redact = self.policy.secrets.redact_responses;
         if pending.is_none() && !redact {
             return to_client(frame);
@@ -426,16 +621,18 @@ impl Gate {
     fn mark_tainted(&mut self, source: String) {
         if self.session.taint.is_none() {
             warn!(%source, "the session read untrusted content: tools that can send data out are now held");
+            self.event.taint = Some(clip(&source, MAX_REASON));
             self.session.taint = Some(source);
         }
     }
 
     /// Redacts secrets anywhere in `message` (in observe mode, only logs
     /// them). Returns whether the message changed.
-    fn redact(&self, message: &mut Value) -> bool {
+    fn redact(&mut self, message: &mut Value) -> bool {
         if self.observe() {
             if let Some(kind) = self.secrets.find_in_json(message) {
                 warn!(%kind, "would redact a secret from a server message (observe mode)");
+                self.note_change(format!("secrets redacted: {kind}"));
             }
             return false;
         }
@@ -444,6 +641,7 @@ impl Gate {
             return false;
         }
         warn!(?kinds, "redacted secrets from a server message");
+        self.note_change(format!("secrets redacted: {}", kinds.join(", ")));
         true
     }
 
@@ -465,6 +663,12 @@ impl Gate {
             protocol_version = version,
             server, "MCP session initialized"
         );
+        let server_version = result
+            .get("serverInfo")
+            .and_then(|info| info.get("version"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        self.event.item = Some(clip(&format!("{server} {server_version}"), MAX_NAME));
 
         let Some(text) = result.get("instructions").and_then(Value::as_str) else {
             return false;
@@ -478,6 +682,7 @@ impl Gate {
             Verdict::Changed => "they changed since they were approved",
             Verdict::Unknown => "they aren't approved",
         };
+        self.note_change(format!("the server's instructions removed: {reason}"));
         if self.observe() {
             warn!("would remove the server's instructions: {reason} (observe mode)");
             return false;
@@ -513,6 +718,7 @@ impl Gate {
         let hide = if observe { "would hide" } else { "hiding" };
         let Some(name) = Pins::item_name(kind, item) else {
             warn!(kind = noun, "{hide} an item with no name");
+            self.note_change(format!("a {noun} with no name hidden"));
             return false;
         };
         let verdict = self
@@ -529,6 +735,7 @@ impl Gate {
                 self.session.approve(kind, name, item, labels);
                 if kind == Kind::Tool && decision.action == Rule::Deny {
                     debug!(item = name, "{hide} a tool the policy denies");
+                    self.note_change(format!("tool `{name}` hidden: the policy denies it"));
                     return false;
                 }
                 true
@@ -540,10 +747,14 @@ impl Gate {
                     "{hide} it: it changed since it was approved"
                 );
                 self.session.quarantine(kind, name);
+                self.note_change(format!(
+                    "{noun} `{name}` hidden: it changed since it was approved"
+                ));
                 false
             }
             Verdict::Unknown => {
                 info!(kind = noun, item = name, "{hide} it: it isn't approved");
+                self.note_change(format!("{noun} `{name}` hidden: it isn't approved"));
                 false
             }
         }
@@ -574,32 +785,36 @@ impl Gate {
 
     /// Answers a blocked client request (or, in observe mode, forwards it).
     fn block_client(
-        &self,
+        &mut self,
         frame: &[u8],
         id: &Value,
         method: &str,
-        reason: String,
+        refusal: impl Into<Refusal>,
         reply: Reply,
     ) -> Vec<Action> {
+        let Refusal { reason, detail } = refusal.into();
+        self.note_block(&reason, audit::Verdict::Block);
         if self.observe() {
             warn!(%method, %reason, "would block (observe mode)");
             return to_server(frame);
         }
         warn!(%method, %reason, "blocked");
-        let text = format!("Blocked by mcp-mandate: {reason}");
-        let response = match reply {
-            Reply::ToolError => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {"content": [{"type": "text", "text": text}], "isError": true}
-            }),
-            Reply::Error => rpc_error(id, &text),
+        let text = match detail {
+            Some(detail) => format!("Blocked by mcp-mandate: {reason}: {detail}"),
+            None => format!("Blocked by mcp-mandate: {reason}"),
         };
-        vec![Action::ToClient(encode(&response))]
+        vec![Action::ToClient(encode(&blocked_reply(id, &text, reply)))]
     }
 
     /// Answers a blocked server request (or, in observe mode, forwards it).
-    fn block_server(&self, frame: &[u8], id: &Value, method: &str, reason: String) -> Vec<Action> {
+    fn block_server(
+        &mut self,
+        frame: &[u8],
+        id: &Value,
+        method: &str,
+        reason: String,
+    ) -> Vec<Action> {
+        self.note_block(&reason, audit::Verdict::Block);
         if self.observe() {
             warn!(%method, %reason, "would block (observe mode)");
             return to_client(frame);
@@ -609,7 +824,11 @@ impl Gate {
         vec![Action::ToServer(encode(&rpc_error(id, &text)))]
     }
 
-    fn batch(&self, len: usize, forward: Action) -> Vec<Action> {
+    fn batch(&mut self, len: usize, forward: Action) -> Vec<Action> {
+        self.note_block(
+            "batches can't be checked one message at a time",
+            audit::Verdict::Drop,
+        );
         if self.observe() {
             warn!(len, "would drop a JSON-RPC batch (observe mode)");
             return vec![forward];
@@ -622,11 +841,87 @@ impl Gate {
     }
 }
 
-fn drop_line(error: &ParseError, direction: &str, frame: &[u8]) -> Vec<Action> {
-    if !matches!(error, ParseError::Empty) {
-        warn!(direction, reason = %error, bytes = frame.len(), "dropped a line that isn't JSON-RPC");
+/// What the gate did with a message, judged by where it sent it: back to
+/// its sender means answered instead of forwarded. Also returns the
+/// forwarded bytes when they differ from what arrived.
+fn judge<'a>(
+    from: Origin,
+    frame: &[u8],
+    actions: &'a [Action],
+) -> (audit::Verdict, Option<&'a [u8]>) {
+    let forwarded = match (from, actions) {
+        (_, []) => return (audit::Verdict::Drop, None),
+        (Origin::Client, [Action::ToServer(bytes)])
+        | (Origin::Server, [Action::ToClient(bytes)]) => bytes,
+        _ => return (audit::Verdict::Block, None),
+    };
+    if forwarded == frame {
+        (audit::Verdict::Allow, None)
+    } else {
+        (audit::Verdict::Modify, Some(forwarded))
     }
-    Vec::new()
+}
+
+/// A blocked request's answer: a tool error for a tool call, so the model
+/// reads why; a JSON-RPC error otherwise.
+fn blocked_reply(id: &Value, text: &str, reply: Reply) -> Value {
+    match reply {
+        Reply::ToolError => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"content": [{"type": "text", "text": text}], "isError": true}
+        }),
+        Reply::Error => rpc_error(id, text),
+    }
+}
+
+fn reply_for(method: &str) -> Reply {
+    if method == "tools/call" {
+        Reply::ToolError
+    } else {
+        Reply::Error
+    }
+}
+
+/// A message's bytes without its line ending, for hashing.
+fn without_line_ending(frame: &[u8]) -> &[u8] {
+    let frame = frame.strip_suffix(b"\n").unwrap_or(frame);
+    frame.strip_suffix(b"\r").unwrap_or(frame)
+}
+
+/// A request id for the audit log; a very long one is replaced by its hash.
+fn audit_id(id: &Value) -> Value {
+    let text = id.to_string();
+    if text.len() <= MAX_ID_BYTES {
+        id.clone()
+    } else {
+        Value::String(format!("sha256:{}", audit::sha256_hex(text.as_bytes())))
+    }
+}
+
+/// `text`, cut to at most `max` bytes (at a character boundary), with "…"
+/// added when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// An error and its causes on one line.
+fn describe(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 fn to_server(frame: &[u8]) -> Vec<Action> {

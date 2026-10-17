@@ -22,6 +22,9 @@
 //! [secrets]
 //! redact_responses = true
 //! block_in_arguments = true
+//!
+//! [audit]
+//! path = "logs/server.audit.jsonl"  # default: policy.toml → policy.audit.jsonl
 //! ```
 //!
 //! When several rules match a tool, the most restrictive action wins
@@ -121,6 +124,8 @@ struct PolicyFile {
     secrets: SecretsFile,
     #[serde(default)]
     taint: Taint,
+    #[serde(default)]
+    audit: AuditFile,
 }
 
 fn deny() -> Action {
@@ -193,6 +198,19 @@ impl Default for Taint {
     }
 }
 
+/// The `[audit]` table.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct AuditFile {
+    path: Option<PathBuf>,
+}
+
+/// The audit log a policy file writes when it doesn't name one: next to
+/// it, named after it (`policy.toml` → `policy.audit.jsonl`).
+pub fn default_audit_log(policy: &Path) -> PathBuf {
+    policy.with_extension("audit.jsonl")
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolRuleFile {
@@ -228,6 +246,8 @@ pub struct Policy {
     pub unknown_requests: Action,
     pub secrets: Secrets,
     pub taint: Taint,
+    /// The audit log, resolved against the policy file's folder.
+    pub audit_log: PathBuf,
     rules: Vec<ToolRule>,
 }
 
@@ -291,7 +311,7 @@ impl Policy {
             source,
         })?;
         let base = path.parent().unwrap_or(Path::new("."));
-        Self::parse(&text, base).map_err(|error| match error {
+        Self::parse_with(&text, base, default_audit_log(path)).map_err(|error| match error {
             PolicyError::Parse { source, .. } => PolicyError::Parse {
                 path: path.to_owned(),
                 source,
@@ -300,8 +320,14 @@ impl Policy {
         })
     }
 
-    /// Parses policy text; a relative `pins` path is resolved against `base`.
+    /// Parses policy text; relative paths (`pins`, the audit log) are
+    /// resolved against `base`. Without a file name to go by, the default
+    /// audit log is `mcp-mandate.audit.jsonl` in `base`.
     pub fn parse(text: &str, base: &Path) -> Result<Self, PolicyError> {
+        Self::parse_with(text, base, base.join("mcp-mandate.audit.jsonl"))
+    }
+
+    fn parse_with(text: &str, base: &Path, default_log: PathBuf) -> Result<Self, PolicyError> {
         let file: PolicyFile = toml::from_str(text).map_err(|source| PolicyError::Parse {
             path: PathBuf::new(),
             source,
@@ -354,6 +380,7 @@ impl Policy {
                 patterns,
             },
             taint: file.taint,
+            audit_log: file.audit.path.map_or(default_log, |log| base.join(log)),
             rules,
         })
     }
@@ -517,6 +544,31 @@ mod tests {
             policy.pins,
             Some(PathBuf::from("/policies/server.pins.toml"))
         );
+    }
+
+    #[test]
+    fn the_example_policy_is_valid() {
+        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../policies/example.toml");
+        let policy = Policy::load(&example).unwrap();
+        assert!(policy.audit_log.ends_with("logs/everything.audit.jsonl"));
+    }
+
+    #[test]
+    fn the_audit_log_goes_next_to_the_policy_unless_it_names_one() {
+        let dir = std::env::temp_dir().join(format!("mcp-mandate-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("server.policy.toml");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            Policy::load(&file).unwrap().audit_log,
+            dir.join("server.policy.audit.jsonl")
+        );
+        std::fs::write(&file, "[audit]\npath = \"logs/audit.jsonl\"\n").unwrap();
+        assert_eq!(
+            Policy::load(&file).unwrap().audit_log,
+            dir.join("logs/audit.jsonl")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

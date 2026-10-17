@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use mcp_mandate_pin::Inventory;
 
@@ -53,8 +55,48 @@ match = "delete_*"
 action = "deny"
 "#;
 
+/// An audit log in memory, which can be made to fail.
+#[derive(Clone, Default)]
+struct Memory {
+    events: Arc<Mutex<Vec<audit::Event>>>,
+    failing: Arc<AtomicBool>,
+}
+
+impl Recorder for Memory {
+    fn record(&mut self, event: &audit::Event) -> Result<(), audit::AuditError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(audit::AuditError::Write {
+                path: "memory".into(),
+                source: std::io::Error::other("no space left on device"),
+            });
+        }
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+impl Memory {
+    fn events(&self) -> Vec<audit::Event> {
+        self.events.lock().unwrap().clone()
+    }
+
+    fn last(&self) -> audit::Event {
+        self.events().pop().expect("nothing was recorded")
+    }
+
+    fn fail(&self, failing: bool) {
+        self.failing.store(failing, Ordering::SeqCst);
+    }
+}
+
 fn gate(policy: &str, pins: Option<Pins>) -> Gate {
-    Gate::new(Policy::parse(policy, Path::new(".")).unwrap(), pins)
+    gate_with_log(policy, pins).0
+}
+
+fn gate_with_log(policy: &str, pins: Option<Pins>) -> (Gate, Memory) {
+    let log = Memory::default();
+    let policy = Policy::parse(policy, Path::new(".")).unwrap();
+    (Gate::new(policy, pins, Box::new(log.clone())), log)
 }
 
 fn line(value: Value) -> Vec<u8> {
@@ -582,4 +624,169 @@ fn redaction_can_be_switched_off() {
         shown["result"]["content"][0]["text"],
         "AKIAIOSFODNN7EXAMPLE"
     );
+}
+
+// --- Audit -------------------------------------------------------------------
+
+#[test]
+fn records_every_message_and_what_the_gate_did_with_it() {
+    let (mut gate, log) = gate_with_log(POLICY, Some(pins()));
+    list(&mut gate, Kind::Tool, approved_tools());
+    let arguments = json!({"message": "hi"});
+    assert_eq!(call(&mut gate, "echo", arguments.clone()), None);
+    blocked_with(
+        call(&mut gate, "write_file", json!({})),
+        "needs your approval",
+    );
+
+    let events = log.events();
+    let [asked, listed, allowed, held] = events.as_slice() else {
+        panic!("expected 4 entries, got {events:#?}");
+    };
+    assert_eq!(asked.from, Some(Origin::Client));
+    assert_eq!(asked.method.as_deref(), Some("tools/list"));
+    assert_eq!(asked.verdict, Some(audit::Verdict::Allow));
+
+    assert_eq!(listed.from, Some(Origin::Server));
+    assert_eq!(listed.kind, Some(MessageKind::Response));
+    assert_eq!(listed.method.as_deref(), Some("tools/list"));
+    assert_eq!(listed.verdict, Some(audit::Verdict::Modify));
+    assert_eq!(
+        listed.changes,
+        ["tool `delete_repo` hidden: the policy denies it"]
+    );
+    assert!(listed.forwarded_sha256.is_some());
+    assert_ne!(listed.forwarded_sha256, listed.sha256);
+
+    let request = request(
+        9,
+        "tools/call",
+        json!({"name": "echo", "arguments": arguments}),
+    );
+    assert_eq!(allowed.item.as_deref(), Some("echo"));
+    assert_eq!(allowed.id, Some(json!(9)));
+    assert_eq!(allowed.verdict, Some(audit::Verdict::Allow));
+    assert_eq!(allowed.args_sha256, Some(fingerprint(&arguments)));
+    assert_eq!(
+        allowed.sha256,
+        Some(audit::sha256_hex(&request[..request.len() - 1]))
+    );
+    assert_eq!(allowed.forwarded_sha256, None);
+
+    assert_eq!(held.item.as_deref(), Some("write_file"));
+    assert_eq!(held.verdict, Some(audit::Verdict::Block));
+    assert!(
+        held.reason
+            .as_deref()
+            .unwrap()
+            .contains("needs your approval")
+    );
+}
+
+#[test]
+fn the_log_keeps_hashes_not_argument_values() {
+    let (mut gate, log) = gate_with_log(POLICY, Some(pins()));
+    list(&mut gate, Kind::Tool, approved_tools());
+    // `message` must be a string; the schema error quotes the value.
+    let outcome = call(&mut gate, "echo", json!({"message": 4_242_424_242_u64}));
+    blocked_with(outcome, "4242424242");
+
+    let recorded = serde_json::to_string(&log.events()).unwrap();
+    assert!(!recorded.contains("4242424242"), "{recorded}");
+    assert!(recorded.contains("(`type` at /message)"), "{recorded}");
+}
+
+#[test]
+fn records_what_tainted_the_session_and_what_was_redacted() {
+    let (mut gate, log) = gate_with_log(ALLOW_ALL, Some(taint_pins()));
+    list(&mut gate, Kind::Tool, taint_tools());
+    call_and_answer(&mut gate, 10, "fetch_page", "key AKIAIOSFODNN7EXAMPLE");
+
+    let answer = log.last();
+    assert_eq!(answer.method.as_deref(), Some("tools/call"));
+    assert_eq!(answer.item.as_deref(), Some("fetch_page"));
+    assert_eq!(
+        answer.taint.as_deref(),
+        Some("the output of tool `fetch_page`")
+    );
+    assert_eq!(answer.verdict, Some(audit::Verdict::Modify));
+    assert_eq!(answer.changes, ["secrets redacted: aws-access-key-id"]);
+
+    call_and_answer(&mut gate, 11, "add_note", "more");
+    assert_eq!(log.last().taint, None, "only the message that tainted it");
+}
+
+#[test]
+fn nothing_passes_while_the_audit_log_cannot_be_written() {
+    let (mut gate, log) = gate_with_log(POLICY, Some(pins()));
+    list(&mut gate, Kind::Tool, approved_tools());
+    log.fail(true);
+
+    blocked_with(
+        call(&mut gate, "echo", json!({"message": "hi"})),
+        "the audit log can't be written",
+    );
+    let ping = request(3, "ping", json!({}));
+    let refused = only_to_client(&gate.from_client(&ping));
+    assert_eq!(refused["id"], 3);
+    assert_eq!(refused["error"]["code"], BLOCKED_ERROR_CODE);
+    let note = line(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    assert_eq!(gate.from_client(&note), Vec::new());
+
+    // The server's answers are stopped too, but the client isn't left
+    // waiting for them.
+    let answer = only_to_client(&gate.from_server(&response(4, json!({}))));
+    assert_eq!(answer["id"], 4);
+    assert_eq!(answer["error"]["code"], BLOCKED_ERROR_CODE);
+    let actions = gate.from_server(&request(5, "roots/list", json!({})));
+    let [Action::ToServer(refused)] = actions.as_slice() else {
+        panic!("the server's request should be answered with an error");
+    };
+    let refused: Value = serde_json::from_slice(refused).unwrap();
+    assert_eq!(refused["error"]["code"], BLOCKED_ERROR_CODE);
+    assert!(log.events().len() == 2, "only the listing was recorded");
+
+    log.fail(false);
+    assert_eq!(
+        call(&mut gate, "echo", json!({"message": "hi"})),
+        None,
+        "traffic resumes once the log can be written"
+    );
+}
+
+#[test]
+fn observe_mode_records_what_it_would_do_and_never_blocks_on_the_log() {
+    let (mut gate, log) = gate_with_log(&format!("mode = \"observe\"\n{POLICY}"), Some(pins()));
+    list(&mut gate, Kind::Tool, approved_tools());
+    assert_eq!(call(&mut gate, "write_file", json!({})), None);
+    let held = log.last();
+    assert_eq!(held.verdict, Some(audit::Verdict::Allow));
+    assert_eq!(held.would, Some(audit::Verdict::Block));
+    assert!(held.reason.is_some());
+
+    log.fail(true);
+    assert_eq!(call(&mut gate, "echo", json!({"message": "hi"})), None);
+}
+
+#[test]
+fn records_the_end_of_the_session() {
+    let (mut gate, log) = gate_with_log("", None);
+    gate.end_session(Some(143));
+    let end = log.last();
+    assert_eq!(end.event, audit::EventKind::SessionEnd);
+    assert_eq!(end.exit_code, Some(143));
+}
+
+#[test]
+fn clips_long_names_and_ids() {
+    let (mut gate, log) = gate_with_log("", None);
+    let name = "x".repeat(10_000);
+    let id = "i".repeat(10_000);
+    let request = line(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {"name": name}}));
+    gate.from_client(&request);
+    let event = log.last();
+    assert!(event.item.unwrap().len() <= MAX_NAME + '…'.len_utf8());
+    assert!(event.id.unwrap().as_str().unwrap().starts_with("sha256:"));
+    assert!(event.reason.unwrap().len() <= MAX_REASON + '…'.len_utf8());
 }

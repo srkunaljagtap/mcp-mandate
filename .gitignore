@@ -10,3 +10,6 @@
 # Local-only working notes (not for GitHub)
 CLAUDE.md
 notes/
+
+# Audit logs written next to policies
+*.audit.jsonl

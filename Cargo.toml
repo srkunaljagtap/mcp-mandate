@@ -14,6 +14,7 @@ repository = "https://github.com/srkunaljagtap/mcp-mandate"
 # Dependency versions are declared once here; crates opt in with
 # `name.workspace = true`.
 [workspace.dependencies]
+mcp-mandate-audit = { path = "crates/mcp-mandate-audit", version = "0.1.0" }
 mcp-mandate-gate = { path = "crates/mcp-mandate-gate", version = "0.1.0" }
 mcp-mandate-pin = { path = "crates/mcp-mandate-pin", version = "0.1.0" }
 mcp-mandate-policy = { path = "crates/mcp-mandate-policy", version = "0.1.0" }

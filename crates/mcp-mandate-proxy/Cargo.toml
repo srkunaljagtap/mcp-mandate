@@ -21,6 +21,7 @@ which.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+mcp-mandate-audit.workspace = true
 mcp-mandate-policy.workspace = true
 
 [lints]

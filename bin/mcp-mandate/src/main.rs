@@ -2,10 +2,12 @@
 
 use std::error::Error;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use mcp_mandate_audit::{self as audit, Log, Recorder, VerifyError};
 use mcp_mandate_gate::Gate;
 use mcp_mandate_pin::{Kind, Pins, unpinned_package};
 use mcp_mandate_policy::{Mode, Policy};
@@ -69,16 +71,26 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
-    /// Check that no entry in the audit log was changed or removed.
+    /// Check that no entry in the audit log was edited, removed, added or
+    /// reordered.
     Verify {
-        /// Audit log file (JSONL).
-        #[arg(long)]
+        /// The audit log (JSONL).
+        #[arg(required_unless_present = "policy")]
         log: Option<PathBuf>,
+        /// Check the audit log this policy writes, instead of naming it.
+        #[arg(long, conflicts_with = "log")]
+        policy: Option<PathBuf>,
+        /// A head hash saved from an earlier check. Also fails unless the
+        /// log still contains it, which catches entries cut off the end and
+        /// rewritten logs.
+        #[arg(long)]
+        anchor: Option<String>,
     },
 }
 
-// stdout is reserved for protocol traffic (stdio MCP), so every message the
-// program prints goes to stderr.
+// While `run` relays a server, stdout carries the protocol traffic, so every
+// message the program prints goes to stderr. Only `audit verify`, which
+// relays nothing, prints its report to stdout.
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -87,8 +99,13 @@ fn main() -> ExitCode {
         Command::Gate { config } => not_yet(&format!("serve the HTTP gateway{}", with(&config))),
         Command::Scout { server } => not_yet(&format!("review `{}`", join(&server))),
         Command::Audit {
-            command: AuditCommand::Verify { log },
-        } => not_yet(&format!("verify the audit log{}", with(&log))),
+            command:
+                AuditCommand::Verify {
+                    log,
+                    policy,
+                    anchor,
+                },
+        } => verify(log, policy, anchor.as_deref()),
     }
 }
 
@@ -101,10 +118,10 @@ fn not_yet(what: &str) -> ExitCode {
 /// either side ends.
 fn run(policy: &Path, command: ServerCommand) -> ExitCode {
     init_logging();
-    let gate = match load_gate(policy) {
+    let gate = match load_gate(policy, &command) {
         Ok(gate) => gate,
         Err(error) => {
-            error!(error = %report(error.as_ref()), "couldn't load the policy");
+            error!(error = %report(error.as_ref()), "couldn't start the gate");
             return ExitCode::from(2);
         }
     };
@@ -124,7 +141,9 @@ fn run(policy: &Path, command: ServerCommand) -> ExitCode {
     std::process::exit(code)
 }
 
-fn load_gate(path: &Path) -> Result<Gate, Box<dyn Error>> {
+/// Loads the policy and pins, and opens the audit log with this session's
+/// start recorded.
+fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error>> {
     let policy = Policy::load(path)?;
     let pins = match &policy.pins {
         Some(pins_path) => {
@@ -146,15 +165,117 @@ fn load_gate(path: &Path) -> Result<Gate, Box<dyn Error>> {
             None
         }
     };
-    let mode = match policy.mode {
-        Mode::Enforce => "enforce",
-        Mode::Observe => "observe",
-    };
-    info!(policy = %path.display(), mode, "loaded policy");
+    info!(policy = %path.display(), mode = mode_name(policy.mode), "loaded policy");
     if policy.mode == Mode::Observe {
         warn!("observe mode: decisions are logged, but nothing is blocked or hidden");
     }
-    Ok(Gate::new(policy, pins))
+    let mut log = Log::open(&policy.audit_log)?;
+    log.record(&session_start(path, &policy, command)?)?;
+    info!(
+        audit_log = %log.path().display(),
+        session = log.session(),
+        "recording every decision to the audit log"
+    );
+    Ok(Gate::new(policy, pins, Box::new(log)))
+}
+
+fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Enforce => "enforce",
+        Mode::Observe => "observe",
+    }
+}
+
+/// The audit entry that opens a session: what ran, under which policy.
+fn session_start(
+    path: &Path,
+    policy: &Policy,
+    command: &ServerCommand,
+) -> Result<audit::Event, Box<dyn Error>> {
+    let hash_file = |file: &Path| std::fs::read(file).map(|bytes| audit::sha256_hex(&bytes));
+    // The server's arguments can carry tokens, so the command is recorded
+    // only as a hash: each part's bytes, each followed by a NUL.
+    let mut argv = Vec::new();
+    for part in std::iter::once(&command.program).chain(&command.args) {
+        argv.extend_from_slice(part.as_encoded_bytes());
+        argv.push(0);
+    }
+    let program = Path::new(&command.program)
+        .file_name()
+        .unwrap_or(command.program.as_os_str());
+    Ok(audit::Event {
+        event: audit::EventKind::SessionStart,
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        mode: Some(mode_name(policy.mode).to_owned()),
+        policy: Some(path.display().to_string()),
+        policy_sha256: Some(hash_file(path)?),
+        pins_sha256: policy.pins.as_deref().map(hash_file).transpose()?,
+        server: Some(program.to_string_lossy().into_owned()),
+        command_sha256: Some(audit::sha256_hex(&argv)),
+        pid: Some(std::process::id()),
+        ..audit::Event::default()
+    })
+}
+
+/// `mcp-mandate audit verify`: checks the log's hash chain and prints what
+/// it holds.
+fn verify(log: Option<PathBuf>, policy: Option<PathBuf>, anchor: Option<&str>) -> ExitCode {
+    let path = match (log, policy) {
+        (Some(log), _) => log,
+        (None, Some(policy)) => match Policy::load(&policy) {
+            Ok(policy) => policy.audit_log,
+            Err(error) => {
+                eprintln!("mcp-mandate: {}", report(&error));
+                return ExitCode::from(2);
+            }
+        },
+        (None, None) => unreachable!("clap requires a log or a policy"),
+    };
+    let (text, code) = match audit::verify(&path, anchor) {
+        Ok(found) => (intact(&path, &found), ExitCode::SUCCESS),
+        Err(error @ VerifyError::Read { .. }) => {
+            eprintln!("mcp-mandate: {}", report(&error));
+            return ExitCode::from(2);
+        }
+        Err(error) => (
+            format!("{}: NOT INTACT: {error}\n", path.display()),
+            ExitCode::FAILURE,
+        ),
+    };
+    // A reader that stops early (`| head`) closes the pipe; the exit code
+    // still tells the result, so a failed write isn't an error.
+    let _ = std::io::stdout().write_all(text.as_bytes());
+    code
+}
+
+/// The report on a log that verified.
+fn intact(path: &Path, found: &audit::Report) -> String {
+    let mut text = format!("{}: intact\n", path.display());
+    let entries = count(found.entries, "entry", "entries");
+    let sessions = count(found.sessions as u64, "session", "sessions");
+    match (&found.first, &found.last) {
+        (Some(first), Some(last)) => {
+            text += &format!("  {entries} in {sessions}, {first} to {last}\n");
+        }
+        _ => text += &format!("  {entries}\n"),
+    }
+    if found.unfinished > 0 {
+        text += &format!(
+            "  {} without an end entry (still running, stopped abruptly, or cut off with the end of the log)\n",
+            count(found.unfinished as u64, "session", "sessions")
+        );
+    }
+    if let Some(at) = found.anchor_at {
+        text += &format!("  The anchor is entry {at} of {}.\n", found.entries);
+    }
+    text += &format!("  Head: {}\n", found.head);
+    text += "  Save the head somewhere else and check it later with --anchor: that also catches entries cut off the end, or a rewritten log.\n";
+    text
+}
+
+/// "1 entry", "3 entries".
+fn count(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// `mcp-mandate pin`: records what the server offers into a pins file.
@@ -332,6 +453,17 @@ mod tests {
     fn run_requires_a_policy_and_a_server_command() {
         assert!(Cli::try_parse_from(["mcp-mandate", "run", "--", "cat"]).is_err());
         assert!(Cli::try_parse_from(["mcp-mandate", "run", "--policy", "p.toml"]).is_err());
+    }
+
+    #[test]
+    fn audit_verify_takes_a_log_or_a_policy_but_not_both() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["mcp-mandate", "audit", "verify"].iter().chain(args))
+        };
+        assert!(parse(&["x.audit.jsonl"]).is_ok());
+        assert!(parse(&["--policy", "p.toml", "--anchor", "abc"]).is_ok());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["x.audit.jsonl", "--policy", "p.toml"]).is_err());
     }
 
     #[test]
