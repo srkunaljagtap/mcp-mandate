@@ -6,8 +6,8 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::error::Error;
-use crate::types::{MessagesRequest, MessagesResponse};
+use super::error::Error;
+use super::types::{MessagesRequest, MessagesResponse};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// The API contract version. It's a date and rarely changes; new features

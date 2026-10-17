@@ -1,29 +1,29 @@
-# Workspace root. This file has no [package] of its own (a "virtual manifest");
-# it only groups the crates under crates/ so they share one Cargo.lock and one
-# target/ directory, and can inherit common settings from here.
+# Workspace root: groups the binary under bin/ and the libraries under crates/
+# so they share one Cargo.lock, one target/ and the settings below.
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["bin/*", "crates/*"]
 
-# Settings every crate can inherit with `version.workspace = true` etc.
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/srkunaljagtap/mcp-mandate"
 
 # Dependency versions are declared once here; crates opt in with
-# `name.workspace = true`, so versions never drift between crates.
+# `name.workspace = true`.
 [workspace.dependencies]
-agent-core = { path = "crates/agent-core" }
+mcp-mandate-scout = { path = "crates/mcp-mandate-scout", version = "0.1.0" }
 
-anyhow = "1.0.104"                                          # easy errors for the binary
-dotenvy = "0.15.7"                                          # loads .env into the environment
-reqwest = { version = "0.13.5", features = ["json"] }       # HTTP client (rustls TLS by default)
-serde = { version = "1.0.229", features = ["derive"] }      # #[derive(Serialize, Deserialize)]
-serde_json = "1.0.154"                                      # JSON encoding/decoding
-thiserror = "2.0.21"                                        # typed errors for the library
-tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }  # async runtime
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+dotenvy = "0.15.7"
+reqwest = { version = "0.13.5", features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
 
-# Lint levels applied to every crate that has `[lints] workspace = true`.
 [workspace.lints.rust]
 unsafe_code = "forbid"

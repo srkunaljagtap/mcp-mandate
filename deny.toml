@@ -1,0 +1,33 @@
+# cargo-deny checks every dependency for known vulnerabilities (RustSec
+# advisories), acceptable licenses, and where it was downloaded from.
+# Run locally with: cargo deny check
+
+[advisories]
+# Vulnerable, unsound and unmaintained crates fail by default; yanked
+# releases fail too.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses compatible with shipping under MIT OR Apache-2.0.
+# A dependency whose license isn't listed (for example a copyleft one) fails.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io; no other registries or git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

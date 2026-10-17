@@ -1,35 +1,113 @@
-# mandate
+# mcp-mandate
 
-A command-line coding assistant written in Rust and powered by Claude. It can
-read and write files and run commands inside a project folder.
+**Pin what you trust. Permit what you allow. Prove what happened.**
 
-## Status
+mcp-mandate is an open-source security gate between AI agents (Claude Code,
+Cursor, your own) and the MCP servers they call. Every tool call passes a
+deterministic check before it reaches a server, so an agent that was tricked
+by something it read can't act with your keys.
 
-Early development: sends one prompt to Claude and prints the reply. Tool use
-and multi-turn conversations aren't implemented yet.
+> **Status: under construction.** v0.1.0 isn't released and nothing is
+> enforced yet. Don't rely on it for protection.
 
-## Build and run
+## How it works
 
-Requires [rustup](https://rustup.rs). The exact Rust version is pinned in
-`rust-toolchain.toml` and installed automatically on first build. On Windows
-you also need the Visual Studio C++ build tools for the linker.
+Two parts, two speeds:
 
-Put your Anthropic API key in a `.env` file (it's gitignored):
+| | Gate | Scout |
+|---|---|---|
+| Runs on | Every MCP call, in line | New or changed servers, offline |
+| Uses an LLM | Never | Optional, with your own API key |
+| Can decide | Allow, block, hold | Only propose rules |
+| When it fails | Closed (blocks) | Safe (no new rules) |
+
+For each tool call the gate will:
+
+1. **Identify** the caller (OIDC token on the HTTP gateway).
+2. **Pin**: check the tool's name, description and schema against the hash you
+   approved, and quarantine tools that changed.
+3. **Authorize** against your policy (default deny).
+4. **Validate** arguments: schema, size limits, no shell metacharacters in
+   command fields.
+5. **Flow check**: hold calls that write or send data out once the session has
+   read untrusted content.
+6. **Broker** a credential scoped to that one server; never forward yours.
+7. **Call** the server over stdio or HTTP.
+8. **Redact and label** the response: scrub secrets, mark untrusted output.
+9. **Record** a hash-chained audit entry for every decision.
+
+## Usage (planned)
 
 ```sh
-cp .env.example .env    # then paste your key after ANTHROPIC_API_KEY=
+# review a server and draft a policy for it
+mcp-mandate scout -- npx -y <mcp-server>
+
+# run it behind the gate
+mcp-mandate run --policy policies/default.toml -- npx -y <mcp-server>
+
+# check that the audit log wasn't tampered with
+mcp-mandate audit verify
 ```
 
+In your MCP client's config, put `mcp-mandate run --` in front of the server
+command it already runs:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "mcp-mandate",
+      "args": ["run", "--", "npx", "-y", "<mcp-server>"]
+    }
+  }
+}
+```
+
+## What it doesn't do
+
+- **It guards MCP messages, not the server process.** A local server runs
+  with your operating-system permissions and could read files directly
+  without making an MCP call. Use OS sandboxing to contain that.
+- **It doesn't replace** your identity provider or the servers' own
+  authentication.
+- **No AI decides what to block.** The gate is plain rules; Scout's LLM
+  review is optional and only drafts rules for you to approve.
+
+## Build from source
+
+Requires [rustup](https://rustup.rs). The Rust version is pinned in
+`rust-toolchain.toml` and installed on first build. On Windows you also need
+the Visual Studio C++ build tools.
+
 ```sh
-cargo run -q -p agent-cli -- "Explain Rust ownership in two sentences"
-cargo test                                    # run all tests (no API key needed)
-cargo fmt --check                             # check formatting
-cargo clippy --all-targets -- -D warnings     # lint, treating warnings as errors
+cargo build --release
+cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check        # licenses, advisories, sources (cargo install cargo-deny)
 ```
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `crates/agent-core` | Library: Claude API client, message types, agent loop |
-| `crates/agent-cli` | Binary: the `mandate` command you run |
+| `bin/mcp-mandate` | The `mcp-mandate` command: `run`, `gate`, `scout`, `audit` |
+| `crates/mcp-mandate-scout` | Server review and the optional Claude API client |
+
+More crates (proxy, pinning, policy, taint, audit, identity) arrive as the
+features do.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Please report vulnerabilities
+privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.

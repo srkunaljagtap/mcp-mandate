@@ -1,0 +1,17 @@
+[package]
+name = "mcp-mandate"
+description = "A security gate between AI agents and their MCP tools: pin, permit, prove"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["mcp", "security", "ai-agents", "gateway", "proxy"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+clap.workspace = true
+
+[lints]
+workspace = true

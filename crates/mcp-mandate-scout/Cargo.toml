@@ -1,9 +1,11 @@
 [package]
-name = "agent-core"
-description = "Claude API client, message types and the agent loop"
+name = "mcp-mandate-scout"
+description = "Reviews MCP servers and drafts Mandate policies"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 reqwest.workspace = true
