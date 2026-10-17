@@ -1,0 +1,21 @@
+# Workspace root. This file has no [package] of its own (a "virtual manifest");
+# it only groups the crates under crates/ so they share one Cargo.lock and one
+# target/ directory, and can inherit common settings from here.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# Settings every crate can inherit with `version.workspace = true` etc.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+# Dependency versions are declared once here; crates opt in with
+# `name.workspace = true`, so versions never drift between crates.
+[workspace.dependencies]
+agent-core = { path = "crates/agent-core" }
+
+# Lint levels applied to every crate that has `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,17 @@
+[package]
+name = "agent-cli"
+description = "Command-line interface for rust-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# The package is agent-cli, but the program you run is called rust-agent.
+[[bin]]
+name = "rust-agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-core.workspace = true
+
+[lints]
+workspace = true

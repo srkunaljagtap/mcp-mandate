@@ -1,0 +1,6 @@
+# Pins the exact compiler for everyone who builds this repo, including CI.
+# rustup reads this file and installs the toolchain automatically if missing.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"   # skip offline docs; smaller download locally and in CI
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,3 @@
+# Text files use LF line endings everywhere, including Windows checkouts, so
+# files are byte-identical across OSes and CI. Git detects text vs binary.
+* text=auto eol=lf
