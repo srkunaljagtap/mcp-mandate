@@ -101,6 +101,9 @@ pub struct SecretDetector {
     patterns: Vec<SecretPattern>,
     /// How many of `patterns`, at the end, are exact strings.
     literals: usize,
+    /// Whether a field named like a secret (`password`, `api_key`) counts
+    /// as one whatever its value.
+    named_fields: bool,
 }
 
 impl Default for SecretDetector {
@@ -117,7 +120,24 @@ impl SecretDetector {
         Self {
             patterns,
             literals: 0,
+            named_fields: true,
         }
+    }
+
+    /// A detector that knows no secret until exact strings are added: no
+    /// built-in patterns, and no field counts as one for its name. For
+    /// secrets known exactly, looked for apart from the rest.
+    pub fn empty() -> Self {
+        Self {
+            patterns: Vec::new(),
+            literals: 0,
+            named_fields: false,
+        }
+    }
+
+    /// Whether it finds nothing at all, so looking can be skipped.
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty() && !self.named_fields
     }
 
     /// The kind of the first secret found in `text`.
@@ -233,7 +253,7 @@ impl SecretDetector {
                     }
                     if let Some(kind) = self.find(key) {
                         *found = Some(kind.to_owned());
-                    } else if secret_field(key, item) {
+                    } else if self.named_fields && secret_field(key, item) {
                         *found = Some("secret-field".to_owned());
                     } else if skip_binary && binary == Some(key.as_str()) {
                         *found = self.blob_secret(key, item);
@@ -298,7 +318,7 @@ impl SecretDetector {
                 let mut next_number: HashMap<String, u64> = HashMap::new();
                 // Keys can't be changed in place, so the map is rebuilt.
                 for (mut key, mut item) in std::mem::take(map) {
-                    if secret_field(&key, &item) {
+                    if self.named_fields && secret_field(&key, &item) {
                         self.redact_field(&mut item, kinds);
                         kinds.push("secret-field".to_owned());
                     } else if binary == Some(key.as_str()) {
@@ -816,6 +836,41 @@ mod tests {
         assert!(!text.contains("opaque-token-99"), "{text}");
         detector.set_literals("gateway-credential", &[]);
         assert_eq!(detector.patterns.len(), built_in);
+    }
+
+    #[test]
+    fn an_empty_detector_finds_only_the_exact_strings_it_is_given() {
+        let mut detector = SecretDetector::empty();
+        assert!(detector.is_empty());
+        assert!(!SecretDetector::default().is_empty());
+        let mut message = json!({"password": "correct-horse", "text": "AKIAIOSFODNN7EXAMPLE"});
+        assert_eq!(detector.find_in_response(&message), None);
+        assert!(detector.redact_json(&mut message).is_empty());
+
+        detector.set_literals("gateway-credential", &["opaque-token-1234567".to_owned()]);
+        assert!(!detector.is_empty());
+        let mut message = json!({
+            "password": "correct-horse",
+            "text": "AKIAIOSFODNN7EXAMPLE and opaque-token-1234567",
+            "contents": [{"uri": "file:///.env", "blob": STANDARD.encode("TOKEN=opaque-token-1234567")}]
+        });
+        assert_eq!(
+            detector.redact_json(&mut message),
+            ["gateway-credential", "gateway-credential"]
+        );
+        assert_eq!(message["password"], "correct-horse");
+        assert_eq!(
+            message["text"],
+            "AKIAIOSFODNN7EXAMPLE and [REDACTED: gateway-credential]"
+        );
+        let blob = message["contents"][0]["blob"].as_str().unwrap();
+        assert_eq!(
+            STANDARD.decode(blob).unwrap(),
+            b"[REDACTED: gateway-credential]"
+        );
+
+        detector.set_literals("gateway-credential", &[]);
+        assert!(detector.is_empty());
     }
 
     #[test]

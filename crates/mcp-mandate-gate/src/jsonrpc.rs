@@ -152,6 +152,90 @@ pub fn head(frame: &[u8]) -> Option<Message> {
     envelope.into_message().ok()
 }
 
+/// What each message in a batch says it is, read as [`head`] reads a
+/// single message (`None` for one that doesn't say). `None` when `frame`
+/// isn't a batch, or its messages can't even be told apart.
+pub fn batch_heads(frame: &[u8]) -> Option<Vec<Option<Message>>> {
+    let body = trim_json_whitespace(frame);
+    if body.first() != Some(&b'[') {
+        return None;
+    }
+    let items: Vec<Envelope<'_>> = serde_json::from_slice(body).ok()?;
+    Some(
+        items
+            .into_iter()
+            .map(|item| item.into_message().ok())
+            .collect(),
+    )
+}
+
+/// `frame` as text, with each escape in its strings (`\n`, `\"`, `A`,
+/// …) written as the character it stands for, so a search finds what a
+/// parser reads in them, keys included. Borrowed when there's nothing to
+/// write out; bytes that aren't UTF-8 read as U+FFFD.
+pub fn unescaped(frame: &[u8]) -> Cow<'_, str> {
+    let text = String::from_utf8_lossy(frame);
+    if !text.contains('\\') {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_ref();
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        let mut chars = rest[at + 1..].chars();
+        let Some(kind) = chars.next() else {
+            out.push('\\');
+            return Cow::Owned(out);
+        };
+        rest = chars.as_str();
+        match kind {
+            'u' => match unicode_escape(rest) {
+                Some((character, used)) => {
+                    out.push(character);
+                    rest = &rest[used..];
+                }
+                None => out.push('u'),
+            },
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            // `\"`, `\\` and `\/`, and any JSON doesn't allow.
+            other => out.push(other),
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// The character a `\u` escape stands for, given what follows the `\u`,
+/// and how many bytes of that it takes: a surrogate pair takes the next
+/// `\u` escape too. One half of a pair alone stands for U+FFFD.
+fn unicode_escape(after: &str) -> Option<(char, usize)> {
+    let unit = |text: &str| {
+        let hex = text.get(..4)?;
+        if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        u16::from_str_radix(hex, 16).ok()
+    };
+    let first = unit(after)?;
+    let second = after
+        .get(4..)
+        .and_then(|rest| rest.strip_prefix("\\u"))
+        .and_then(unit);
+    if let Some(second) = second
+        && (0xD800..0xDC00).contains(&first)
+        && (0xDC00..0xE000).contains(&second)
+        && let Some(Ok(character)) = char::decode_utf16([first, second]).next()
+    {
+        return Some((character, 10));
+    }
+    let character = char::from_u32(u32::from(first)).unwrap_or(char::REPLACEMENT_CHARACTER);
+    Some((character, 4))
+}
+
 /// `frame` without the whitespace JSON allows around a value. Only that:
 /// anything else (a form feed, say) makes a full parse of the message fail,
 /// so classifying it must fail too.
@@ -659,6 +743,46 @@ mod tests {
             format!(r#"[{{"jsonrpc":"2.0","id":1,"result":[{values}]}}]"#),
         ] {
             assert_eq!(head(text.as_bytes()), None, "{}", &text[..40]);
+        }
+    }
+
+    #[test]
+    fn the_messages_of_a_batch_can_be_read_one_by_one() {
+        let batch = br#"[{"jsonrpc":"2.0","id":7,"result":{}},{"jsonrpc":"2.0","id":8,"method":"ping","result":{}},{"jsonrpc":"2.0","method":"notifications/x"}]"#;
+        assert_eq!(
+            batch_heads(batch),
+            Some(vec![
+                Some(Message::Response {
+                    id: json!(7),
+                    is_error: false
+                }),
+                // Both a request and a response.
+                None,
+                Some(Message::Notification {
+                    method: "notifications/x".to_owned()
+                }),
+            ])
+        );
+        assert_eq!(
+            batch_heads(br#"{"jsonrpc":"2.0","id":7,"result":{}}"#),
+            None
+        );
+        assert_eq!(
+            batch_heads(br#"[1,{"jsonrpc":"2.0","id":7,"result":{}}]"#),
+            None
+        );
+    }
+
+    #[test]
+    fn writes_out_what_escapes_stand_for() {
+        assert!(matches!(unescaped(br#"{"a":"plain"}"#), Cow::Borrowed(_)));
+        for (text, expected) in [
+            (r#""token-\"1\"\/2\\3\n""#, "\"token-\"1\"/2\\3\n\""),
+            (r#""😀 \ud83d é""#, "\"😀 \u{fffd} é\""),
+            (r#""\uZZZZ \u12""#, "\"uZZZZ u12\""),
+            ("\"end\\", "\"end\\"),
+        ] {
+            assert_eq!(unescaped(text.as_bytes()), expected, "{text}");
         }
     }
 

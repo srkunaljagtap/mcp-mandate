@@ -17,7 +17,9 @@
 //!   An answer whose taint can't be shared with those doesn't pass.
 //! - Secrets: redacted from everything the server sends (keys included),
 //!   and blocked in what the client sends: tool and prompt arguments and
-//!   resource URIs.
+//!   resource URIs. The gateway's own credential for the server is kept
+//!   out of everything sent to the client, in every mode and whatever the
+//!   policy says.
 //! - Protocol: a response must answer a request the client is still
 //!   waiting for, and a message the gate can't read in full doesn't pass
 //!   (one too large to check that is a request, or the answer to one, is
@@ -28,7 +30,7 @@
 //!   written doesn't pass.
 //!
 //! In observe mode every decision is logged but nothing is blocked, hidden
-//! or redacted.
+//! or redacted, except the gateway's own credential.
 
 pub mod jsonrpc;
 mod template;
@@ -121,11 +123,18 @@ pub trait SharedTaint: Send + Sync {
 /// the agent's other gates read it.
 const TAINT_CHECK: Duration = Duration::from_secs(1);
 
+/// What a server's sampling request taints the session with: it puts the
+/// server's text in front of the model, as a tool's output does.
+const SAMPLING_TAINT: &str = "the server's `sampling/createMessage` request";
+
 /// One session's gate.
 pub struct Gate {
     policy: Policy,
     pins: Option<Pins>,
     secrets: SecretDetector,
+    /// Only the exact strings in `secrets` (the gateway's own credential),
+    /// which never reach the client, whatever the mode or the policy.
+    credentials: SecretDetector,
     /// Client requests whose responses the gate inspects, by id.
     pending: HashMap<String, Pending>,
     /// Server requests passed to the client, by id, with their method.
@@ -148,8 +157,8 @@ enum Pending {
     /// `initialize` or a list, checked against the pins.
     List(String),
     /// A tool call, whose output may taint the session. `None` when the
-    /// call couldn't be read in full (observe mode passes it on), so which
-    /// tool it names isn't known.
+    /// gate didn't read the call in full (observe mode passes on one it
+    /// can't, and those in a batch), so which tool it names isn't known.
     ToolCall(Option<String>),
     /// A resource read, whose content may taint the session.
     ResourceRead,
@@ -281,6 +290,7 @@ impl Gate {
             .collect();
         Self {
             secrets: SecretDetector::new(custom),
+            credentials: SecretDetector::empty(),
             policy,
             pins,
             pending: HashMap::new(),
@@ -302,12 +312,14 @@ impl Gate {
     }
 
     /// Adds exact strings to treat as secrets, such as the credential the
-    /// gateway itself uses for this server: redacted if the server echoes
-    /// them, blocked if the client sends them. Strings shorter than 8
+    /// gateway itself uses for this server: kept out of everything sent to
+    /// the client (in every mode, whatever the policy says about redacting),
+    /// and blocked if the client sends them. Strings shorter than 8
     /// characters are ignored (they'd match ordinary text).
     pub fn add_secret_literals<I: IntoIterator<Item = String>>(&mut self, literals: I) {
         for literal in literals {
             self.secrets.add_literal("gateway-credential", &literal);
+            self.credentials.add_literal("gateway-credential", &literal);
         }
     }
 
@@ -317,6 +329,8 @@ impl Gate {
     /// strings haven't changed, so it can run before every message.
     pub fn set_secret_literals(&mut self, literals: &[String]) {
         self.secrets.set_literals("gateway-credential", literals);
+        self.credentials
+            .set_literals("gateway-credential", literals);
     }
 
     /// Forgets a client request that will never be answered through the
@@ -378,7 +392,7 @@ impl Gate {
                 to_server(frame)
             }
             Ok(Message::Response { id, .. }) => self.client_response(frame, &id),
-            Ok(Message::Batch { len }) => self.batch(len, Action::ToServer(frame.to_vec())),
+            Ok(Message::Batch { len }) => self.batch(Origin::Client, frame, len),
             Err(ParseError::Empty) => return Vec::new(),
             Err(error) => self.unreadable(&error, Origin::Client, frame),
         };
@@ -479,7 +493,7 @@ impl Gate {
                 }
                 self.server_response(frame, None)
             }
-            Ok(Message::Batch { len }) => self.batch(len, Action::ToClient(frame.to_vec())),
+            Ok(Message::Batch { len }) => self.batch(Origin::Server, frame, len),
             Err(ParseError::Empty) => return Vec::new(),
             Err(error) => self.unreadable(&error, Origin::Server, frame),
         };
@@ -546,9 +560,11 @@ impl Gate {
         }
     }
 
-    /// Records what happened to `frame`. A message that can't be recorded
-    /// doesn't pass (in observe mode, it passes with a warning).
-    fn record(&mut self, from: Origin, frame: &[u8], actions: Vec<Action>) -> Vec<Action> {
+    /// Records what happened to `frame`, once the gateway's credential is
+    /// kept out of what goes to the client. A message that can't be
+    /// recorded doesn't pass (in observe mode, it passes with a warning).
+    fn record(&mut self, from: Origin, frame: &[u8], mut actions: Vec<Action>) -> Vec<Action> {
+        self.keep_credential_out(&mut actions);
         let mut event = std::mem::take(&mut self.event);
         // Judged by where the message went, unless the gate already said
         // what it did.
@@ -590,7 +606,10 @@ impl Gate {
             (from, actions.as_slice()),
             (Origin::Client, [Action::ToServer(_)]) | (Origin::Server, [Action::ToClient(_)])
         );
-        self.unrecorded(from, frame, event.method.as_deref(), forwarded)
+        let mut answer = self.unrecorded(from, frame, event.method.as_deref(), forwarded);
+        // It echoes the message's id.
+        self.keep_credential_out(&mut answer);
+        answer
     }
 
     /// Fails closed for a message the audit log couldn't take: answers a
@@ -660,6 +679,11 @@ impl Gate {
         if self.observe() && self.event.would.is_none() {
             self.event.would = Some(audit::Verdict::Modify);
         }
+        self.list_change(change);
+    }
+
+    /// Lists a change to the current message in its audit entry.
+    fn list_change(&mut self, change: String) {
         if self.event.changes.len() < MAX_CHANGES {
             let change = self.audit_text(&change, MAX_REASON);
             self.event.changes.push(change);
@@ -693,16 +717,9 @@ impl Gate {
         };
         if self.observe() {
             warn!(direction, reason = %error, bytes = frame.len(), "would drop a line that isn't JSON-RPC (observe mode)");
-            return match from {
-                Origin::Client => {
-                    self.expect_unread(head);
-                    to_server(frame)
-                }
-                Origin::Server => {
-                    self.taint_unread(head, answered);
-                    to_client(frame)
-                }
-            };
+            // A batch's messages are followed one by one.
+            let heads = jsonrpc::batch_heads(frame).unwrap_or_else(|| vec![head]);
+            return self.pass_unread(from, frame, heads, answered);
         }
         if answer.is_empty() {
             warn!(direction, reason = %error, bytes = frame.len(), "dropped a line that isn't JSON-RPC");
@@ -764,8 +781,35 @@ impl Gate {
         (answer, None)
     }
 
+    /// Passes on a message observe mode doesn't check (one it can't read in
+    /// full, or a batch), and follows it as far as `heads` allow: what it
+    /// says it is, from its top-level members (one for each message in a
+    /// batch; `None` for one that doesn't say). A request is expected to be
+    /// answered, and an answer taints the session as a readable one would.
+    /// `answered` is the request it was already found to answer.
+    fn pass_unread(
+        &mut self,
+        from: Origin,
+        frame: &[u8],
+        heads: Vec<Option<Message>>,
+        answered: Option<Pending>,
+    ) -> Vec<Action> {
+        match from {
+            Origin::Client => {
+                for head in heads {
+                    self.expect_unread(head);
+                }
+                to_server(frame)
+            }
+            Origin::Server => {
+                self.taint_unread(heads, answered);
+                to_client(frame)
+            }
+        }
+    }
+
     /// Expects the server to answer a request observe mode passes on
-    /// although the gate couldn't read it in full, so the answer is checked
+    /// although the gate didn't read it in full, so the answer is checked
     /// (and taints the session) like any other. Only its method is known
     /// (`head` says it), so a tool call counts as one to a tool that reads
     /// untrusted content.
@@ -787,32 +831,55 @@ impl Gate {
     }
 
     /// Taints the session for a server message observe mode passes on
-    /// although the gate couldn't read it, as a readable answer to the same
-    /// request would: the model reads it all the same, and the agent's
-    /// other servers may be enforcing. `answered` is the request it was
-    /// already found to answer; otherwise its top-level members (`head`)
-    /// say which, and if even those can't be read, it could answer any
-    /// request still waiting.
-    fn taint_unread(&mut self, head: Option<Message>, answered: Option<Pending>) {
-        let source = match (answered, head) {
-            (Some(pending), _) => self.taint_from(&pending),
-            (None, Some(Message::Response { id, .. })) => match self.pending.remove(&id_key(&id)) {
-                Some(pending) => {
-                    self.note_answered(&pending);
-                    self.taint_from(&pending)
+    /// although the gate didn't check it, as readable ones would: the model
+    /// reads it all the same, and the agent's other servers may be
+    /// enforcing. `answered` is the request it was already found to answer;
+    /// otherwise `heads` say what it is (each message's, in a batch). An
+    /// answer taints as one to the request it names, which stops waiting,
+    /// and a sampling request as an allowed one does. An answer that can't
+    /// be read, or names no request still waiting, could answer any of them.
+    fn taint_unread(&mut self, heads: Vec<Option<Message>>, answered: Option<Pending>) {
+        if let Some(pending) = answered {
+            let source = self.taint_from(&pending);
+            self.taint_unchecked(source);
+            return;
+        }
+        // In a batch, it isn't the answer to any one request.
+        let single = heads.len() == 1;
+        let mut first = None;
+        for head in heads {
+            let source = match head {
+                Some(Message::Response { id, .. }) => match self.pending.remove(&id_key(&id)) {
+                    Some(pending) => {
+                        if single {
+                            self.note_answered(&pending);
+                        }
+                        self.taint_from(&pending)
+                    }
+                    None => self.waiting_taint(),
+                },
+                Some(Message::Request { method, .. }) if method == "sampling/createMessage" => {
+                    Some(SAMPLING_TAINT.to_owned())
                 }
-                None => None,
-            },
-            // A request or a notification answers nothing.
-            (None, Some(_)) => None,
-            // The least, so it's the same one whatever order they're kept in.
-            (None, None) => self
-                .pending
-                .values()
-                .filter_map(|pending| self.taint_from(pending))
-                .min(),
-        };
-        self.taint_unchecked(source);
+                // Any other request, or a notification, answers nothing.
+                Some(_) => None,
+                None => self.waiting_taint(),
+            };
+            first = first.or(source);
+        }
+        self.taint_unchecked(first);
+    }
+
+    /// What an answer to any of the requests still waiting would taint the
+    /// session with, for one that may answer any of them: its id may name
+    /// one written another way (`"7"` for `7`, which some clients take for
+    /// the same), or not be readable at all. The least, so it's the same
+    /// whatever order they're kept in.
+    fn waiting_taint(&self) -> Option<String> {
+        self.pending
+            .values()
+            .filter_map(|pending| self.taint_from(pending))
+            .min()
     }
 
     /// Taints the session with `source`, if any, for a server message
@@ -1051,12 +1118,15 @@ impl Gate {
 
     /// A response to no request the client is waiting for: a server
     /// answering twice, or making one up. Dropped (in observe mode, passed
-    /// on after the usual checks).
+    /// on after the usual checks, tainting the session as an answer to any
+    /// request still waiting would).
     fn unexpected_response(&mut self, frame: &[u8]) -> Vec<Action> {
         let reason = "a response to no request the client is waiting for";
         self.note_block(reason, audit::Verdict::Drop);
         if self.observe() {
             warn!("would drop {reason} (observe mode)");
+            let source = self.waiting_taint();
+            self.taint_unchecked(source);
             return self.server_response(frame, None);
         }
         warn!("dropped {reason}");
@@ -1276,6 +1346,103 @@ impl Gate {
         Some(reason)
     }
 
+    /// Keeps the gateway's own credential for the server out of every
+    /// message going to the client, in every mode and whatever the policy
+    /// says about redacting: it's the operator's, not part of what a policy
+    /// in observe mode is trying out. Costs nothing without one (the stdio
+    /// relay never sets one).
+    fn keep_credential_out(&mut self, actions: &mut Vec<Action>) {
+        if self.credentials.is_empty()
+            || !actions
+                .iter()
+                .any(|action| matches!(action, Action::ToClient(_)))
+        {
+            return;
+        }
+        let mut kept = Vec::with_capacity(actions.len());
+        for action in std::mem::take(actions) {
+            match action {
+                Action::ToClient(message) => kept.extend(self.without_credential(message)),
+                action => kept.push(action),
+            }
+        }
+        *actions = kept;
+    }
+
+    /// `message`, on its way to the client, with the gateway's credential
+    /// redacted if it holds it (read in full and written again). One that
+    /// holds it but can't be read in full doesn't pass.
+    fn without_credential(&mut self, message: Vec<u8>) -> Option<Action> {
+        // Looked for as a parser reads the message, escapes written out. A
+        // resource's base64 blob can only be looked into once it's read.
+        let (named, blob) = {
+            let text = jsonrpc::unescaped(&message);
+            (
+                self.credentials.find(&text).is_some(),
+                text.contains("\"blob\""),
+            )
+        };
+        if !named && !blob {
+            return Some(Action::ToClient(message));
+        }
+        // Never read in full when that would take too much memory.
+        let parsed = match classify(&message) {
+            Err(ParseError::TooManyValues) => None,
+            _ => serde_json::from_slice::<Value>(&message).ok(),
+        };
+        let Some(mut parsed) = parsed else {
+            return if named {
+                self.refuse_credential(&message)
+            } else {
+                Some(Action::ToClient(message))
+            };
+        };
+        let redacted = !self.credentials.redact_json(&mut parsed).is_empty();
+        if !redacted && !named {
+            return Some(Action::ToClient(message));
+        }
+        // Written again even if nothing was redacted: it may have been in
+        // a repeated key's other copy, which reading it left out.
+        let rewritten = encode(&parsed);
+        if self
+            .credentials
+            .find(&jsonrpc::unescaped(&rewritten))
+            .is_some()
+        {
+            // Somewhere redacting doesn't reach (a number, say).
+            return self.refuse_credential(&message);
+        }
+        warn!("redacted the gateway's credential for the server from a message to the client");
+        self.list_change("the gateway's credential for the server redacted".to_owned());
+        Some(Action::ToClient(rewritten))
+    }
+
+    /// Stops a message on its way to the client that holds the gateway's
+    /// credential but can't be read in full to redact it. If it answers a
+    /// request, the client gets an error in its place; if it's the server's
+    /// request, the server does; anything else is dropped.
+    fn refuse_credential(&mut self, message: &[u8]) -> Option<Action> {
+        let reason = "it holds the gateway's credential for the server, and can't be read in full to redact it";
+        warn!("stopped a message to the client: {reason}");
+        self.event.reason = Some(self.audit_text(reason, MAX_REASON));
+        let (verdict, answer) = match jsonrpc::head(message) {
+            Some(Message::Response { id, .. }) if !id.is_null() => {
+                let text = "Blocked by mcp-mandate: the server's answer held the gateway's credential for the server, and couldn't be read in full to redact it";
+                let reply = reply_for(self.event.method.as_deref().unwrap_or_default());
+                let answer = encode(&blocked_reply(&id, text, reply));
+                (audit::Verdict::Block, Some(Action::ToClient(answer)))
+            }
+            Some(Message::Request { id, .. }) => {
+                let text = "Blocked by mcp-mandate: the request held the gateway's credential for the server, and couldn't be read in full to redact it";
+                let answer = encode(&rpc_error(&id, text));
+                (audit::Verdict::Block, Some(Action::ToServer(answer)))
+            }
+            _ => (audit::Verdict::Drop, None),
+        };
+        self.event.verdict = Some(verdict);
+        answer
+    }
+
     /// Redacts secrets anywhere in `message` (in observe mode, only logs
     /// them). Returns whether the message changed.
     fn redact(&mut self, message: &mut Value) -> bool {
@@ -1431,12 +1598,9 @@ impl Gate {
         };
         match rule {
             Rule::Allow => {
-                // A sampling request puts the server's text in front of the
-                // model, like a tool's output does.
-                let source = "the server's `sampling/createMessage` request";
                 if method == "sampling/createMessage"
-                    && !self.mark_tainted(source.to_owned())
-                    && let Some(reason) = self.unshared_taint(source)
+                    && !self.mark_tainted(SAMPLING_TAINT.to_owned())
+                    && let Some(reason) = self.unshared_taint(SAMPLING_TAINT)
                 {
                     let text = format!("Blocked by mcp-mandate: {reason}");
                     return vec![Action::ToServer(encode(&rpc_error(id, &text)))];
@@ -1480,7 +1644,8 @@ impl Gate {
         vec![Action::ToClient(encode(&blocked_reply(id, &text, reply)))]
     }
 
-    /// Answers a blocked server request (or, in observe mode, forwards it).
+    /// Answers a blocked server request (or, in observe mode, forwards it,
+    /// and a sampling request taints the session as an allowed one does).
     fn block_server(
         &mut self,
         frame: &[u8],
@@ -1491,6 +1656,9 @@ impl Gate {
         self.note_block(&reason, audit::Verdict::Block);
         if self.observe() {
             warn!(%method, %reason, "would block (observe mode)");
+            if method == "sampling/createMessage" {
+                self.taint_unchecked(Some(SAMPLING_TAINT.to_owned()));
+            }
             return to_client(frame);
         }
         warn!(%method, %reason, "blocked");
@@ -1498,14 +1666,18 @@ impl Gate {
         vec![Action::ToServer(encode(&rpc_error(id, &text)))]
     }
 
-    fn batch(&mut self, len: usize, forward: Action) -> Vec<Action> {
+    /// A JSON-RPC batch, whose messages aren't checked one at a time:
+    /// dropped (in observe mode, passed on, and followed as far as each
+    /// message's top-level members allow).
+    fn batch(&mut self, from: Origin, frame: &[u8], len: usize) -> Vec<Action> {
         self.note_block(
             "batches can't be checked one message at a time",
             audit::Verdict::Drop,
         );
         if self.observe() {
             warn!(len, "would drop a JSON-RPC batch (observe mode)");
-            return vec![forward];
+            let heads = jsonrpc::batch_heads(frame).unwrap_or_else(|| vec![None]);
+            return self.pass_unread(from, frame, heads, None);
         }
         warn!(
             len,
