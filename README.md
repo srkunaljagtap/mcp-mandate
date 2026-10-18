@@ -147,8 +147,9 @@ same text in mcp-mandate's logs, including the package named in the warning
 about an unpinned version: the user name, password, query and fragment of
 every URL, wherever it is in an argument (also in a package spec such as
 `name@git+https://user:token@host/repo.git`), the value of `NAME=value`,
-the values of options and headers such as `--api-key` or `Authorization:`,
-and keys of known shapes. A value can have spaces, so it's masked up to its
+the values of options and headers such as `--api-key`, `--token:…`,
+`/p:Password=…`, npm's `--//host/:_authToken=…` or `Authorization:`, and
+keys of known shapes. A value can have spaces, so it's masked up to its
 closing quote if it opens one, or else up to the next option:
 `--db-password=correct horse` and `Authorization: Bearer <token>` are
 masked whole. When a client passes a value's words as separate arguments,
@@ -157,10 +158,11 @@ option, until it has one word for an option such as `--api-key` and two for
 a header such as `Authorization:` (a scheme and a token), so
 `Authorization:` `Bearer` `<token>` is masked however it's split. In a
 script passed to a shell (`sh -c "API_KEY=… node server.js"`), that masks
-the words after an unquoted value too. A secret with no recognizable shape in a plain argument
-isn't caught, so pass secrets to servers through environment variables
-instead. A remote server is named by its URL without its user name,
-password, query or fragment, so a key in the URL's path is kept.
+the words after an unquoted value too. A secret with no recognizable shape
+in a plain argument isn't caught, so pass secrets to servers through
+environment variables instead. A remote server is named by its URL without
+its user name, password, query or fragment, so a key in the URL's path is
+kept.
 
 **If the pins file already exists**, `pin` stops with "the pins file already
 exists; pass --force to replace it". That's on purpose: re-pinning trusts
@@ -187,11 +189,14 @@ write to them: whoever can edit them decides what the gate allows. A
 folder such as `~/.config/mcp-mandate/` works, as long as your agent's own
 file tools aren't allowed there. mcp-mandate warns when either file is
 inside the folder the server runs in (unless that's your home folder or
-`/`, where clients often start servers), or when other users can write to
-the file or its folder. Group write access counts unless the group's id is
-the owner's user id: on systems such as Fedora and Ubuntu, which give each
-user a private group and make new files group-writable, that's a group only
-you are in.
+`/`, where clients often start servers). On Linux and macOS it also warns
+when the file or its folder belongs to another user (anyone but you and
+root), or when other users can write to the file or its folder. Group
+write access counts unless the group is your own private group (named
+after you, with the same id as your user id, and no other members): on
+systems such as Fedora and Ubuntu, which give each user a private group and
+make new files group-writable, that's a group only you are in. Only the
+permission bits are read, not ACLs, and Windows permissions aren't checked.
 
 ```toml
 pins = "everything.pins.toml"
@@ -331,8 +336,9 @@ mcp-mandate audit verify policy.audit.jsonl
   and at most once a second while messages pass through it: it puts the
   file back if something removed it (a cleaner of temporary files, say)
   and touches it so it doesn't look old. If the file can't be written when
-  an answer taints a server's session (a full disk, say), that answer
-  doesn't reach the client: the request gets an error saying the taint
+  an answer taints a server's session (a full disk, say), or it was removed
+  and can't be put back, that answer doesn't reach the client: the request
+  gets an error saying the taint
   couldn't be shared with the agent's other servers, and the audit log
   records it. A sampling request from the server is refused the same way.
   Observe mode only warns. The server itself stays tainted and keeps
@@ -340,12 +346,16 @@ mcp-mandate audit verify policy.audit.jsonl
   pass again. If the folder itself is removed while the agent runs and
   can't be made again (`$XDG_RUNTIME_DIR` is removed when you log out,
   even if the agent goes on running in `tmux` or `screen`), the agent's
-  servers that haven't seen the taint yet are no longer held. When
-  mcp-mandate is started through a shell or wrapper, set
-  `MCP_MANDATE_AGENT` to the same name in each server's configuration so
-  they're still counted as one agent. A named agent's taint lasts while any
-  server with that name is running; once they have all stopped, the next
-  one starts clean. If no private folder can be set up, or the agent can't
+  servers that haven't seen the taint yet are no longer held, and a
+  tainted server withholds every answer that would taint it until the file
+  can be written again. When mcp-mandate is started through a shell or
+  wrapper, set `MCP_MANDATE_AGENT` to the same name in each server's
+  configuration so they're still counted as one agent. A named agent's
+  taint lasts while any server with that name is running; once they have
+  all stopped, the next one starts clean. Each running server holds a lock
+  on a file next to the taint file (`taint-named-<name>.lock`), touches it
+  so it doesn't look old, and makes it again if it was removed, so a
+  cleaner doesn't make a running agent look stopped. If no private folder can be set up, or the agent can't
   be identified, each server keeps its own taint and logs a warning. On the
   HTTPS gateway, taint is shared across every session of the same caller.
 - **Secrets.** API keys, tokens, private keys, and password or secret
@@ -378,14 +388,20 @@ mcp-mandate audit verify policy.audit.jsonl
   `enforce` blocks, and a policy must say `mode = "enforce"` to get it.
   What the gate blocks, hides, holds, redacts or drops (all of the above)
   it does only in `enforce` mode; the HTTPS gateway's token checks and
-  limits, and its redaction of its own credential, apply in both. In `observe` mode, messages the gate can't read
-  reliably pass through unchanged too, each with a "would drop" warning
-  and an audit entry saying what `enforce` mode would have done: anything
-  that isn't JSON-RPC 2.0, batches, and the repeated keys, requests
-  without a real id, messages that are both a request and a response, long
-  method names and oversized messages listed above. In `enforce` mode
-  they're dropped, and a request dropped this way gets no answer (unless
-  it's too large to check: see above).
+  limits, and its redaction of its own credential, apply in both. In
+  `observe` mode, messages the gate can't read reliably pass through
+  unchanged too, each with a "would drop" warning and an audit entry
+  saying what `enforce` mode would have done: anything that isn't JSON-RPC
+  2.0, batches, and the repeated keys, requests without a real id,
+  messages that are both a request and a response, long method names and
+  oversized messages listed above. In `enforce` mode they're dropped, and
+  a request dropped this way gets no answer (unless it's too large to
+  check: see above). `observe` mode still keeps track of taint, so servers
+  of the same agent that enforce are still held: whatever it passes that
+  could taint the session does (an answer it can't read or can't match to
+  its request, a batch, a request it would have blocked and its answer, a
+  server's sampling request), and a tool call whose tool can't be read
+  counts as one that reads untrusted content.
 
 A blocked tool call comes back to the agent as a tool error that says why
 (for example, "Blocked by mcp-mandate: tool `x` changed since it was
@@ -416,7 +432,10 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
     match the token's algorithm);
   - the issuer;
   - the audience (the gateway, or the server being used);
-  - the subject, the expiry and the not-before time.
+  - the subject, the expiry and the not-before time. Clocks may differ by
+    up to a minute for the not-before time, but not for the expiry: a
+    token past its expiry by the gateway's clock gets `401`, so the client
+    renews it.
 
   Set `audience` to an API or resource identifier, never to a client id:
   the token's type isn't checked, so with a client id an ID token would
@@ -429,23 +448,26 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   to find your provider and sign in.
 - **The server never sees your token.** The gateway removes it and signs in
   with its own credential for that one server: a secret from an environment
-  variable or file (never the config file itself), or short-lived OAuth
-  client-credential tokens. A credential sent in a header must be ASCII.
-  Only the headers MCP needs are passed on, and redirects aren't followed,
-  so a server can't bounce the credential elsewhere. A server that echoes
-  the credential back gets it redacted, in either mode, in replies and
-  event streams alike (a message the gate can't read that holds it is
-  dropped): the whole header value, the token after its scheme, the client
-  secret, and every client-credential token that may still be valid: until
-  the expiry the token endpoint gave (`expires_in`), or for a day when it
-  gave none, the 16 newest at most. An event's id isn't a message, so the gate
-  doesn't check it: an id holding the credential, or anything else the
-  policy takes for a secret, is dropped.
+  variable or file (never the config file itself), without the spaces or
+  line breaks around it, or short-lived OAuth client-credential tokens. A
+  credential sent in a header must be ASCII. Only the headers MCP needs are
+  passed on, and redirects aren't followed, so a server can't bounce the
+  credential elsewhere. A server that echoes the credential back gets it
+  redacted, in either mode, in replies and event streams alike (a message
+  the gate can't read that holds it doesn't pass): the whole header value,
+  the token after its scheme, the client secret, and every
+  client-credential token that may still be valid: until the expiry the
+  token endpoint gave (`expires_in`), or for a day when it gave none, the
+  16 newest at most. An event's id isn't a message, so the gate doesn't
+  check it: an id holding the credential, or anything else the policy
+  takes for a secret, is dropped.
 - **Sessions** belong to the caller who opened them, and each has its own
   gate: its own taint, its own audit session. The server's session id is
   never shown to the client. Sessions unused for 30 minutes close, unless
   a request is still in flight. Closing a session also ends its event
-  streams and the server's session.
+  streams and the server's session. A request still waiting on a session
+  that closes gets `404`, as for any unknown session, so the client starts
+  a new one.
 - **Every message**, including streamed (SSE) ones, goes through the gate
   exactly as with `mcp-mandate run`. Each session's audit log entries name
   the caller (`sub`) and their OAuth client.
@@ -465,10 +487,11 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   gate's refusals of the server's own requests being sent at once (a server
   sending more requests waits until one is taken). Across all callers,
   messages are read and checked as many at a time as the machine has CPUs;
-  the rest wait their turn. Nothing outlives the token it came with: an
-  event stream ends when the token it was opened with expires, and a
-  request still waiting for its answer when the token it was sent with
-  expires is given up on (its event stream ends, or the client gets
+  the rest wait their turn. Nothing outlives the token it came with: a
+  request whose token expires before the request is checked or sent gets
+  `401`, an event stream ends when the token it was opened with expires,
+  and a request still waiting for its answer when the token it was sent
+  with expires is given up on (its event stream ends, or the client gets
   `504`); clients carry on with a fresh token. A reply or event stream
   from the server that sends nothing for 5 minutes is ended too, so a call
   that runs longer needs the server to send progress notifications or
@@ -576,15 +599,17 @@ jq -c 'select(.verdict == "block") | {time, item, reason}' policy.audit.jsonl
   and never opened through a symlink. If your policies are in git, add
   `*.audit.jsonl` to `.gitignore`.
 - **If it can't be written** (a full disk, say, or another process holding
-  its lock for more than 2 seconds), nothing passes: requests are answered
-  with an error saying the audit log can't be written, until it can be
-  again. Once one write has waited 2 seconds for the lock, the ones after
+  its lock for more than 2 seconds), nothing passes: requests, and answers
+  the other side is waiting for, are answered with an error saying the
+  audit log can't be written (messages too large to check included), until
+  it can be again. Once one write has waited 2 seconds for the lock, the ones after
   it fail at once until a write gets it, so sessions sharing the log don't
   each wait in turn. A gate stops writing to its log until it's restarted
   if it finds the log deleted, replaced by another file (it compares the
   file's device and inode, or on Windows its volume serial number and file
-  index), or cut short before the last entry the gate wrote or read, even
-  if the log has grown back past that point since. It stays stopped even
+  index), or cut short before the last entry the gate wrote or read, or
+  that entry changed, even if the log has since grown back to the same
+  length or past it. It stays stopped even
   once a new file appears at the path, so entries can't disappear
   unnoticed. In `observe` mode, all of this only warns. A log that can't be
   opened, or whose last line is damaged, stops `mcp-mandate run` from
