@@ -1063,6 +1063,206 @@ fn observe_mode_expects_an_answer_to_a_request_it_cant_read() {
     assert_eq!(event.would, None);
 }
 
+fn fetch_call(id: u64) -> Vec<u8> {
+    request(
+        id,
+        "tools/call",
+        json!({"name": "fetch_page", "arguments": {}}),
+    )
+}
+
+#[test]
+fn observe_mode_follows_a_batch_it_passes_on() {
+    // The server's: each answer taints as one to its request, which stops
+    // waiting.
+    let readable = line(json!([
+        {"jsonrpc": "2.0", "id": 7, "result": {"content": [{"type": "text", "text": INJECTION}]}},
+        {"jsonrpc": "2.0", "method": "notifications/progress", "params": {}}
+    ]));
+    let repeated_key = format!(
+        "[{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"text\":\"hi\",\"text\":\"{INJECTION}\"}}}}]\n"
+    );
+    for batch in [readable, repeated_key.into_bytes()] {
+        let record = Arc::new(Record::default());
+        let (mut gate, log) = sharing_gate(OBSERVE, &record);
+        gate.from_client(&fetch_call(7));
+        assert_eq!(
+            gate.from_server(&batch),
+            vec![Action::ToClient(batch.clone())]
+        );
+        assert_eq!(log.last().would, Some(audit::Verdict::Drop));
+        assert_eq!(
+            record.get().as_deref(),
+            Some("the output of tool `fetch_page`")
+        );
+        assert!(!gate.pending.contains_key("7"));
+    }
+
+    // One it can't match to a request could answer any still waiting.
+    for answer in [
+        json!({"jsonrpc": "2.0", "id": "8", "result": {"text": INJECTION}}),
+        json!({"jsonrpc": "2.0", "id": 8, "method": "x", "result": {"text": INJECTION}}),
+    ] {
+        let record = Arc::new(Record::default());
+        let (mut gate, _) = sharing_gate(OBSERVE, &record);
+        gate.from_client(&fetch_call(8));
+        let batch = line(json!([answer]));
+        assert_eq!(
+            gate.from_server(&batch),
+            vec![Action::ToClient(batch.clone())]
+        );
+        assert_eq!(
+            record.get().as_deref(),
+            Some("the output of tool `fetch_page`"),
+            "{answer}"
+        );
+    }
+
+    // The client's: each request is expected, so its answer taints. Which
+    // tool a call names isn't read, so even a closed-world one counts.
+    let record = Arc::new(Record::default());
+    let (mut gate, _) = sharing_gate(OBSERVE, &record);
+    let batch = line(json!([
+        {"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {"name": "add_note", "arguments": {}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    ]));
+    assert_eq!(
+        gate.from_client(&batch),
+        vec![Action::ToServer(batch.clone())]
+    );
+    let answer = response(
+        11,
+        json!({"content": [{"type": "text", "text": INJECTION}]}),
+    );
+    assert_eq!(
+        gate.from_server(&answer),
+        vec![Action::ToClient(answer.clone())]
+    );
+    assert_eq!(
+        record.get().as_deref(),
+        Some("the output of a tool call mcp-mandate couldn't read in full")
+    );
+
+    // Enforcing, a batch is still dropped.
+    let record = Arc::new(Record::default());
+    let (mut gate, _) = sharing_gate("", &record);
+    gate.from_client(&fetch_call(7));
+    let batch = line(json!([{"jsonrpc": "2.0", "id": 7, "result": {"text": INJECTION}}]));
+    assert_eq!(gate.from_server(&batch), Vec::new());
+    assert_eq!(record.get(), None);
+}
+
+#[test]
+fn observe_mode_taints_for_an_answer_whose_id_names_no_waiting_request() {
+    // `"7"` for `7`: some clients take one for the other.
+    let readable = line(
+        json!({"jsonrpc": "2.0", "id": "7", "result": {"content": [{"type": "text", "text": INJECTION}]}}),
+    );
+    let repeated_key = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"result\":{{\"text\":\"hi\",\"text\":\"{INJECTION}\"}}}}\n"
+    );
+    for answer in [readable.clone(), repeated_key.into_bytes()] {
+        let record = Arc::new(Record::default());
+        let (mut gate, log) = sharing_gate(OBSERVE, &record);
+        gate.from_client(&fetch_call(7));
+        assert_eq!(
+            gate.from_server(&answer),
+            vec![Action::ToClient(answer.clone())]
+        );
+        assert_eq!(log.last().would, Some(audit::Verdict::Drop));
+        assert_eq!(
+            record.get().as_deref(),
+            Some("the output of tool `fetch_page`"),
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+    }
+
+    // Not when no request still waiting would taint the session.
+    let record = Arc::new(Record::default());
+    let (mut gate, _) = sharing_gate(OBSERVE, &record);
+    let note = request(
+        7,
+        "tools/call",
+        json!({"name": "add_note", "arguments": {}}),
+    );
+    gate.from_client(&note);
+    assert_eq!(
+        gate.from_server(&readable),
+        vec![Action::ToClient(readable.clone())]
+    );
+    assert_eq!(record.get(), None);
+
+    // Enforcing, it's dropped.
+    let record = Arc::new(Record::default());
+    let (mut gate, _) = sharing_gate("", &record);
+    gate.from_client(&fetch_call(7));
+    assert_eq!(gate.from_server(&readable), Vec::new());
+    assert_eq!(record.get(), None);
+}
+
+#[test]
+fn observe_mode_taints_for_a_sampling_request_it_would_block() {
+    let observing = |policy: &str| {
+        let record = Arc::new(Record::default());
+        let (gate, log) =
+            gate_with_log(&format!("{OBSERVE}{ALLOW_ALL}{policy}"), Some(taint_pins()));
+        let gate = gate.with_shared_taint(Arc::clone(&record) as Arc<dyn SharedTaint>);
+        (gate, log, record)
+    };
+    let passes = |gate: &mut Gate, request: Vec<u8>| {
+        assert_eq!(
+            gate.from_server(&request),
+            vec![Action::ToClient(request.clone())]
+        );
+    };
+
+    // Denied (as by default) or held by the policy.
+    for policy in ["", "[server_requests]\nsampling = \"hold\"\n"] {
+        let (mut gate, log, record) = observing(policy);
+        passes(&mut gate, sampling_request(5));
+        assert_eq!(log.last().would, Some(audit::Verdict::Block), "{policy}");
+        assert_eq!(record.get().as_deref(), Some(SAMPLING_TAINT), "{policy}");
+    }
+
+    // Allowed, but refused for reusing an id still in flight...
+    let allowed = "[server_requests]\nsampling = \"allow\"\n";
+    let (mut gate, log, record) = observing(allowed);
+    passes(&mut gate, request(5, "roots/list", json!({})));
+    assert_eq!(record.get(), None);
+    passes(&mut gate, sampling_request(5));
+    assert_eq!(log.last().would, Some(audit::Verdict::Block));
+    assert_eq!(record.get().as_deref(), Some(SAMPLING_TAINT));
+
+    // ...or because too many of the server's requests are waiting.
+    let (mut gate, _, record) = observing(allowed);
+    for id in 0..MAX_PENDING {
+        gate.server_pending
+            .insert(format!("\"r{id}\""), "roots/list".to_owned());
+    }
+    passes(&mut gate, sampling_request(5));
+    assert_eq!(record.get().as_deref(), Some(SAMPLING_TAINT));
+
+    // One it can't read, whose top-level members say what it is.
+    let (mut gate, _, record) = observing("");
+    passes(
+        &mut gate,
+        b"{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[],\"messages\":[]}}\n".to_vec(),
+    );
+    assert_eq!(record.get().as_deref(), Some(SAMPLING_TAINT));
+
+    // Enforcing, it's refused, and taints nothing.
+    let record = Arc::new(Record::default());
+    let (gate, _) = gate_with_log(ALLOW_ALL, Some(taint_pins()));
+    let mut gate = gate.with_shared_taint(Arc::clone(&record) as Arc<dyn SharedTaint>);
+    let actions = gate.from_server(&sampling_request(5));
+    assert!(
+        matches!(actions.as_slice(), [Action::ToServer(_)]),
+        "{actions:?}"
+    );
+    assert_eq!(record.get(), None);
+}
+
 #[test]
 fn answers_are_withheld_while_a_removed_record_cant_be_put_back() {
     let record = Arc::new(Remembered::default());
@@ -1170,6 +1370,216 @@ fn redaction_can_be_switched_off() {
         shown["result"]["content"][0]["text"],
         "AKIAIOSFODNN7EXAMPLE"
     );
+}
+
+/// The credential the HTTPS gateway uses for the server.
+const CREDENTIAL: &str = "opaque-token-1234567";
+
+/// A gate on the HTTPS gateway (for `policy`, which allows every tool),
+/// which knows the gateway's own credential for the server.
+fn credential_gate(policy: &str) -> (Gate, Memory) {
+    let (mut gate, log) = gate_with_log(&format!("{policy}{ALLOW_ALL}"), Some(taint_pins()));
+    gate.set_secret_literals(&[CREDENTIAL.to_owned(), format!("Bearer {CREDENTIAL}")]);
+    list(&mut gate, Kind::Tool, taint_tools());
+    (gate, log)
+}
+
+/// Lets a call to `add_note` through and has the server answer it with
+/// `answer` (which needn't be readable); returns what reaches the client.
+fn answer_with(gate: &mut Gate, id: u64, answer: &[u8]) -> Vec<Action> {
+    let note = request(
+        id,
+        "tools/call",
+        json!({"name": "add_note", "arguments": {}}),
+    );
+    assert_eq!(
+        gate.from_client(&note),
+        vec![Action::ToServer(note.clone())]
+    );
+    gate.from_server(answer)
+}
+
+fn assert_no_credential(actions: &[Action]) {
+    for action in actions {
+        let (Action::ToClient(bytes) | Action::ToServer(bytes)) = action;
+        let text = jsonrpc::unescaped(bytes);
+        assert!(!text.contains(CREDENTIAL), "{text}");
+    }
+}
+
+#[test]
+fn the_gateways_credential_is_redacted_whatever_the_mode_and_policy() {
+    // Without it, nothing is looked for (the stdio relay never sets one).
+    assert!(gate(POLICY, None).credentials.is_empty());
+    for policy in [
+        String::new(),
+        "[secrets]\nredact_responses = false\n".to_owned(),
+        OBSERVE.to_owned(),
+        format!("{OBSERVE}[secrets]\nredact_responses = false\n"),
+    ] {
+        let (mut gate, log) = credential_gate(&policy);
+        let redacts_others = policy.is_empty();
+
+        // As it is, and written with escapes a client reads through.
+        let plain = response(
+            10,
+            json!({"content": [{"type": "text", "text": format!("Bearer {CREDENTIAL}, key AKIAIOSFODNN7EXAMPLE")}]}),
+        );
+        let escaped = b"{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"opaque\\u002dtoken-1234567\"}]}}\n";
+        for (id, answer) in [(10, plain), (11, escaped.to_vec())] {
+            let actions = answer_with(&mut gate, id, &answer);
+            assert_no_credential(&actions);
+            let text = only_to_client(&actions)["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                text.contains("[REDACTED: gateway-credential]"),
+                "{policy}: {text}"
+            );
+            if id == 10 {
+                // Other secrets follow the policy.
+                assert_eq!(
+                    text.contains("AKIAIOSFODNN7EXAMPLE"),
+                    !redacts_others,
+                    "{policy}: {text}"
+                );
+            }
+            let event = log.last();
+            assert_eq!(event.verdict, Some(audit::Verdict::Modify), "{policy}");
+            assert!(event.forwarded_sha256.is_some());
+            if !redacts_others {
+                assert!(
+                    event
+                        .changes
+                        .contains(&"the gateway's credential for the server redacted".to_owned()),
+                    "{policy}: {:?}",
+                    event.changes
+                );
+            }
+        }
+
+        // A notification, a server request and, in observe mode, a batch.
+        let mut messages = vec![
+            line(json!({"jsonrpc": "2.0", "method": "notifications/message",
+                "params": {"level": "info", "data": format!("token {CREDENTIAL}")}})),
+            line(json!({"jsonrpc": "2.0", "id": 5, "method": "roots/list",
+                "params": {CREDENTIAL: true}})),
+        ];
+        if policy.contains("observe") {
+            messages.push(line(
+                json!([{"jsonrpc": "2.0", "method": "notifications/message",
+                "params": {"data": CREDENTIAL}}]),
+            ));
+        }
+        for message in messages {
+            let actions = gate.from_server(&message);
+            assert!(
+                matches!(actions.as_slice(), [Action::ToClient(bytes)] if *bytes != message),
+                "{policy}: {actions:?}"
+            );
+            assert_no_credential(&actions);
+        }
+        let recorded = serde_json::to_string(&log.events()).unwrap();
+        assert!(!recorded.contains(CREDENTIAL), "{recorded}");
+    }
+}
+
+#[test]
+fn the_gateways_credential_stays_out_of_the_gates_own_answers() {
+    // A schema error quotes the arguments back to the client.
+    let (mut gate, _) = gate_with_log(
+        &format!("{POLICY}\n[secrets]\nblock_in_arguments = false\n"),
+        Some(pins()),
+    );
+    gate.set_secret_literals(&[CREDENTIAL.to_owned()]);
+    list(&mut gate, Kind::Tool, approved_tools());
+    let text = call(&mut gate, "echo", json!({"message": [CREDENTIAL]}));
+    blocked_with(text.clone(), "don't match its schema");
+    let text = text.unwrap();
+    assert!(!text.contains(CREDENTIAL), "{text}");
+    assert!(text.contains("[REDACTED: gateway-credential]"), "{text}");
+}
+
+#[test]
+fn observe_mode_stops_the_gateways_credential_in_an_answer_it_cant_read() {
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    for redact in ["", "[secrets]\nredact_responses = false\n"] {
+        let policy = format!("{OBSERVE}{redact}");
+
+        // Readable once a repeated key is read as most parsers do: written
+        // again without it.
+        let (mut gate, log) = credential_gate(&policy);
+        let repeated_key = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{CREDENTIAL}\",\"text\":\"hi\"}}]}}}}\n"
+        );
+        let actions = answer_with(&mut gate, 10, repeated_key.as_bytes());
+        assert_no_credential(&actions);
+        assert_eq!(
+            only_to_client(&actions)["result"]["content"][0]["text"],
+            "hi"
+        );
+        let event = log.last();
+        assert_eq!(event.verdict, Some(audit::Verdict::Modify));
+        assert_eq!(event.would, Some(audit::Verdict::Drop));
+        assert!(
+            event
+                .changes
+                .contains(&"the gateway's credential for the server redacted".to_owned()),
+            "{:?}",
+            event.changes
+        );
+
+        // Not readable at all (nested too deeply, or too large to check):
+        // the client gets an error in its place.
+        let nested = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"Bearer {CREDENTIAL}\"}}],\"deep\":{deep}}}}}\n"
+        );
+        let rows = vec![r#"{"id":1,"name":"x"}"#; 80_000].join(",");
+        let huge = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{CREDENTIAL}\"}}],\"structuredContent\":{{\"rows\":[{rows}]}}}}}}\n"
+        );
+        for (id, answer) in [(11, nested), (12, huge)] {
+            let actions = answer_with(&mut gate, id, answer.as_bytes());
+            assert_no_credential(&actions);
+            let reply = only_to_client(&actions);
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply["result"]["isError"], true);
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("held the gateway's credential"), "{text}");
+            let event = log.last();
+            assert_eq!(event.verdict, Some(audit::Verdict::Block));
+            assert!(
+                event
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("gateway's credential"),
+                "{event:?}"
+            );
+            assert!(!gate.pending.contains_key(&id.to_string()));
+        }
+
+        // A server request of that kind is answered in the client's place;
+        // anything else is dropped.
+        let request = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"roots/list\",\"params\":{{\"t\":\"{CREDENTIAL}\",\"deep\":{deep}}}}}\n"
+        );
+        let actions = gate.from_server(request.as_bytes());
+        let [Action::ToServer(bytes)] = actions.as_slice() else {
+            panic!("expected an error to the server, got {actions:?}");
+        };
+        let error: Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(error["id"], 5);
+        assert_eq!(error["error"]["code"], BLOCKED_ERROR_CODE);
+        assert_eq!(log.last().verdict, Some(audit::Verdict::Block));
+        let junk = format!("not json, Bearer {CREDENTIAL}\n");
+        assert_eq!(gate.from_server(junk.as_bytes()), Vec::new());
+        assert_eq!(log.last().verdict, Some(audit::Verdict::Drop));
+
+        let recorded = serde_json::to_string(&log.events()).unwrap();
+        assert!(!recorded.contains(CREDENTIAL), "{recorded}");
+    }
 }
 
 // --- Audit -------------------------------------------------------------------
