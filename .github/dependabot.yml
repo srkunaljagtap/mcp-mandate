@@ -1,0 +1,37 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions in .github/workflows current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The container image's base images, pinned by digest in the Dockerfile:
+  # security fixes in the runtime image arrive as a new digest. The Rust
+  # build image's version moves with rust-toolchain.toml, by hand, so only
+  # its digest is refreshed here.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+
+  # Rust dependencies: one grouped pull request a week for minor and patch
+  # updates; major versions get their own. The fuzz targets have their own
+  # lockfile.
+  - package-ecosystem: cargo
+    directories: ["/", "/fuzz"]
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

@@ -1,0 +1,57 @@
+# An example configuration for `mcp-mandate gate`, the HTTPS gateway in
+# front of remote MCP servers. Paths are relative to this file.
+
+# Where to listen, and the URL agents use to reach the gateway.
+listen = "0.0.0.0:8443"
+public_url = "https://gate.example.com"
+
+[tls]
+# mcp-mandate serves HTTPS with this certificate and key (PEM).
+cert = "tls/gate.crt"
+key = "tls/gate.key"
+# Or, when a proxy in front (such as a Kubernetes ingress) handles HTTPS:
+#   terminated_by_proxy = true
+# Plain HTTP without either is allowed only on a loopback address.
+
+[identity]
+# Your OIDC identity provider. Tokens must come from this issuer, be for
+# this gateway (`public_url`) or the server they're used on, name a
+# subject, and be unexpired. Anyone with such a token may use every server
+# below, so control who can get one in the identity provider.
+issuer = "https://example.okta.com/oauth2/default"
+# Optional:
+#   jwks_uri = "..."       where the signing keys are (default: OIDC discovery)
+#   audience = "..."       (default: public_url)
+#   algorithms = ["RS256"] (default: every asymmetric algorithm; never HS*)
+
+# Browsers send an Origin header; any origin not listed here is refused.
+# allowed_origins = ["https://app.example.com"]
+
+# Each server is reached at /servers/<name>/mcp on the gateway. Its policy
+# (pins, rules, audit log) works as it does for `mcp-mandate run`. Pin it
+# with `mcp-mandate pin --gateway gateway.toml --server <name>`.
+#
+# The gateway signs in to each server with its own credential, never the
+# caller's token. Secrets come from an environment variable (`*_env`) or a
+# file (`*_file`), never from this file.
+
+[servers.github]
+url = "https://api.githubcopilot.com/mcp/"
+policy = "github.policy.toml"
+auth = { type = "bearer", token_env = "GITHUB_MCP_TOKEN" }
+
+[servers.tickets]
+url = "https://tickets-mcp.internal.example.com/mcp"
+policy = "tickets.policy.toml"
+[servers.tickets.auth]
+# Short-lived tokens from your identity provider (OAuth client credentials),
+# requested for this server's URL (RFC 8707) and renewed before they expire.
+type = "client_credentials"
+token_url = "https://example.okta.com/oauth2/default/v1/token"
+client_id = "mcp-mandate-gateway"
+client_secret_file = "/run/secrets/tickets-client-secret"
+scope = "tickets.read"
+
+# Other ways to sign in:
+#   auth = { type = "header", name = "X-API-Key", value_file = "/run/secrets/key" }
+#   auth = { type = "none" }

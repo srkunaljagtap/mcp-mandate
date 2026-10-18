@@ -1,0 +1,15 @@
+# Build output
+/target
+
+# Local secrets (never commit)
+.env
+
+# Per-machine Claude Code settings (permission approvals)
+.claude/settings.local.json
+
+# Local-only working notes (not for GitHub)
+CLAUDE.md
+notes/
+
+# Audit logs written next to policies
+*.audit.jsonl

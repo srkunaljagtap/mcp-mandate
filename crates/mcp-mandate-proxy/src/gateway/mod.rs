@@ -1,0 +1,1170 @@
+//! `mcp-mandate gate`: the HTTPS gateway in front of remote MCP servers.
+//!
+//! ```text
+//! agent ──HTTPS + caller's token──▶ gateway ──HTTPS + the gateway's own credential──▶ MCP server
+//!                                     │ 1. checks the token (issuer, audience, signature, expiry)
+//!                                     │ 2. finds the caller's session (each has its own gate)
+//!                                     │ 3. runs every message both ways through the gate
+//!                                     └ 4. records it all in the server's audit log
+//! ```
+//!
+//! Agents reach each configured server at `/servers/<name>/mcp` (MCP's
+//! Streamable HTTP transport). A missing or invalid token gets `401` with a
+//! pointer to the gateway's OAuth protected-resource metadata, so MCP
+//! clients can find the identity provider and sign in.
+
+mod config;
+mod identity;
+mod session;
+pub mod sse;
+mod tls;
+mod upstream;
+
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use futures_util::StreamExt;
+use mcp_mandate_audit::{self as audit, Log, Recorder};
+use mcp_mandate_gate::jsonrpc::{Message, classify};
+use mcp_mandate_gate::{Action, Gate};
+use mcp_mandate_pin::Inventory;
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tracing::{debug, error, info, warn};
+
+pub use config::{Auth, ConfigError, GatewayConfig, IdentityConfig, ServerConfig, Tls};
+pub use identity::{Caller, IdentityError, TokenError};
+pub use upstream::CredentialError;
+
+use crate::ProxyError;
+use crate::framing::MAX_MESSAGE_BYTES;
+use crate::inventory::{self, PROTOCOL_VERSION, Rpc, result_of};
+use crate::process::Signals;
+use identity::Identity;
+use session::{CallerTaints, Session, Sessions};
+use upstream::{PROTOCOL_HEADER, SESSION_HEADER, Upstream};
+
+/// Largest request body accepted from a client, and how long it may take
+/// to arrive. It's read only once the client's token checks out.
+const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Sessions unused for this long are closed.
+const IDLE_SESSION: Duration = Duration::from_secs(30 * 60);
+/// How long listing a server's inventory may take.
+const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a server gets to take the gate's answer to one of its
+/// requests, and to end a session.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often an event stream to a client gets a keep-alive comment: writing
+/// is how a client that vanished is noticed.
+const KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayError {
+    #[error("couldn't listen on {address}")]
+    Bind {
+        address: std::net::SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("couldn't load the identity provider's signing keys")]
+    Identity(#[from] IdentityError),
+    #[error("couldn't set up TLS: {0}")]
+    Tls(String),
+    #[error("couldn't open an audit log")]
+    Audit(#[from] mcp_mandate_audit::AuditError),
+    #[error("the gateway stopped serving")]
+    Serve(#[source] std::io::Error),
+}
+
+struct App {
+    config: GatewayConfig,
+    identity: Identity,
+    upstreams: BTreeMap<String, Upstream>,
+    /// Each server's audit log, opened once.
+    logs: BTreeMap<String, Log>,
+    sessions: Sessions,
+    taints: Arc<CallerTaints>,
+}
+
+/// Runs the gateway until SIGINT or SIGTERM (Ctrl-C on Windows). Returns
+/// the exit code for the signal.
+pub async fn run(config: GatewayConfig) -> Result<i32, GatewayError> {
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .map_err(|source| GatewayError::Bind {
+            address: config.listen,
+            source,
+        })?;
+    let mut signals = Signals::new();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let code = signals.recv().await;
+        let _ = stop.send(code);
+    });
+    let (code_in, code_out) = tokio::sync::oneshot::channel();
+    serve(config, listener, async move {
+        let code = stopped.await.unwrap_or(0);
+        warn!(code, "received a stop signal; stopping the gateway");
+        let _ = code_in.send(code);
+    })
+    .await?;
+    Ok(code_out.await.unwrap_or(0))
+}
+
+/// Serves on `listener` until `shutdown` completes. Then every open
+/// session's end is recorded, and its server told.
+pub async fn serve(
+    config: GatewayConfig,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), GatewayError> {
+    let identity_http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("the HTTP client's settings are valid");
+    let identity = Identity::connect(config.identity.clone(), identity_http).await?;
+    let http = upstream::client();
+    let upstreams = config
+        .servers
+        .values()
+        .map(|server| (server.name.clone(), Upstream::new(server, http.clone())))
+        .collect();
+    let tls = match &config.tls {
+        Tls::Serve { cert, key } => Some(tls::server_config(cert, key)?),
+        Tls::TerminatedByProxy | Tls::Loopback => None,
+    };
+    // Opened now, so an unwritable log stops the start rather than every
+    // session.
+    let mut logs = BTreeMap::new();
+    for server in config.servers.values() {
+        logs.insert(server.name.clone(), Log::open(&server.policy.audit_log)?);
+    }
+    let app = Arc::new(App {
+        config,
+        identity,
+        upstreams,
+        logs,
+        sessions: Sessions::default(),
+        taints: Arc::default(),
+    });
+    let sweeper = tokio::spawn(sweep(Arc::clone(&app)));
+    let address = listener.local_addr().map_err(GatewayError::Serve)?;
+    info!(
+        %address,
+        public_url = %app.config.public_url,
+        tls = tls.is_some(),
+        servers = app.config.servers.len(),
+        "the gateway is serving"
+    );
+    let router = router(Arc::clone(&app));
+    tls::serve(listener, tls, router, shutdown).await;
+    sweeper.abort();
+    let closing: Vec<_> = app
+        .sessions
+        .drain()
+        .iter()
+        .filter_map(|session| close_session(&app, session))
+        .collect();
+    // Ends are recorded right away; a server slow to end its session
+    // doesn't hold the stop up for long.
+    let _ = tokio::time::timeout(DELETE_TIMEOUT, futures_util::future::join_all(closing)).await;
+    Ok(())
+}
+
+fn router(app: Arc<App>) -> Router {
+    Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource/servers/{name}/mcp",
+            get(resource_metadata),
+        )
+        .route(
+            "/servers/{name}/mcp",
+            get(open_stream).post(post_message).delete(end_session),
+        )
+        .with_state(app)
+}
+
+/// Closes idle sessions once a minute.
+async fn sweep(app: Arc<App>) {
+    let mut every = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        every.tick().await;
+        for session in app.sessions.sweep(IDLE_SESSION) {
+            info!(server = %session.server, caller = %session.caller.subject, "closed an idle session");
+            close_session(&app, &session);
+        }
+        app.taints.keep_only(&app.sessions.callers());
+    }
+}
+
+/// OAuth protected-resource metadata (RFC 9728): where to get a token for
+/// a server behind the gateway.
+async fn resource_metadata(State(app): State<Arc<App>>, Path(name): Path<String>) -> Response {
+    if !app.config.servers.contains_key(&name) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    axum::Json(json!({
+        "resource": app.config.server_url(&name),
+        "authorization_servers": [app.identity.issuer()],
+        "bearer_methods_supported": ["header"],
+    }))
+    .into_response()
+}
+
+/// Lets a request in: the server must exist, the origin (if any) must be
+/// allowed, and the bearer token must check out.
+// The error is the HTTP response to send back; one is built per refused request.
+#[allow(clippy::result_large_err)]
+async fn admit(app: &App, name: &str, headers: &HeaderMap) -> Result<Caller, Response> {
+    if !app.config.servers.contains_key(name) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    if let Some(origin) = headers.get(ORIGIN) {
+        let allowed = origin.to_str().is_ok_and(|origin| {
+            app.config
+                .allowed_origins
+                .iter()
+                .any(|allowed| allowed == origin)
+        });
+        if !allowed {
+            return Err((StatusCode::FORBIDDEN, "this origin isn't allowed").into_response());
+        }
+    }
+    let metadata = format!(
+        "{}/.well-known/oauth-protected-resource/servers/{name}/mcp",
+        app.config.public_url
+    );
+    let Some(token) = bearer(headers) else {
+        return Err(unauthorized(&metadata, false));
+    };
+    match app
+        .identity
+        .check(token, &app.config.server_url(name))
+        .await
+    {
+        Ok(caller) => Ok(caller),
+        Err(error) => {
+            info!(server = name, reason = %error, "refused a token");
+            Err(unauthorized(&metadata, true))
+        }
+    }
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+fn unauthorized(metadata: &str, invalid: bool) -> Response {
+    let challenge = if invalid {
+        format!("Bearer error=\"invalid_token\", resource_metadata=\"{metadata}\"")
+    } else {
+        format!("Bearer resource_metadata=\"{metadata}\"")
+    };
+    (
+        StatusCode::UNAUTHORIZED,
+        [(WWW_AUTHENTICATE, challenge)],
+        "a valid bearer token is required",
+    )
+        .into_response()
+}
+
+/// The caller's open session, from the `Mcp-Session-Id` header. A missing,
+/// unknown, or someone else's session is `404`, so the client starts over.
+// The error is the HTTP response to send back; one is built per refused request.
+#[allow(clippy::result_large_err)]
+fn find_session(
+    app: &App,
+    name: &str,
+    caller: &Caller,
+    headers: &HeaderMap,
+) -> Result<Arc<Session>, Response> {
+    let session = headers
+        .get(SESSION_HEADER)
+        .and_then(|id| id.to_str().ok())
+        .and_then(|id| app.sessions.get(id, name, caller));
+    match session {
+        Some(session) => {
+            session.touch();
+            Ok(session)
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "no such session; send initialize first",
+        )
+            .into_response()),
+    }
+}
+
+/// Opens a session for `caller` on server `name`: its own gate, recording
+/// to the server's audit log. If the log can't be written, nothing opens.
+// The error is the HTTP response to send back; one is built per refused request.
+#[allow(clippy::result_large_err)]
+async fn open_session(
+    app: &Arc<App>,
+    name: &str,
+    caller: &Caller,
+) -> Result<Arc<Session>, Response> {
+    let server = &app.config.servers[name];
+    let unavailable =
+        |problem: &str| (StatusCode::SERVICE_UNAVAILABLE, problem.to_owned()).into_response();
+    // All of a server's sessions record through one open file, which may
+    // have to wait for its lock: not on a thread that serves requests.
+    let mut log = app.logs[name].new_session();
+    let start = session_start(app, server, caller);
+    let recorded = tokio::task::spawn_blocking(move || log.record(&start).map(|()| log)).await;
+    let log = match recorded {
+        Ok(Ok(log)) => log,
+        Ok(Err(failure)) => {
+            error!(server = name, error = %describe(&failure), "couldn't open a session: the audit log can't be written");
+            return Err(unavailable(
+                "the audit log can't be written, so no session can open",
+            ));
+        }
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    };
+    let mut gate = Gate::new(server.policy.clone(), server.pins.clone(), Box::new(log))
+        .with_shared_taint(Arc::new(app.taints.for_caller(&caller.subject)));
+    // If the server ever echoes the gateway's own credential, the caller
+    // mustn't get it. Kept current before every check, as tokens renew.
+    gate.set_secret_literals(&app.upstreams[name].credential_strings());
+    let session = Arc::new(Session::new(name, caller.clone(), gate));
+    if app.sessions.insert(Arc::clone(&session)).is_err() {
+        close_session(app, &session);
+        return Err(unavailable("too many open sessions"));
+    }
+    info!(server = name, caller = %caller.subject, "opened a session");
+    Ok(session)
+}
+
+fn session_start(app: &App, server: &ServerConfig, caller: &Caller) -> audit::Event {
+    audit::Event {
+        event: audit::EventKind::SessionStart,
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        mode: Some(format!("{:?}", server.policy.mode).to_lowercase()),
+        policy: Some(server.policy_path.display().to_string()),
+        policy_sha256: server.policy_sha256.clone(),
+        pins_sha256: server.pins_sha256.clone(),
+        server: Some(server.name.clone()),
+        url: Some(app.upstreams[&server.name].display_url()),
+        caller: Some(caller.subject.clone()),
+        caller_client: caller.client.clone(),
+        pid: Some(std::process::id()),
+        ..audit::Event::default()
+    }
+}
+
+/// Closes a session: it's forgotten, nothing more passes through it, and
+/// its streams stop. Then its end is recorded, once, and the server's
+/// session is ended too, by the returned task: await it, or let it run.
+/// `None` if the session was closed already.
+fn close_session(app: &Arc<App>, session: &Arc<Session>) -> Option<JoinHandle<()>> {
+    app.sessions.remove(&session.id);
+    if !session.close() {
+        return None;
+    }
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let app = Arc::clone(app);
+    let session = Arc::clone(session);
+    Some(runtime.spawn(async move {
+        session.record_end().await;
+        if let Some(upstream_id) = session.upstream_id() {
+            let ended = app.upstreams[&session.server].delete(&upstream_id);
+            if tokio::time::timeout(DELETE_TIMEOUT, ended).await.is_err() {
+                debug!(server = %session.server, "the MCP server didn't end its session in time");
+            }
+        }
+    }))
+}
+
+/// Closes a session that `initialize` opened unless its reply goes back to
+/// the client: a client that never got the session's id can't use it or
+/// end it. That includes a client that left while waiting.
+struct Opening {
+    app: Arc<App>,
+    session: Arc<Session>,
+    kept: bool,
+}
+
+impl Opening {
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        if !self.kept {
+            close_session(&self.app, &self.session);
+        }
+    }
+}
+
+/// A client's JSON-RPC message (`POST`).
+async fn post_message(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    // Nothing of the body is read until the token checks out.
+    let caller = match admit(&app, &name, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    let existing = if headers.contains_key(SESSION_HEADER) {
+        match find_session(&app, &name, &caller, &headers) {
+            Ok(session) => Some(session),
+            Err(response) => return response,
+        }
+    } else {
+        None
+    };
+    // Counted before the body is read, so a session can't have any number
+    // of bodies arriving, or requests waiting, at once.
+    let in_flight = match existing.as_ref().map(|session| session.start_request()) {
+        Some(None) => return too_many("this session already has its most requests in flight"),
+        Some(permit) => permit,
+        None => None,
+    };
+    let body = match read_body(&headers, body).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let (initialize, request_id) = match classify(&body) {
+        Ok(Message::Request { id, method }) => (method == "initialize", Some(id)),
+        _ => (false, None),
+    };
+    let (session, in_flight, opening) = match existing {
+        Some(session) => (session, in_flight, None),
+        None if initialize => {
+            let session = match open_session(&app, &name, &caller).await {
+                Ok(session) => session,
+                Err(response) => return response,
+            };
+            let in_flight = session.start_request();
+            let opening = Opening {
+                app: Arc::clone(&app),
+                session: Arc::clone(&session),
+                kept: false,
+            };
+            (session, in_flight, Some(opening))
+        }
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "no Mcp-Session-Id: start with an initialize request",
+            )
+                .into_response();
+        }
+    };
+
+    let Some(actions) = gate_check(&app, &session, move |gate| gate.from_client(&body)).await
+    else {
+        close_session(&app, &session);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let (answers, forward) = split(actions);
+    let Some(forward) = forward.into_iter().next() else {
+        // The gate answered (blocked) or dropped it. A session it was
+        // opening closes, so its id isn't handed out.
+        let id = opening.is_none().then_some(session.id.as_str());
+        return match answers.into_iter().next() {
+            Some(answer) => json_reply(answer, id),
+            None => accepted(id),
+        };
+    };
+
+    let protocol = protocol_version(&headers);
+    let upstream = &app.upstreams[&name];
+    let response = match upstream
+        .post(forward, session.upstream_id().as_deref(), protocol.as_ref())
+        .await
+    {
+        Ok(response) => response,
+        Err(failure) => {
+            warn!(server = name, error = %describe(&failure), "couldn't reach the MCP server");
+            abandon(&session, request_id.as_ref()).await;
+            return (StatusCode::BAD_GATEWAY, "couldn't reach the MCP server").into_response();
+        }
+    };
+    if opening.is_some() {
+        let upstream_id = response
+            .headers()
+            .get(SESSION_HEADER)
+            .and_then(|id| id.to_str().ok())
+            .map(str::to_owned);
+        session.set_upstream_id(upstream_id);
+    }
+    let reply = relay(
+        Arc::clone(&app),
+        session,
+        response,
+        protocol,
+        request_id,
+        in_flight,
+    )
+    .await;
+    if let Some(opening) = opening
+        && reply.status().is_success()
+    {
+        opening.keep();
+    }
+    reply
+}
+
+/// Runs `check` with the session's gate, after making sure the gate knows
+/// every form of the gateway's credential for this server in use right
+/// now: tokens are renewed, and the server may echo any of them.
+async fn gate_check<T: Send + 'static>(
+    app: &App,
+    session: &Session,
+    check: impl FnOnce(&mut Gate) -> T + Send + 'static,
+) -> Option<T> {
+    let credentials = app.upstreams[&session.server].credential_strings();
+    session
+        .check(move |gate| {
+            gate.set_secret_literals(&credentials);
+            check(gate)
+        })
+        .await
+}
+
+/// Forgets a request that won't be answered through the gate, so it doesn't
+/// stay pending (and in memory) forever.
+async fn abandon(session: &Session, request_id: Option<&Value>) {
+    if let Some(id) = request_id.cloned() {
+        session.check(move |gate| gate.abandon(&id)).await;
+    }
+}
+
+/// Sends the server's reply back to the client, every message through the
+/// gate: a single JSON message, or an event stream. The request stays
+/// counted `in_flight` until its reply is done.
+async fn relay(
+    app: Arc<App>,
+    session: Arc<Session>,
+    response: reqwest::Response,
+    protocol: Option<HeaderValue>,
+    request_id: Option<Value>,
+    in_flight: Option<OwnedSemaphorePermit>,
+) -> Response {
+    let status = response.status();
+    if status == reqwest::StatusCode::ACCEPTED {
+        // An answer to a request may still come, on the server's stream.
+        return accepted(Some(&session.id));
+    }
+    if status == reqwest::StatusCode::NOT_FOUND && session.upstream_id().is_some() {
+        // The server forgot the session (so there's none to end there): the
+        // client must start over.
+        session.set_upstream_id(None);
+        close_session(&app, &session);
+        return (StatusCode::NOT_FOUND, "the MCP server ended the session").into_response();
+    }
+    if !status.is_success() {
+        warn!(server = %session.server, %status, "the MCP server answered with an error status");
+        abandon(&session, request_id.as_ref()).await;
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("the MCP server answered with HTTP {}", status.as_u16()),
+        )
+            .into_response();
+    }
+    if is_event_stream(response.headers()) {
+        return stream(
+            app, session, response, protocol, request_id, in_flight, None,
+        );
+    }
+    let body = match read_limited(response).await {
+        Ok(body) => body,
+        Err(problem) => {
+            warn!(server = %session.server, %problem, "couldn't read the MCP server's reply");
+            abandon(&session, request_id.as_ref()).await;
+            return (
+                StatusCode::BAD_GATEWAY,
+                "couldn't read the MCP server's reply",
+            )
+                .into_response();
+        }
+    };
+    let Some(actions) = gate_check(&app, &session, move |gate| gate.from_server(&body)).await
+    else {
+        close_session(&app, &session);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let (answers, to_server) = split(actions);
+    for message in to_server {
+        answer_server(&app, &session, message, protocol.clone());
+    }
+    match answers.into_iter().next() {
+        Some(answer) => json_reply(answer, Some(&session.id)),
+        None => {
+            abandon(&session, request_id.as_ref()).await;
+            (
+                StatusCode::BAD_GATEWAY,
+                "the MCP server's reply didn't pass the gate",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Relays an event stream: each event's message goes through the gate, and
+/// what passes is written to the client as it arrives. The stream stays
+/// counted by `slot` while it's open, and ends when the client leaves, the
+/// session closes, or at `deadline`.
+fn stream(
+    app: Arc<App>,
+    session: Arc<Session>,
+    response: reqwest::Response,
+    protocol: Option<HeaderValue>,
+    request_id: Option<Value>,
+    slot: Option<OwnedSemaphorePermit>,
+    deadline: Option<Instant>,
+) -> Response {
+    let (sender, receiver) = mpsc::channel::<Bytes>(64);
+    let id = session.id.clone();
+    tokio::spawn(async move {
+        let _slot = slot;
+        let mut answered = false;
+        let expired = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        // Whichever ends first; dropping the server's stream closes it.
+        tokio::select! {
+            () = relay_events(&app, &session, response, protocol.as_ref(), request_id.as_ref(), &sender, &mut answered) => {}
+            () = sender.closed() => {}
+            () = session.closed() => {}
+            () = expired => {}
+        }
+        // If the stream never carried the answer, forget the request.
+        if !answered {
+            abandon(&session, request_id.as_ref()).await;
+        }
+    });
+    let body = Body::from_stream(futures_util::stream::unfold(
+        receiver,
+        |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|event| (Ok::<_, Infallible>(event), receiver))
+        },
+    ));
+    let mut response = Response::new(body);
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    if let Ok(id) = HeaderValue::from_str(&id) {
+        headers.insert(SESSION_HEADER, id);
+    }
+    response
+}
+
+/// Relays the server's events until its stream ends. Sets `answered` once
+/// the answer to `request_id` has gone through the gate.
+async fn relay_events(
+    app: &Arc<App>,
+    session: &Arc<Session>,
+    response: reqwest::Response,
+    protocol: Option<&HeaderValue>,
+    request_id: Option<&Value>,
+    sender: &mpsc::Sender<Bytes>,
+    answered: &mut bool,
+) {
+    let mut parser = sse::Parser::new(MAX_MESSAGE_BYTES);
+    let mut chunks = response.bytes_stream();
+    let mut keep_alive = tokio::time::interval_at(Instant::now() + KEEP_ALIVE, KEEP_ALIVE);
+    loop {
+        let chunk = tokio::select! {
+            chunk = chunks.next() => chunk,
+            _ = keep_alive.tick() => {
+                // A client too far behind to take it is busy anyway.
+                let _ = sender.try_send(Bytes::from_static(b":\n\n"));
+                continue;
+            }
+        };
+        let Some(Ok(chunk)) = chunk else { return };
+        let events = match parser.push(&chunk) {
+            Ok(events) => events,
+            Err(problem) => {
+                warn!(server = %session.server, %problem, "stopped relaying the MCP server's stream");
+                return;
+            }
+        };
+        for event in events {
+            if event.data.is_empty() || event.kind.as_deref().is_some_and(|kind| kind != "message")
+            {
+                continue;
+            }
+            // A session with a live stream isn't idle.
+            session.touch();
+            let answer = request_id.is_some_and(|wanted| {
+                matches!(classify(&event.data), Ok(Message::Response { id, .. }) if id == *wanted)
+            });
+            let data = event.data;
+            let Some(actions) = gate_check(app, session, move |gate| gate.from_server(&data)).await
+            else {
+                return;
+            };
+            *answered |= answer;
+            for action in actions {
+                match action {
+                    Action::ToClient(message) => {
+                        let event = sse::encode(event.id.as_deref(), &message);
+                        if sender.send(Bytes::from(event)).await.is_err() {
+                            return; // the client left; dropping the stream closes the server's too
+                        }
+                    }
+                    Action::ToServer(message) => {
+                        answer_server(app, session, message, protocol.cloned());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sends the gate's answer to a server request back to the server. Every
+/// such answer is a refusal, so when the server already has too many
+/// waiting to be sent, it gets no more.
+fn answer_server(
+    app: &Arc<App>,
+    session: &Arc<Session>,
+    message: Vec<u8>,
+    protocol: Option<HeaderValue>,
+) {
+    let Some(slot) = session.start_answer() else {
+        warn!(server = %session.server, "didn't answer a request of the MCP server: too many answers are still being sent");
+        return;
+    };
+    let app = Arc::clone(app);
+    let session = Arc::clone(session);
+    tokio::spawn(async move {
+        let _slot = slot;
+        let upstream = &app.upstreams[&session.server];
+        let upstream_id = session.upstream_id();
+        let sent = upstream.post(message, upstream_id.as_deref(), protocol.as_ref());
+        match tokio::time::timeout(ANSWER_TIMEOUT, sent).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(failure)) => {
+                debug!(server = %session.server, error = %describe(&failure), "couldn't send an answer to the MCP server");
+            }
+            Err(_) => {
+                debug!(server = %session.server, "the MCP server didn't take an answer in time");
+            }
+        }
+    });
+}
+
+/// The server's stream for messages it sends on its own (`GET`).
+async fn open_stream(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let caller = match admit(&app, &name, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    let session = match find_session(&app, &name, &caller, &headers) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(slot) = session.open_stream() else {
+        return too_many("this session already has its most server streams open");
+    };
+    let protocol = protocol_version(&headers);
+    let upstream = &app.upstreams[&name];
+    let request = match upstream
+        .request(
+            reqwest::Method::GET,
+            "text/event-stream",
+            session.upstream_id().as_deref(),
+            protocol.as_ref(),
+        )
+        .await
+    {
+        Ok(request) => request,
+        Err(failure) => {
+            warn!(server = name, error = %describe(&failure), "couldn't get a credential for the MCP server");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let request = match headers.get("last-event-id").filter(|id| id.len() <= 256) {
+        Some(id) => request.header("last-event-id", id.clone()),
+        None => request,
+    };
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(failure) => {
+            warn!(server = name, error = %failure.without_url(), "couldn't reach the MCP server");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    if !response.status().is_success() || !is_event_stream(response.headers()) {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    // It lasts no longer than the token it was opened with: a caller whose
+    // token has expired, or who was disabled, stops getting messages.
+    let deadline = token_deadline(&caller);
+    stream(app, session, response, protocol, None, Some(slot), deadline)
+}
+
+/// When `caller`'s token expires, as an instant; `None` if it's too far
+/// off to represent.
+fn token_deadline(caller: &Caller) -> Option<Instant> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    Instant::now().checked_add(Duration::from_secs(caller.expires.saturating_sub(now)))
+}
+
+/// Ends a session (`DELETE`).
+async fn end_session(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let caller = match admit(&app, &name, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    let session = match find_session(&app, &name, &caller, &headers) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    // Its end is recorded, and the server's session ended, before the
+    // client hears back.
+    if let Some(closing) = close_session(&app, &session) {
+        let _ = closing.await;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn too_many(problem: &'static str) -> Response {
+    (StatusCode::TOO_MANY_REQUESTS, problem).into_response()
+}
+
+/// Reads a client's request body: at most [`MAX_REQUEST_BYTES`], arriving
+/// within [`BODY_TIMEOUT`].
+// The error is the HTTP response to send back; one is built per refused request.
+#[allow(clippy::result_large_err)]
+async fn read_body(headers: &HeaderMap, body: Body) -> Result<Bytes, Response> {
+    let too_large = || {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("a request may be at most {MAX_REQUEST_BYTES} bytes"),
+        )
+            .into_response()
+    };
+    let declared = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|length| length.to_str().ok())
+        .and_then(|length| length.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > MAX_REQUEST_BYTES as u64) {
+        return Err(too_large());
+    }
+    let read = async {
+        let mut bytes = Vec::new();
+        let mut chunks = body.into_data_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+            if bytes.len() + chunk.len() > MAX_REQUEST_BYTES {
+                return Err(too_large());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(bytes))
+    };
+    tokio::time::timeout(BODY_TIMEOUT, read)
+        .await
+        .unwrap_or_else(|_| {
+            Err((
+                StatusCode::REQUEST_TIMEOUT,
+                "the request's body took too long to arrive",
+            )
+                .into_response())
+        })
+}
+
+fn split(actions: Vec<Action>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut to_client = Vec::new();
+    let mut to_server = Vec::new();
+    for action in actions {
+        match action {
+            Action::ToClient(message) => to_client.push(message),
+            Action::ToServer(message) => to_server.push(message),
+        }
+    }
+    (to_client, to_server)
+}
+
+fn json_reply(message: Vec<u8>, session: Option<&str>) -> Response {
+    let mut response = Response::new(Body::from(message));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    with_session(response, session)
+}
+
+fn accepted(session: Option<&str>) -> Response {
+    with_session(StatusCode::ACCEPTED.into_response(), session)
+}
+
+fn with_session(mut response: Response, session: Option<&str>) -> Response {
+    if let Some(Ok(id)) = session.map(HeaderValue::from_str) {
+        response.headers_mut().insert(SESSION_HEADER, id);
+    }
+    response
+}
+
+/// The client's `MCP-Protocol-Version`, passed on only if it looks like
+/// one (a date such as `2025-06-18`).
+fn protocol_version(headers: &HeaderMap) -> Option<HeaderValue> {
+    headers
+        .get(PROTOCOL_HEADER)
+        .filter(|value| {
+            value.len() <= 32
+                && value
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'.')
+        })
+        .cloned()
+}
+
+fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim_start().starts_with("text/event-stream"))
+}
+
+/// Reads a reply body, refusing one over [`MAX_MESSAGE_BYTES`].
+async fn read_limited(response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if body.len() + chunk.len() > MAX_MESSAGE_BYTES {
+            return Err(format!("it's larger than {MAX_MESSAGE_BYTES} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// An error and its causes on one line.
+fn describe(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+// --- Listing a remote server's inventory (`pin` and `scout`) ------------------
+
+/// Lists everything `server` offers, signing in with the gateway's
+/// credential for it, then ends the session.
+pub async fn inventory(server: &ServerConfig) -> Result<Inventory, ProxyError> {
+    let upstream = Upstream::new(server, upstream::client());
+    let mut rpc = HttpRpc {
+        upstream: &upstream,
+        session: None,
+        protocol: None,
+        next_id: 0,
+    };
+    let listed = tokio::time::timeout(INVENTORY_TIMEOUT, inventory::collect(&mut rpc)).await;
+    if let Some(session) = rpc.session.take() {
+        // Bounded too: a server under review can't hold the listing up.
+        let _ = tokio::time::timeout(DELETE_TIMEOUT, upstream.delete(&session)).await;
+    }
+    listed.map_err(|_| ProxyError::Timeout(INVENTORY_TIMEOUT))?
+}
+
+/// A minimal Streamable HTTP client.
+struct HttpRpc<'a> {
+    upstream: &'a Upstream,
+    session: Option<String>,
+    protocol: Option<HeaderValue>,
+    next_id: u64,
+}
+
+impl Rpc for HttpRpc<'_> {
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, ProxyError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let response = self
+            .upstream
+            .post(
+                body.to_string().into_bytes(),
+                self.session.as_deref(),
+                self.protocol.as_ref(),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(ProxyError::Status {
+                method: method.to_owned(),
+                status: response.status().as_u16(),
+            });
+        }
+        if method == "initialize" {
+            self.session = response
+                .headers()
+                .get(SESSION_HEADER)
+                .and_then(|id| id.to_str().ok())
+                .map(str::to_owned);
+        }
+        let bad_reply = || ProxyError::BadReply(method.to_owned());
+        let message = if is_event_stream(response.headers()) {
+            self.find_in_stream(response, id)
+                .await?
+                .ok_or_else(bad_reply)?
+        } else {
+            let body = read_limited(response).await.map_err(|_| bad_reply())?;
+            serde_json::from_slice::<Value>(&body).map_err(|_| bad_reply())?
+        };
+        if message.get("id") != Some(&json!(id)) {
+            return Err(bad_reply());
+        }
+        let result = result_of(method, &message)?;
+        if method == "initialize" {
+            let version = result
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(PROTOCOL_VERSION);
+            self.protocol = HeaderValue::from_str(version).ok();
+        }
+        Ok(result)
+    }
+
+    async fn notify(&mut self, method: &str) -> Result<(), ProxyError> {
+        let body = json!({"jsonrpc": "2.0", "method": method});
+        let response = self
+            .upstream
+            .post(
+                body.to_string().into_bytes(),
+                self.session.as_deref(),
+                self.protocol.as_ref(),
+            )
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ProxyError::Status {
+                method: method.to_owned(),
+                status: response.status().as_u16(),
+            })
+        }
+    }
+}
+
+impl HttpRpc<'_> {
+    /// Reads an event stream until the response with `id`, refusing any
+    /// request the server makes meanwhile.
+    async fn find_in_stream(
+        &self,
+        response: reqwest::Response,
+        id: u64,
+    ) -> Result<Option<Value>, ProxyError> {
+        let mut parser = sse::Parser::new(MAX_MESSAGE_BYTES);
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let events = parser
+                .push(&chunk?)
+                .map_err(|_| ProxyError::BadReply("a streamed reply".to_owned()))?;
+            for event in events {
+                let Ok(message) = serde_json::from_slice::<Value>(&event.data) else {
+                    continue;
+                };
+                if message.get("method").is_some() {
+                    if let Some(request_id) = message.get("id") {
+                        let refusal = json!({"jsonrpc": "2.0", "id": request_id,
+                            "error": {"code": -32601, "message": "mcp-mandate doesn't answer server requests while listing"}});
+                        let _ = self
+                            .upstream
+                            .post(
+                                refusal.to_string().into_bytes(),
+                                self.session.as_deref(),
+                                self.protocol.as_ref(),
+                            )
+                            .await;
+                    }
+                    continue;
+                }
+                if message.get("id") == Some(&json!(id)) {
+                    return Ok(Some(message));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_never_finishes_arriving_is_given_up_on() {
+        let trickle =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        let refused = read_body(&HeaderMap::new(), trickle).await.unwrap_err();
+        assert_eq!(refused.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_refused_declared_or_not() {
+        let mut declared = HeaderMap::new();
+        declared.insert(CONTENT_LENGTH, HeaderValue::from(MAX_REQUEST_BYTES + 1));
+        let refused = read_body(&declared, Body::empty()).await.unwrap_err();
+        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from(vec![b' '; MAX_REQUEST_BYTES])),
+            Ok(Bytes::from_static(b" ")),
+        ];
+        let undeclared = Body::from_stream(futures_util::stream::iter(chunks));
+        let refused = read_body(&HeaderMap::new(), undeclared).await.unwrap_err();
+        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let fits = Body::from(vec![b' '; MAX_REQUEST_BYTES]);
+        assert_eq!(
+            read_body(&HeaderMap::new(), fits).await.unwrap().len(),
+            MAX_REQUEST_BYTES
+        );
+    }
+}

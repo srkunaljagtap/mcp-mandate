@@ -1,0 +1,37 @@
+[package]
+name = "mcp-mandate"
+description = "A security gate between AI agents and their MCP tools: pin, permit, prove"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["mcp", "security", "ai-agents", "gateway", "proxy"]
+categories = ["command-line-utilities", "network-programming"]
+
+[features]
+default = ["llm"]
+# Scout's optional Claude review: an HTTPS client, and reading the API key
+# from `.env`. Build with `--no-default-features` to leave it out.
+llm = ["mcp-mandate-scout/llm", "dep:dotenvy"]
+
+[dependencies]
+clap.workspace = true
+dotenvy = { workspace = true, optional = true }
+mcp-mandate-audit.workspace = true
+mcp-mandate-gate.workspace = true
+mcp-mandate-pin.workspace = true
+mcp-mandate-policy.workspace = true
+mcp-mandate-proxy.workspace = true
+mcp-mandate-scout.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+mcp-mandate-pin.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

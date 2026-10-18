@@ -1,0 +1,39 @@
+name: Fuzz
+
+# Coverage-guided fuzzing (cargo-fuzz, libFuzzer) of every parser, weekly
+# and on demand (run it before a release). Property tests cover the same
+# parsers on every pull request; this digs deeper.
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays, 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [gate_messages, event_stream, frames, audit_log, policy_file, pins_file]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # A dated nightly, so a run can be repeated exactly.
+      - run: rustup toolchain install nightly-2026-10-01 --profile minimal
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-fuzz@0.13.2
+      # Fails if fuzz/Cargo.lock is out of date, so only the reviewed
+      # dependency versions are built.
+      - run: cargo +nightly-2026-10-01 fetch --locked --manifest-path fuzz/Cargo.toml
+      - name: Fuzz for 5 minutes
+        # A crash fails the job; libFuzzer prints the input that caused it.
+        run: cargo +nightly-2026-10-01 fuzz run ${{ matrix.target }} -- -max_total_time=300
