@@ -55,9 +55,10 @@ const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
 /// and fragment of every URL, wherever it is in an argument
 /// (`name@git+https://…`), the value of a variable (`NAME=value`), of an
 /// option or header named like a secret (`--api-key`, `Authorization:`,
-/// npm's `--//host/:_authToken=`), and anything shaped like a known kind
-/// of key. A value can have spaces, so it is masked up to its closing
-/// quote, if it opens one, or else up to the next option. Split over
+/// npm's `--//host/:_authToken=`, Windows-style `/token:` and
+/// `/p:Password=`), and anything shaped like a known kind of key. A value
+/// can have spaces, so it is masked up to its closing quote, if it opens
+/// one, or else up to the next option. Split over
 /// arguments, it is followed for as many words as it can have: one after
 /// `--api-key`, two (a scheme and a token) after `Authorization:`.
 #[derive(Debug, Clone)]
@@ -167,7 +168,7 @@ fn mask(arg: &str, value: usize, secrets: &SecretDetector) -> (String, usize) {
 /// One word of an argument, with anything that may be a secret masked, and
 /// how far past it a secret it starts goes.
 fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
-    let secret_option = word.starts_with('-') && secret_name(option_name(word));
+    let secret_option = is_option(word) && secret_name(option_name(word));
     // A URL, wherever it is in the word (`name@git+https://…`), unless it's
     // in a value masked as such (`DATABASE_URL=postgres://…`,
     // `--token:https://…`).
@@ -193,8 +194,9 @@ fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
         }
     } else if secret_option {
         // An option `assignment` doesn't split: `--token:value`, npm's
-        // `--//host/:_auth=value`, `-p:Password=value`. Its value is
-        // whatever follows the first separator, or else the next word.
+        // `--//host/:_auth=value`, `-p:Password=value`, `/token:value`.
+        // Its value is whatever follows the first separator, or else the
+        // next word.
         match split_option(word) {
             Some((option, separator, value)) if !value.is_empty() => (
                 format!("{option}{separator}{MASK}"),
@@ -213,8 +215,9 @@ fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
 
 /// How far the masked value of `name` goes past its first word.
 fn secret_run(name: &str, separator: char, value: &str) -> Run {
-    // `--token:value` is an option, like `--token=value`, not a header.
-    let header = separator == ':' && !name.starts_with('-');
+    // `--token:value` and `/token:value` are options, like `--token=value`,
+    // not headers.
+    let header = separator == ':' && !name.starts_with(['-', '/']);
     match value.chars().next() {
         // `Authorization:` with its scheme and token after a space.
         None if secret_name(name) && header => Run::Value(2),
@@ -296,6 +299,23 @@ fn assignment(word: &str) -> Option<(&str, char, &str)> {
         && !(option && separator == ':')
         && !(separator == '=' && value.starts_with('='));
     valid.then_some((name, separator, value))
+}
+
+/// Whether `word` is written as an option: it starts with `-`, or, as
+/// Windows programs and MSBuild write them (`/token:value`,
+/// `/p:Name=value`), it is a `/`, a name and then `:` or `=`. An absolute
+/// path such as `/srv/data:ro` has another `/` before any separator.
+fn is_option(word: &str) -> bool {
+    if word.starts_with('-') {
+        return true;
+    }
+    let Some(rest) = word.strip_prefix('/') else {
+        return false;
+    };
+    let name = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+        .unwrap_or(rest.len());
+    name > 0 && rest[name..].starts_with([':', '='])
 }
 
 /// The part of an option word that names it: up to its first `=`, or its
@@ -1252,6 +1272,48 @@ mod tests {
         assert_eq!(
             shown("server", &["--name:monkey", "/srv"]),
             "server --name:monkey /srv"
+        );
+    }
+
+    #[test]
+    fn masks_options_written_with_a_slash() {
+        // MSBuild's `/p:Name=value` and Windows programs' `/name:value`.
+        assert_eq!(
+            shown("dotnet", &["run", "/p:Password=s3cret", "server.csproj"]),
+            "dotnet run /p:*** server.csproj"
+        );
+        assert_eq!(
+            shown("server.exe", &["/token:abcdef1234", "/srv"]),
+            "server.exe /token:*** /srv"
+        );
+        assert_eq!(
+            shown("server.exe", &["/token:", "abcdef1234", "/srv"]),
+            "server.exe /token: *** /srv"
+        );
+        assert_eq!(
+            shown("server.exe", &["/token:https://host/abcdef1234", "/srv"]),
+            "server.exe /token:*** /srv"
+        );
+        // Other options are shown.
+        assert_eq!(
+            shown("dotnet", &["build", "/p:Configuration=Release"]),
+            "dotnet build /p:Configuration=Release"
+        );
+        // An absolute path has a second `/` before any separator, so it
+        // isn't taken for an option, whatever its folders are called.
+        assert_eq!(
+            shown(
+                "docker",
+                &[
+                    "run",
+                    "-v",
+                    "/srv/data:ro",
+                    "-v",
+                    "/srv/tokens:/tokens:ro",
+                    "image"
+                ]
+            ),
+            "docker run -v /srv/data:ro -v /srv/tokens:/tokens:ro image"
         );
     }
 
