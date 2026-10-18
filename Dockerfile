@@ -17,8 +17,8 @@ RUN cargo build --release --locked --bin mcp-mandate \
  && mkdir /audit
 
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
-LABEL org.opencontainers.image.source="https://github.com/srkunaljagtap/mcp-mandate" \
-      org.opencontainers.image.description="A security gate between AI agents and their MCP tools" \
+# The release workflow adds the source repository's address as a label.
+LABEL org.opencontainers.image.description="A security gate between AI agents and their MCP tools" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 COPY --from=build /mcp-mandate /usr/local/bin/mcp-mandate
 # A folder the non-root user can write, for audit logs; mount a volume here

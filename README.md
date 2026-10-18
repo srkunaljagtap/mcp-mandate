@@ -45,7 +45,9 @@ other personal data.
 
 **Prebuilt binaries** for Linux (x86_64 and arm64, glibc 2.35 or newer),
 macOS (Intel and Apple silicon) and Windows (x86_64) are on the
-[releases page](https://github.com/srkunaljagtap/mcp-mandate/releases).
+[releases page](../../releases). In the commands below, `OWNER` stands for
+the GitHub account or organization that hosts mcp-mandate (the first part
+of this repository's address); replace it before running them.
 Each release lists SHA-256 checksums in `SHA256SUMS`, and each archive has
 a signed build attestation. Checked as below, the attestation proves the
 archive was built by this repository's release workflow
@@ -56,8 +58,8 @@ on any branch, would pass.
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
 gh attestation verify mcp-mandate-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
-  --repo srkunaljagtap/mcp-mandate \
-  --signer-workflow srkunaljagtap/mcp-mandate/.github/workflows/release.yml \
+  --repo OWNER/mcp-mandate \
+  --signer-workflow OWNER/mcp-mandate/.github/workflows/release.yml \
   --source-ref refs/tags/v0.1.0 --deny-self-hosted-runners
 ```
 
@@ -70,7 +72,7 @@ use mcp-mandate under WSL instead.
 **From source**, with [rustup](https://rustup.rs):
 
 ```sh
-cargo install --locked --git https://github.com/srkunaljagtap/mcp-mandate --tag v0.1.0 mcp-mandate
+cargo install --locked --git https://github.com/OWNER/mcp-mandate --tag v0.1.0 mcp-mandate
 ```
 
 **Container image** (linux/amd64), for the [HTTPS gateway](#the-https-gateway):
@@ -78,10 +80,10 @@ cargo install --locked --git https://github.com/srkunaljagtap/mcp-mandate --tag 
 ```sh
 docker run --rm -p 8443:8443 \
   -v "$PWD/config:/config:ro" -v mcp-mandate-audit:/audit \
-  ghcr.io/srkunaljagtap/mcp-mandate:0.1.0 gate --config /config/gateway.toml
-gh attestation verify oci://ghcr.io/srkunaljagtap/mcp-mandate:0.1.0 \
-  --repo srkunaljagtap/mcp-mandate \
-  --signer-workflow srkunaljagtap/mcp-mandate/.github/workflows/release.yml \
+  ghcr.io/OWNER/mcp-mandate:0.1.0 gate --config /config/gateway.toml
+gh attestation verify oci://ghcr.io/OWNER/mcp-mandate:0.1.0 \
+  --repo OWNER/mcp-mandate \
+  --signer-workflow OWNER/mcp-mandate/.github/workflows/release.yml \
   --source-ref refs/tags/v0.1.0 --deny-self-hosted-runners
 ```
 
