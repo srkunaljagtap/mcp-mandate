@@ -1,0 +1,9 @@
+# Only what the build needs goes into the image's build context: never local
+# secrets (.env), build output, or anything else that happens to be here.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!bin/
+!crates/
+!policies/
