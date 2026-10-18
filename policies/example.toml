@@ -1,10 +1,11 @@
 # An example mcp-mandate policy for one MCP server. Every setting is shown
 # with its default unless marked otherwise.
 
-# "enforce" blocks what this policy doesn't allow. "observe" logs what would
-# be blocked but lets everything through: use it to try a policy on real
-# traffic first.
-mode = "enforce"
+# "observe" (the default) logs what this policy would block, hide or redact,
+# but lets everything through: try a policy on real traffic this way first.
+# "enforce" blocks what the policy doesn't allow. Nothing is enforced until
+# this says "enforce".
+mode = "observe"
 
 # The pins file written by `mcp-mandate pin`, relative to this file. Without
 # it, nothing the server offers is approved. (Not a default.)

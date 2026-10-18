@@ -735,7 +735,12 @@ mod tests {
     /// A gate for a server that was never pinned: protocol plumbing passes,
     /// every tool call is blocked.
     fn unpinned_gate() -> Arc<Mutex<Option<Gate>>> {
-        let policy = Policy::parse("", Path::new(".")).unwrap();
+        let policy = Policy::parse(
+            "mode = \"enforce\"
+",
+            Path::new("."),
+        )
+        .unwrap();
         Arc::new(Mutex::new(Some(Gate::new(policy, None, Box::new(Discard)))))
     }
 

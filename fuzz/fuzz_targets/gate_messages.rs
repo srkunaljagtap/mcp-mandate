@@ -23,7 +23,11 @@ impl Recorder for Discard {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let policy = Policy::parse("[[tools]]\nmatch = \"*\"\naction = \"allow\"\n", Path::new(".")).unwrap();
+    let policy = Policy::parse(
+        "mode = \"enforce\"\n[[tools]]\nmatch = \"*\"\naction = \"allow\"\n",
+        Path::new("."),
+    )
+    .unwrap();
     let pins = Pins::from_inventory(
         "fuzz",
         &Inventory {

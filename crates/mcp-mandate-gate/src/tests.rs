@@ -93,9 +93,16 @@ fn gate(policy: &str, pins: Option<Pins>) -> Gate {
     gate_with_log(policy, pins).0
 }
 
+/// A gate for `policy`, which enforces unless it names a mode itself (a
+/// policy's own default is observe).
 fn gate_with_log(policy: &str, pins: Option<Pins>) -> (Gate, Memory) {
     let log = Memory::default();
-    let policy = Policy::parse(policy, Path::new(".")).unwrap();
+    let policy = if policy.contains("mode =") {
+        policy.to_owned()
+    } else {
+        format!("mode = \"enforce\"\n{policy}")
+    };
+    let policy = Policy::parse(&policy, Path::new(".")).unwrap();
     (Gate::new(policy, pins, Box::new(log.clone())), log)
 }
 

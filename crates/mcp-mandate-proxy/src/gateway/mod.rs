@@ -38,7 +38,7 @@ use mcp_mandate_audit::{self as audit, Log, Recorder};
 use mcp_mandate_gate::jsonrpc::{Message, ParseError, classify};
 use mcp_mandate_gate::{Action, Gate};
 use mcp_mandate_pin::Inventory;
-use mcp_mandate_policy::Policy;
+use mcp_mandate_policy::{Mode, Policy};
 use mcp_mandate_taint::{SecretDetector, SecretPattern};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -188,6 +188,14 @@ pub async fn serve(
         servers = app.config.servers.len(),
         "the gateway is serving"
     );
+    for (name, server) in &app.config.servers {
+        if server.policy.mode == Mode::Observe {
+            warn!(
+                server = name.as_str(),
+                "observe mode: decisions are logged, but nothing is blocked or hidden; add mode = \"enforce\" to the server's policy to enforce it"
+            );
+        }
+    }
     let router = router(Arc::clone(&app));
     tls::serve(listener, tls, router, shutdown).await;
     sweeper.abort();

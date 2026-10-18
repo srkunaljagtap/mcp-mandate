@@ -226,7 +226,9 @@ fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error
     };
     info!(policy = %path.display(), mode = mode_name(policy.mode), "loaded policy");
     if policy.mode == Mode::Observe {
-        warn!("observe mode: decisions are logged, but nothing is blocked or hidden");
+        warn!(
+            "observe mode: decisions are logged, but nothing is blocked or hidden; add mode = \"enforce\" to the policy to enforce it"
+        );
     }
     let mut log = Log::open(&policy.audit_log)?;
     log.record(&session_start(

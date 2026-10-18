@@ -79,7 +79,7 @@ fn memory_stays_flat_over_many_messages() {
     let policy = temp_file(
         "soak.policy.toml",
         &format!(
-            "pins = \"{}\"\n[[tools]]\nmatch = \"echo\"\naction = \"allow\"\n",
+            "mode = \"enforce\"\npins = \"{}\"\n[[tools]]\nmatch = \"echo\"\naction = \"allow\"\n",
             pins.display()
         ),
     );

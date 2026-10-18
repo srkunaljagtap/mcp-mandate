@@ -188,7 +188,14 @@ fn names(message: &Value) -> Option<Vec<String>> {
 /// A gate for one of the case's servers, with everything pinned listed
 /// unless the case skips that.
 fn start_gate(case: &Case, agent: &Arc<AgentTaint>) -> Gate {
-    let policy = Policy::parse(case.policy.as_deref().unwrap_or(ALLOW_ALL), Path::new("."))
+    // Cases are judged in enforce mode unless their policy names a mode.
+    let text = case.policy.as_deref().unwrap_or(ALLOW_ALL);
+    let text = if text.contains("mode =") {
+        text.to_owned()
+    } else {
+        format!("mode = \"enforce\"\n{text}")
+    };
+    let policy = Policy::parse(&text, Path::new("."))
         .unwrap_or_else(|error| panic!("{}: bad policy: {error}", case.id));
     let inventory = Inventory {
         instructions: case.pinned.instructions.clone(),

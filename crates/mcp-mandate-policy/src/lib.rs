@@ -1,7 +1,7 @@
 //! The policy file: what a session may do, written by people.
 //!
 //! ```toml
-//! mode = "enforce"               # or "observe": log what would be blocked
+//! mode = "enforce"               # the default, "observe", only logs what would be blocked
 //! pins = "everything.pins.toml"  # relative to this file
 //!
 //! [defaults]
@@ -72,9 +72,10 @@ pub enum Action {
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Block what the policy doesn't allow.
-    #[default]
     Enforce,
-    /// Log what would be blocked, but let everything through.
+    /// Log what would be blocked, but let everything through. The default:
+    /// a policy blocks only once it says `mode = "enforce"`.
+    #[default]
     Observe,
 }
 
@@ -592,8 +593,10 @@ mod tests {
 
     #[test]
     fn defaults_are_safe() {
+        // A policy starts out only observing; blocking is asked for.
+        assert_eq!(policy("mode = \"enforce\"").mode, Mode::Enforce);
         let policy = policy("");
-        assert_eq!(policy.mode, Mode::Enforce);
+        assert_eq!(policy.mode, Mode::Observe);
         assert_eq!(policy.for_tool("anything").action, Action::Deny);
         assert_eq!(policy.server_requests.sampling, Action::Deny);
         assert_eq!(policy.server_requests.elicitation, Action::Deny);

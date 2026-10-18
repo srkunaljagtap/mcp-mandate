@@ -26,9 +26,13 @@ pub fn temp_file(name: &str, contents: &str) -> PathBuf {
 
 /// A policy file with no pins: protocol plumbing passes, tools don't.
 pub fn empty_policy(test: &str) -> String {
-    temp_file(&format!("{test}.policy.toml"), "")
-        .display()
-        .to_string()
+    temp_file(
+        &format!("{test}.policy.toml"),
+        "mode = \"enforce\"
+",
+    )
+    .display()
+    .to_string()
 }
 
 /// A `sh` script for a server that answers each line it reads with the next

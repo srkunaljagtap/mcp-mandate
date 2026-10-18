@@ -433,7 +433,7 @@ async fn world() -> World {
     for server in ["alpha", "beta", "gamma"] {
         std::fs::write(
             dir.join(format!("{server}.policy.toml")),
-            "pins = \"fake.pins.toml\"\n[[tools]]\nmatch = \"*\"\naction = \"allow\"\n",
+            "mode = \"enforce\"\npins = \"fake.pins.toml\"\n[[tools]]\nmatch = \"*\"\naction = \"allow\"\n",
         )
         .unwrap();
     }

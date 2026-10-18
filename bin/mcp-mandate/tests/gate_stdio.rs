@@ -52,6 +52,7 @@ fn hides_changed_and_unapproved_tools_and_blocks_their_calls() {
         "gate.policy.toml",
         &format!(
             r#"
+            mode = "enforce"
             pins = "{}"
 
             [[tools]]
@@ -227,7 +228,7 @@ fn read_email_then_exfiltrate_is_held_and_planted_keys_are_redacted() {
     let policy = temp_file(
         "exfil.policy.toml",
         &format!(
-            "pins = \"{}\"\n[[tools]]\nmatch = \"*_email\"\naction = \"allow\"\n",
+            "mode = \"enforce\"\npins = \"{}\"\n[[tools]]\nmatch = \"*_email\"\naction = \"allow\"\n",
             pins.display()
         ),
     );
@@ -287,7 +288,7 @@ fn every_decision_is_chained_into_the_audit_log_and_verify_catches_an_edit() {
     let policy = temp_file(
         "audit.policy.toml",
         &format!(
-            "pins = \"{}\"\n\n[[tools]]\nmatch = \"echo\"\naction = \"allow\"\n",
+            "mode = \"enforce\"\npins = \"{}\"\n\n[[tools]]\nmatch = \"echo\"\naction = \"allow\"\n",
             pins.display()
         ),
     );
@@ -421,7 +422,7 @@ fn cross_server_taint(agent: Option<&str>) -> String {
         let policy = temp_file(
             &format!("cross-{variant}-{name}.policy.toml"),
             &format!(
-                "pins = \"{}\"\n[[tools]]\nmatch = \"*\"\naction = \"allow\"\n",
+                "mode = \"enforce\"\npins = \"{}\"\n[[tools]]\nmatch = \"*\"\naction = \"allow\"\n",
                 pins.display()
             ),
         );

@@ -36,7 +36,7 @@ fn the_gate_adds_well_under_five_milliseconds_per_message() {
     let dir = std::env::temp_dir().join(format!("mcp-mandate-latency-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let policy = Policy::parse(
-        "[[tools]]\nmatch = \"*\"\naction = \"allow\"\nno_shell_metacharacters = [\"message\"]\n",
+        "mode = \"enforce\"\n[[tools]]\nmatch = \"*\"\naction = \"allow\"\nno_shell_metacharacters = [\"message\"]\n",
         &dir,
     )
     .unwrap();

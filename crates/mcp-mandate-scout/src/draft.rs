@@ -199,7 +199,12 @@ impl Draft {
                  # the gate removes them.\n",
             );
         }
-        text.push_str("\nmode = \"enforce\"\n");
+        text.push_str(
+            "\n# Observe mode logs what this policy would block, hide or redact, and lets\n\
+             # it all through. Once the audit log shows only what you expect, change\n\
+             # this to \"enforce\".\n\
+             mode = \"observe\"\n",
+        );
         match pins {
             Some(pins) => {
                 let _ = writeln!(text, "pins = {}", toml_string(pins));
