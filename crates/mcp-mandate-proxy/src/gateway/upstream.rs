@@ -255,9 +255,11 @@ impl Upstream {
 }
 
 /// A credential header's value, and the token after its scheme (`Bearer`,
-/// `token`, `SSWS`, in any case): a server may echo either.
+/// `token`, `SSWS`, in any case): a server may echo either. (Read as text
+/// even if it isn't ASCII, rather than not at all.)
 fn credential_forms(value: &HeaderValue) -> Vec<String> {
-    let value = value.to_str().unwrap_or_default();
+    let value = String::from_utf8_lossy(value.as_bytes());
+    let value = value.as_ref();
     let mut forms = vec![value.to_owned()];
     if let Some((scheme, token)) = value.split_once(' ')
         && !scheme.is_empty()
@@ -371,7 +373,9 @@ impl ClientCredentials {
             .as_deref()
             .is_none_or(|kind| kind.eq_ignore_ascii_case("bearer"));
         let access_token = reply.access_token.unwrap_or_default();
-        if !bearer || access_token.is_empty() {
+        // ASCII, as a bearer token is: a server may read other bytes in a
+        // header as some other text than this, and echo that.
+        if !bearer || access_token.is_empty() || !access_token.is_ascii() {
             return Err(CredentialError::Invalid);
         }
         let mut token = HeaderValue::from_str(&format!("Bearer {access_token}"))
@@ -504,6 +508,11 @@ mod tests {
             ["bearer opaque-1234", "opaque-1234"]
         );
         assert_eq!(forms("opaque-1234"), ["opaque-1234"]);
+        let not_ascii = HeaderValue::from_bytes("Token pässwort-1234".as_bytes()).unwrap();
+        assert_eq!(
+            credential_forms(&not_ascii),
+            ["Token pässwort-1234", "pässwort-1234"]
+        );
     }
 
     /// A token endpoint, slow to answer, handing out a new token each time.
@@ -587,6 +596,9 @@ mod tests {
         let error = client_credentials(url).token(&http).await.unwrap_err();
         assert!(matches!(error, CredentialError::Malformed), "{error}");
         let (url, _) = token_endpoint(r#"{"token_type": "Bearer"}"#).await;
+        let error = client_credentials(url).token(&http).await.unwrap_err();
+        assert!(matches!(error, CredentialError::Invalid), "{error}");
+        let (url, _) = token_endpoint(r#"{"access_token": "pässwort-token-1"}"#).await;
         let error = client_credentials(url).token(&http).await.unwrap_err();
         assert!(matches!(error, CredentialError::Invalid), "{error}");
         let huge = format!(

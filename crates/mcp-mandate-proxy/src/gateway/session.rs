@@ -3,14 +3,45 @@
 //! gateway's session id to the server's.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use mcp_mandate_gate::{Gate, SharedTaint};
-use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, SemaphorePermit, watch};
 
 use super::identity::Caller;
+
+/// Most messages being read or checked at once in the whole gateway, for
+/// every caller and session together: one per CPU. Reading a large message
+/// takes memory as well as time, so this bounds both, however many
+/// sessions send them at once.
+static TURNS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(max_turns()));
+
+fn max_turns() -> usize {
+    std::thread::available_parallelism().map_or(1, NonZeroUsize::get)
+}
+
+/// Waits for a turn to read or check a message on a thread where blocking
+/// is fine. Hand the turn to that thread, so it's held until the work is
+/// done, even if whoever waited for it leaves.
+pub async fn turn() -> SemaphorePermit<'static> {
+    TURNS
+        .acquire()
+        .await
+        .expect("the semaphore for turns is never closed")
+}
+
+/// Every turn at once, so nothing else is read or checked until it drops.
+#[cfg(test)]
+pub async fn all_turns() -> SemaphorePermit<'static> {
+    let all = u32::try_from(max_turns()).expect("fewer CPUs than that");
+    TURNS
+        .acquire_many(all)
+        .await
+        .expect("the semaphore for turns is never closed")
+}
 
 /// Most sessions open at once, in all and per caller.
 const MAX_SESSIONS: usize = 10_000;
@@ -82,9 +113,10 @@ impl Session {
     }
 
     /// Runs `check` with the session's gate, on a thread where blocking is
-    /// fine: a check takes CPU time, and writes the audit log, which may
-    /// wait for a lock. `None` once the session is closed, or if a check
-    /// panicked: the session is then unusable.
+    /// fine, once it's its [turn](turn): a check takes CPU time and memory,
+    /// and writes the audit log, which may wait for a lock. `None` once the
+    /// session is closed, or if a check panicked: the session is then
+    /// unusable.
     pub async fn check<T: Send + 'static>(
         &self,
         check: impl FnOnce(&mut Gate) -> T + Send + 'static,
@@ -92,9 +124,12 @@ impl Session {
         if self.unusable() {
             return None;
         }
+        // The gate first, then a turn: whoever holds a turn never waits for
+        // a gate.
         let gate = Arc::clone(&self.gate).lock_owned().await;
-        // Closed while waiting its turn: its end is recorded, so nothing
-        // more is.
+        let turn = turn().await;
+        // Closed while waiting its turn: its end is recorded (or will be,
+        // once this lets go of the gate), so nothing more is.
         if self.unusable() {
             return None;
         }
@@ -103,6 +138,7 @@ impl Session {
             broken: Arc::clone(&self.broken),
         };
         let checked = tokio::task::spawn_blocking(move || {
+            let _turn = turn;
             let mut checking = checking;
             check(&mut checking.gate)
         });
@@ -231,7 +267,8 @@ impl Sessions {
 
     /// Removes and returns sessions idle for longer than `idle`. A session
     /// with a request in flight isn't idle, however quiet its stream: a
-    /// long call is still under way.
+    /// long call is still under way. (A request stays in flight no longer
+    /// than the token it was sent with lasts.)
     pub fn sweep(&self, idle: Duration) -> Vec<Arc<Session>> {
         let Ok(mut map) = self.map.lock() else {
             return Vec::new();
@@ -423,6 +460,31 @@ mod tests {
             .await
             .expect("its streams were told")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn checks_across_all_sessions_take_turns() {
+        // Every turn is taken (as by checks in other sessions)...
+        let all = all_turns().await;
+        let session = session("alice");
+        let ran = Arc::new(AtomicBool::new(false));
+        let check = tokio::spawn({
+            let (session, ran) = (Arc::clone(&session), Arc::clone(&ran));
+            async move {
+                session
+                    .check(move |_| ran.store(true, Ordering::SeqCst))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // ...so this one waits for its turn.
+        assert!(!ran.load(Ordering::SeqCst), "it ran out of turn");
+        drop(all);
+        let checked = tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .expect("it runs once a turn is free");
+        assert_eq!(checked.unwrap(), Some(()));
+        assert!(ran.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

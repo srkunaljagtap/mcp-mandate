@@ -94,6 +94,10 @@ struct LogFile {
     stopped: Option<Stop>,
     /// Where the end of the file is read into, kept between catch-ups.
     tail: Vec<u8>,
+    /// Another process kept the lock past [`LOCK_WAIT`]. Until a write gets
+    /// it again, writes don't wait for it, so writes queued behind one
+    /// another fail at once rather than each after waiting its own turn.
+    held_elsewhere: bool,
 }
 
 /// Why a log file takes no more entries.
@@ -208,8 +212,9 @@ impl LogFile {
             len: 0,
             stopped: None,
             tail: Vec::new(),
+            held_elsewhere: false,
         };
-        lock(&log.file).map_err(open_error)?;
+        lock(&log.file, LOCK_WAIT).map_err(open_error)?;
         let caught_up = log.catch_up();
         let unlocked = log.file.unlock().map_err(open_error);
         caught_up?;
@@ -218,7 +223,16 @@ impl LogFile {
     }
 
     fn record(&mut self, session: &str, event: &Event) -> Result<(), AuditError> {
-        lock(&self.file).map_err(|source| self.write_error(source))?;
+        let wait = if self.held_elsewhere {
+            Duration::ZERO
+        } else {
+            LOCK_WAIT
+        };
+        let locked = lock(&self.file, wait);
+        self.held_elsewhere = locked
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut);
+        locked.map_err(|source| self.write_error(source))?;
         let appended = self.append(session, event);
         let unlocked = self
             .file
@@ -354,15 +368,15 @@ impl LogFile {
     }
 }
 
-/// Takes the exclusive lock on `file`, waiting up to [`LOCK_WAIT`] for
-/// another process to let go of it.
-fn lock(file: &File) -> std::io::Result<()> {
+/// Takes the exclusive lock on `file`, waiting up to `wait` for another
+/// process to let go of it.
+fn lock(file: &File, wait: Duration) -> std::io::Result<()> {
     let started = Instant::now();
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(()),
             Err(TryLockError::Error(error)) => return Err(error),
-            Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+            Err(TryLockError::WouldBlock) if started.elapsed() < wait => {
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(TryLockError::WouldBlock) => {
@@ -642,6 +656,31 @@ pub(crate) mod tests {
         // Writing carries on once it's let go.
         holder.unlock().unwrap();
         log.record(&message(Verdict::Allow)).unwrap();
+        assert_eq!(verify(&path, None).unwrap().entries, 1);
+    }
+
+    #[test]
+    fn once_the_wait_for_a_lock_held_elsewhere_runs_out_writes_fail_at_once() {
+        let path = temp_dir("held-on").join("audit.jsonl");
+        let log = Log::open(&path).unwrap();
+        let holder = File::open(&path).unwrap();
+        holder.lock().unwrap();
+
+        let (mut log, (first, second, took)) = without_hanging(move || {
+            let mut log = log;
+            let first = log.record(&message(Verdict::Allow));
+            let started = Instant::now();
+            let second = log.record(&message(Verdict::Allow));
+            (log, (first, second, started.elapsed()))
+        });
+        assert!(first.is_err() && second.is_err());
+        // The next write, queued behind the first, didn't wait again.
+        assert!(took < LOCK_WAIT / 4, "{took:?}");
+
+        // Once it's let go, a write gets it, and later ones wait for it again.
+        holder.unlock().unwrap();
+        log.record(&message(Verdict::Allow)).unwrap();
+        assert!(!log.file.lock().unwrap().held_elsewhere);
         assert_eq!(verify(&path, None).unwrap().entries, 1);
     }
 

@@ -23,7 +23,7 @@ mod upstream;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use axum::Router;
@@ -35,9 +35,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::StreamExt;
 use mcp_mandate_audit::{self as audit, Log, Recorder};
-use mcp_mandate_gate::jsonrpc::{Message, classify};
+use mcp_mandate_gate::jsonrpc::{Message, ParseError, classify};
 use mcp_mandate_gate::{Action, Gate};
 use mcp_mandate_pin::Inventory;
+use mcp_mandate_policy::Policy;
+use mcp_mandate_taint::{SecretDetector, SecretPattern};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
@@ -97,6 +99,9 @@ struct App {
     upstreams: BTreeMap<String, Upstream>,
     /// Each server's audit log, opened once.
     logs: BTreeMap<String, Log>,
+    /// What each server's policy takes for a secret, for what the gate
+    /// doesn't see (an event's id).
+    secrets: BTreeMap<String, Mutex<SecretDetector>>,
     sessions: Sessions,
     taints: Arc<CallerTaints>,
 }
@@ -155,11 +160,22 @@ pub async fn serve(
     for server in config.servers.values() {
         logs.insert(server.name.clone(), Log::open(&server.policy.audit_log)?);
     }
+    let secrets = config
+        .servers
+        .values()
+        .map(|server| {
+            (
+                server.name.clone(),
+                Mutex::new(secret_detector(&server.policy)),
+            )
+        })
+        .collect();
     let app = Arc::new(App {
         config,
         identity,
         upstreams,
         logs,
+        secrets,
         sessions: Sessions::default(),
         taints: Arc::default(),
     });
@@ -457,9 +473,7 @@ async fn post_message(
         Ok(body) => body,
         Err(response) => return response,
     };
-    // Read where blocking is fine: a body may be large.
-    let parsed = body.clone();
-    let Ok(message) = tokio::task::spawn_blocking(move || classify(&parsed)).await else {
+    let Some(message) = read_message(body.clone()).await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     // The client's answers to the server and its notifications aren't
@@ -524,16 +538,22 @@ async fn post_message(
     };
 
     let protocol = protocol_version(&headers);
+    // Nothing outlives the token it came with: a request still waiting for
+    // its answer when the token expires is given up on.
+    let deadline = token_deadline(&caller);
     let upstream = &app.upstreams[&name];
-    let response = match upstream
-        .post(forward, session.upstream_id().as_deref(), protocol.as_ref())
-        .await
-    {
-        Ok(response) => response,
-        Err(failure) => {
+    let upstream_id = session.upstream_id();
+    let sent = upstream.post(forward, upstream_id.as_deref(), protocol.as_ref());
+    let response = match within(deadline, sent).await {
+        Some(Ok(response)) => response,
+        Some(Err(failure)) => {
             warn!(server = name, error = %describe(&failure), "couldn't reach the MCP server");
             abandon(&session, request_id.as_ref()).await;
             return (StatusCode::BAD_GATEWAY, "couldn't reach the MCP server").into_response();
+        }
+        None => {
+            abandon(&session, request_id.as_ref()).await;
+            return token_expired();
         }
     };
     if opening.is_some() {
@@ -551,6 +571,7 @@ async fn post_message(
         protocol,
         request_id,
         in_flight,
+        deadline,
     )
     .await;
     if let Some(opening) = opening
@@ -559,6 +580,36 @@ async fn post_message(
         opening.keep();
     }
     reply
+}
+
+/// Works out what kind of message a client sent, on a thread where
+/// blocking is fine, once it's its [turn](session::turn): a body may be
+/// large. `None` if that went wrong.
+async fn read_message(body: Bytes) -> Option<Result<Message, ParseError>> {
+    let turn = session::turn().await;
+    tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        classify(&body)
+    })
+    .await
+    .ok()
+}
+
+/// Runs `work` until `deadline`, if there is one: `None` if the deadline
+/// comes first.
+async fn within<T>(deadline: Option<Instant>, work: impl Future<Output = T>) -> Option<T> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, work).await.ok(),
+        None => Some(work.await),
+    }
+}
+
+fn token_expired() -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        "the token this request was sent with expired before the MCP server answered",
+    )
+        .into_response()
 }
 
 /// Runs `check` with the session's gate, after making sure the gate knows
@@ -578,6 +629,35 @@ async fn gate_check<T: Send + 'static>(
         .await
 }
 
+/// Whether `text`, which the gate doesn't see, holds a secret: any form of
+/// the gateway's credential for `server`, or anything its policy takes for
+/// a secret.
+fn holds_secret(app: &App, server: &str, text: &str) -> bool {
+    let credentials = app.upstreams[server].credential_strings();
+    match app.secrets[server].lock() {
+        Ok(mut detector) => {
+            detector.set_literals("gateway-credential", &credentials);
+            detector.find(text).is_some()
+        }
+        // Fail closed.
+        Err(_) => true,
+    }
+}
+
+/// The built-in secret patterns, and `policy`'s own.
+fn secret_detector(policy: &Policy) -> SecretDetector {
+    let custom = policy
+        .secrets
+        .patterns
+        .iter()
+        .map(|(name, regex)| SecretPattern {
+            name: name.clone(),
+            regex: regex.clone(),
+        })
+        .collect();
+    SecretDetector::new(custom)
+}
+
 /// Forgets a request that won't be answered through the gate, so it doesn't
 /// stay pending (and in memory) forever.
 async fn abandon(session: &Session, request_id: Option<&Value>) {
@@ -588,7 +668,7 @@ async fn abandon(session: &Session, request_id: Option<&Value>) {
 
 /// Sends the server's reply back to the client, every message through the
 /// gate: a single JSON message, or an event stream. The client's message
-/// stays counted by `in_flight` until its reply is done.
+/// stays counted by `in_flight` until its reply is done, or `deadline`.
 async fn relay(
     app: Arc<App>,
     session: Arc<Session>,
@@ -596,6 +676,7 @@ async fn relay(
     protocol: Option<HeaderValue>,
     request_id: Option<Value>,
     in_flight: Option<OwnedSemaphorePermit>,
+    deadline: Option<Instant>,
 ) -> Response {
     let status = response.status();
     if status == reqwest::StatusCode::ACCEPTED {
@@ -620,12 +701,12 @@ async fn relay(
     }
     if is_event_stream(response.headers()) {
         return stream(
-            app, session, response, protocol, request_id, in_flight, None,
+            app, session, response, protocol, request_id, in_flight, deadline,
         );
     }
-    let body = match read_limited(response).await {
-        Ok(body) => body,
-        Err(problem) => {
+    let body = match within(deadline, read_limited(response)).await {
+        Some(Ok(body)) => body,
+        Some(Err(problem)) => {
             warn!(server = %session.server, %problem, "couldn't read the MCP server's reply");
             abandon(&session, request_id.as_ref()).await;
             return (
@@ -633,6 +714,10 @@ async fn relay(
                 "couldn't read the MCP server's reply",
             )
                 .into_response();
+        }
+        None => {
+            abandon(&session, request_id.as_ref()).await;
+            return token_expired();
         }
     };
     let Some(actions) = gate_check(&app, &session, move |gate| gate.from_server(&body)).await
@@ -750,6 +835,11 @@ async fn relay_events(
             }
             // A session with a live stream isn't idle.
             session.touch();
+            // The gate never sees the id, which goes to the client as it
+            // is: one holding a secret is dropped.
+            let id = event
+                .id
+                .filter(|id| !holds_secret(app, &session.server, id));
             let data = event.data;
             // Whether it's the answer is worked out with the check, where
             // reading a large message holds no thread that serves requests.
@@ -767,7 +857,7 @@ async fn relay_events(
             for action in actions {
                 match action {
                     Action::ToClient(message) => {
-                        let event = sse::encode(event.id.as_deref(), &message);
+                        let event = sse::encode(id.as_deref(), &message);
                         if sender.send(Bytes::from(event)).await.is_err() {
                             return; // the client left; dropping the stream closes the server's too
                         }
@@ -1197,5 +1287,31 @@ mod tests {
             read_body(&HeaderMap::new(), fits).await.unwrap().len(),
             MAX_REQUEST_BYTES
         );
+    }
+
+    #[tokio::test]
+    async fn a_clients_message_is_read_only_in_its_turn() {
+        let ping = Bytes::from_static(br#"{"jsonrpc": "2.0", "id": 1, "method": "ping"}"#);
+        // Every turn is taken (as by checks in sessions of any caller)...
+        let all = session::all_turns().await;
+        let waiting = tokio::time::timeout(Duration::from_millis(200), read_message(ping.clone()));
+        assert!(waiting.await.is_err(), "it was read out of turn");
+        // ...and once one is free, it's read.
+        drop(all);
+        let read = tokio::time::timeout(Duration::from_secs(5), read_message(ping))
+            .await
+            .expect("read once a turn is free");
+        assert!(
+            matches!(read, Some(Ok(Message::Request { .. }))),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_past_its_deadline_is_given_up_on() {
+        let soon = Some(Instant::now() + Duration::from_secs(1));
+        assert_eq!(within(soon, std::future::pending::<()>()).await, None);
+        assert_eq!(within(soon, async { 7 }).await, Some(7));
+        assert_eq!(within(None, async { 7 }).await, Some(7));
     }
 }
