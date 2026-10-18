@@ -22,6 +22,8 @@ const REFETCH_EVERY: Duration = Duration::from_secs(60);
 /// Clock difference tolerated between the provider and the gateway.
 const LEEWAY_SECONDS: u64 = 60;
 const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
+/// Oldest signing keys still used while they can't be refreshed.
+const MAX_KEY_AGE: Duration = Duration::from_secs(24 * 3600);
 
 pub struct Identity {
     config: IdentityConfig,
@@ -34,6 +36,20 @@ struct Keys {
     set: JwkSet,
     fetched: Instant,
     attempted: Instant,
+}
+
+impl Keys {
+    /// After a failed refresh, keys fetched `age` ago: still used for a
+    /// while, so a brief outage doesn't lock everyone out, but not forever,
+    /// since a key the provider has withdrawn mustn't stay valid. Returns
+    /// whether they were dropped.
+    fn expire(&mut self, age: Duration) -> bool {
+        if age <= MAX_KEY_AGE || self.set.keys.is_empty() {
+            return false;
+        }
+        self.set = JwkSet { keys: Vec::new() };
+        true
+    }
 }
 
 /// A caller whose token checked out.
@@ -159,19 +175,30 @@ impl Identity {
     }
 
     async fn refetch(&self) {
-        let mut keys = self.keys.write().await;
-        if keys.attempted.elapsed() < REFETCH_EVERY {
-            return; // another request just did
+        {
+            let mut keys = self.keys.write().await;
+            if keys.attempted.elapsed() < REFETCH_EVERY {
+                return; // another request just did
+            }
+            keys.attempted = Instant::now();
         }
-        keys.attempted = Instant::now();
-        match fetch_keys(&self.http, &self.jwks_uri).await {
+        // Fetched without holding the lock: token checks go on meanwhile.
+        let fetched = fetch_keys(&self.http, &self.jwks_uri).await;
+        let mut keys = self.keys.write().await;
+        match fetched {
             Ok(set) => {
                 keys.set = set;
                 keys.fetched = Instant::now();
             }
-            // The old keys stay in use: an unreachable provider shouldn't
-            // lock out tokens it signed earlier.
-            Err(error) => warn!(%error, "couldn't refresh the identity provider's signing keys"),
+            Err(error) => {
+                warn!(%error, "couldn't refresh the identity provider's signing keys");
+                let age = keys.fetched.elapsed();
+                if keys.expire(age) {
+                    warn!(
+                        "the identity provider's keys are over a day old and can't be refreshed: refusing tokens until they can"
+                    );
+                }
+            }
         }
     }
 }
@@ -259,20 +286,51 @@ async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value, IdentityEr
         url: url.to_owned(),
         source,
     };
-    let response = http.get(url).send().await.map_err(fetch)?;
+    let mut response = http.get(url).send().await.map_err(fetch)?;
     if !response.status().is_success() {
         return Err(IdentityError::Status {
             url: url.to_owned(),
             status: response.status().as_u16(),
         });
     }
-    let bytes = response.bytes().await.map_err(fetch)?;
     let invalid = |problem: &str| IdentityError::Invalid {
         url: url.to_owned(),
         problem: problem.to_owned(),
     };
-    if bytes.len() > MAX_DOCUMENT_BYTES {
-        return Err(invalid("it's too large"));
+    // Read with a limit, rather than buffering whatever arrives first.
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(fetch)? {
+        if bytes.len() + chunk.len() > MAX_DOCUMENT_BYTES {
+            return Err(invalid("it's too large"));
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| invalid("it isn't JSON"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys() -> Keys {
+        let set = serde_json::from_value(serde_json::json!({
+            "keys": [{"kty": "RSA", "kid": "k1", "n": "sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1WlUzewbgBHod5pcM9H95GQRV3JDXboIRROSBigeC5yjU1hGzHHyXss8UDprecbAYxknTcQkhslANGRUZmdTOQ5qTRsLAt6BTYuyvVRdhS8exSZEy_c4gs_7svlJJQ4H9_NxsiIoLwAEk7-Q3UXERGYw_75IDrGA84-lA_-Ct4eTlXHBIY2EaV7t7LjJaynVJCpkv4LKjTTAumiGUIuQhrNhZLuF_RJLqHpM2kgWFLU7-VTdL1VbC2tejvcI2BlMkEpk1BzBZI0KQB0GaDWFLN-aEAw3vRw", "e": "AQAB"}]
+        }))
+        .unwrap();
+        Keys {
+            set,
+            fetched: Instant::now(),
+            attempted: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn keys_that_cant_be_refreshed_stop_working_after_a_day() {
+        let mut recent = keys();
+        assert!(!recent.expire(Duration::from_secs(3600)));
+        assert_eq!(recent.set.keys.len(), 1);
+        let mut old = keys();
+        assert!(old.expire(MAX_KEY_AGE + Duration::from_secs(1)));
+        assert!(old.set.keys.is_empty());
+    }
 }

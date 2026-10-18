@@ -1,5 +1,6 @@
 //! The draft policy: one rule per tool, by risk, made stricter by findings.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use mcp_mandate_pin::{Inventory, Kind, Pins};
@@ -34,7 +35,8 @@ pub struct ToolPlan {
     pub proposal: Proposal,
     /// What its annotations say it does.
     pub reach: &'static str,
-    /// Taint labels, from its `openWorldHint`.
+    /// Taint labels, from its `openWorldHint`. Only `true` is written to
+    /// the draft; `false` is left to the tool's annotations, with a comment.
     pub reads_untrusted: bool,
     pub sends_out: bool,
     pub no_shell_metacharacters: Vec<String>,
@@ -44,12 +46,28 @@ pub struct ToolPlan {
 /// made stricter (never looser) by the findings about it. A high finding
 /// denies the tool; a medium one holds it.
 pub fn plan_tools(inventory: &Inventory, findings: &[Finding]) -> Vec<ToolPlan> {
+    let mut listed: HashMap<&str, usize> = HashMap::new();
+    for tool in &inventory.tools {
+        if let Some(name) = Pins::item_name(Kind::Tool, tool) {
+            *listed.entry(name).or_default() += 1;
+        }
+    }
     let mut plans: Vec<ToolPlan> = inventory
         .tools
         .iter()
         .filter_map(|tool| {
             let name = Pins::item_name(Kind::Tool, tool)?;
-            let (base, reach, open_world) = by_annotations(tool);
+            // Two definitions under one name: which one a client (or the
+            // pins file) keeps is unclear, so neither is trusted.
+            let (base, reach, open_world) = if listed[name] > 1 {
+                (
+                    Proposal::Deny,
+                    "is listed more than once under this name",
+                    true,
+                )
+            } else {
+                by_annotations(tool)
+            };
             let subject = Subject::tool(name);
             let flagged = findings
                 .iter()
@@ -182,11 +200,21 @@ impl Draft {
                 plan.proposal.label()
             );
             if plan.proposal != Proposal::Deny {
-                let _ = write!(
-                    text,
-                    "reads_untrusted = {}\nsends_out = {}\n",
-                    plan.reads_untrusted, plan.sends_out
-                );
+                // A `false` here would only repeat what the server claims,
+                // so it stays a comment the reader has to agree with.
+                if plan.reads_untrusted {
+                    text.push_str("reads_untrusted = true\n");
+                }
+                if plan.sends_out {
+                    text.push_str("sends_out = true\n");
+                }
+                if !plan.reads_untrusted || !plan.sends_out {
+                    text.push_str(
+                        "# Its annotations say it stays closed-world, so the gate won't count it as\n\
+                         # reading untrusted content or sending data out. If you don't trust that,\n\
+                         # add reads_untrusted = true and sends_out = true.\n",
+                    );
+                }
                 if !plan.no_shell_metacharacters.is_empty() {
                     let arguments: Vec<String> = plan
                         .no_shell_metacharacters
@@ -380,6 +408,28 @@ mod tests {
             (draft.count(Proposal::Allow), draft.count(Proposal::Hold)),
             (3, 1)
         );
+    }
+
+    #[test]
+    fn a_name_listed_twice_is_denied_and_annotations_are_not_written_as_fact() {
+        let local = json!({"readOnlyHint": true, "openWorldHint": false});
+        let tools = inventory(vec![
+            tool("twin", Some(local.clone())),
+            tool("twin", None),
+            tool("local", Some(local)),
+        ]);
+        assert_eq!(
+            proposals(&tools),
+            [
+                ("local".to_owned(), Proposal::Allow),
+                ("twin".to_owned(), Proposal::Deny),
+            ]
+        );
+        let draft = Draft::new(&tools, &[], "server", None);
+        assert!(!draft.text.contains("= false"), "{}", draft.text);
+        let policy = Policy::parse(&draft.text, Path::new(".")).unwrap();
+        let local = policy.for_tool("local");
+        assert_eq!((local.reads_untrusted, local.sends_out), (None, None));
     }
 
     #[test]

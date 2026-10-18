@@ -52,7 +52,7 @@ use crate::framing::MAX_MESSAGE_BYTES;
 use crate::inventory::{self, PROTOCOL_VERSION, Rpc, result_of};
 use crate::process::Signals;
 use identity::Identity;
-use session::{Session, Sessions};
+use session::{CallerTaints, Session, Sessions, StreamGuard};
 use upstream::{PROTOCOL_HEADER, SESSION_HEADER, Upstream};
 
 /// Largest request body accepted from a client.
@@ -74,6 +74,8 @@ pub enum GatewayError {
     Identity(#[from] IdentityError),
     #[error("couldn't set up TLS: {0}")]
     Tls(String),
+    #[error("couldn't open an audit log")]
+    Audit(#[from] mcp_mandate_audit::AuditError),
     #[error("the gateway stopped serving")]
     Serve(#[source] std::io::Error),
 }
@@ -82,7 +84,10 @@ struct App {
     config: GatewayConfig,
     identity: Identity,
     upstreams: BTreeMap<String, Upstream>,
+    /// Each server's audit log, opened once.
+    logs: BTreeMap<String, Log>,
     sessions: Sessions,
+    taints: Arc<CallerTaints>,
 }
 
 /// Runs the gateway until SIGINT or SIGTERM (Ctrl-C on Windows). Returns
@@ -133,11 +138,19 @@ pub async fn serve(
         Tls::Serve { cert, key } => Some(tls::server_config(cert, key)?),
         Tls::TerminatedByProxy | Tls::Loopback => None,
     };
+    // Opened now, so an unwritable log stops the start rather than every
+    // session.
+    let mut logs = BTreeMap::new();
+    for server in config.servers.values() {
+        logs.insert(server.name.clone(), Log::open(&server.policy.audit_log)?);
+    }
     let app = Arc::new(App {
         config,
         identity,
         upstreams,
+        logs,
         sessions: Sessions::default(),
+        taints: Arc::default(),
     });
     let sweeper = tokio::spawn(sweep(Arc::clone(&app)));
     let address = listener.local_addr().map_err(GatewayError::Serve)?;
@@ -149,21 +162,12 @@ pub async fn serve(
         "the gateway is serving"
     );
     let router = router(Arc::clone(&app));
-    let served = match tls {
-        Some(tls) => {
-            tls::serve(listener, tls, router, shutdown).await;
-            Ok(())
-        }
-        None => tokio::select! {
-            served = axum::serve(listener, router) => served.map_err(GatewayError::Serve),
-            () = shutdown => Ok(()),
-        },
-    };
+    tls::serve(listener, tls, router, shutdown).await;
     sweeper.abort();
     for session in app.sessions.drain() {
         session.end();
     }
-    served
+    Ok(())
 }
 
 fn router(app: Arc<App>) -> Router {
@@ -189,6 +193,7 @@ async fn sweep(app: Arc<App>) {
             info!(server = %session.server, caller = %session.caller.subject, "closed an idle session");
             session.end();
         }
+        app.taints.keep_only(&app.sessions.callers());
     }
 }
 
@@ -304,20 +309,19 @@ fn open_session(app: &App, name: &str, caller: &Caller) -> Result<Arc<Session>, 
     let server = &app.config.servers[name];
     let unavailable =
         |problem: &str| (StatusCode::SERVICE_UNAVAILABLE, problem.to_owned()).into_response();
-    let started = Log::open(&server.policy.audit_log).and_then(|mut log| {
-        log.record(&session_start(app, server, caller))?;
-        Ok(log)
-    });
-    let log = match started {
-        Ok(log) => log,
-        Err(failure) => {
-            error!(server = name, error = %describe(&failure), "couldn't open a session: the audit log can't be written");
-            return Err(unavailable(
-                "the audit log can't be written, so no session can open",
-            ));
-        }
-    };
-    let gate = Gate::new(server.policy.clone(), server.pins.clone(), Box::new(log));
+    // All of a server's sessions record through one open file.
+    let mut log = app.logs[name].new_session();
+    if let Err(failure) = log.record(&session_start(app, server, caller)) {
+        error!(server = name, error = %describe(&failure), "couldn't open a session: the audit log can't be written");
+        return Err(unavailable(
+            "the audit log can't be written, so no session can open",
+        ));
+    }
+    let mut gate = Gate::new(server.policy.clone(), server.pins.clone(), Box::new(log))
+        .with_shared_taint(Arc::new(app.taints.for_caller(&caller.subject)));
+    // If the server ever echoes the gateway's own credential, the caller
+    // mustn't get it.
+    gate.add_secret_literals(app.upstreams[name].credential_strings());
     let session = Arc::new(Session::new(name, caller.clone(), gate));
     if app.sessions.insert(Arc::clone(&session)).is_err() {
         session.end();
@@ -360,10 +364,10 @@ async fn post_message(
         Ok(caller) => caller,
         Err(response) => return response,
     };
-    let initialize = matches!(
-        classify(&body),
-        Ok(Message::Request { ref method, .. }) if method == "initialize"
-    );
+    let (initialize, request_id) = match classify(&body) {
+        Ok(Message::Request { id, method }) => (method == "initialize", Some(id)),
+        _ => (false, None),
+    };
     let (session, created) = if headers.contains_key(SESSION_HEADER) {
         match find_session(&app, &name, &caller, &headers) {
             Ok(session) => (session, false),
@@ -407,6 +411,7 @@ async fn post_message(
         Ok(response) => response,
         Err(failure) => {
             warn!(server = name, error = %describe(&failure), "couldn't reach the MCP server");
+            abandon(&session, request_id.as_ref());
             if created {
                 close_session(&app, &session);
             }
@@ -421,7 +426,17 @@ async fn post_message(
             .map(str::to_owned);
         session.set_upstream_id(upstream_id);
     }
-    relay(app, session, response, protocol, created).await
+    // The credential may have just been renewed: the new one is a secret too.
+    session.with_gate(|gate| gate.add_secret_literals(upstream.credential_strings()));
+    relay(app, session, response, protocol, created, request_id).await
+}
+
+/// Forgets a request that won't be answered through the gate, so it doesn't
+/// stay pending (and in memory) forever.
+fn abandon(session: &Session, request_id: Option<&Value>) {
+    if let Some(id) = request_id {
+        session.with_gate(|gate| gate.abandon(id));
+    }
 }
 
 /// Sends the server's reply back to the client, every message through the
@@ -432,9 +447,11 @@ async fn relay(
     response: reqwest::Response,
     protocol: Option<HeaderValue>,
     created: bool,
+    request_id: Option<Value>,
 ) -> Response {
     let status = response.status();
     if status == reqwest::StatusCode::ACCEPTED {
+        // An answer to a request may still come, on the server's stream.
         return accepted(&session.id);
     }
     if status == reqwest::StatusCode::NOT_FOUND && session.upstream_id().is_some() {
@@ -444,6 +461,7 @@ async fn relay(
     }
     if !status.is_success() {
         warn!(server = %session.server, %status, "the MCP server answered with an error status");
+        abandon(&session, request_id.as_ref());
         if created {
             close_session(&app, &session);
         }
@@ -454,12 +472,13 @@ async fn relay(
             .into_response();
     }
     if is_event_stream(response.headers()) {
-        return stream(app, session, response, protocol);
+        return stream(app, session, response, protocol, request_id, None);
     }
     let body = match read_limited(response).await {
         Ok(body) => body,
         Err(problem) => {
             warn!(server = %session.server, %problem, "couldn't read the MCP server's reply");
+            abandon(&session, request_id.as_ref());
             return (
                 StatusCode::BAD_GATEWAY,
                 "couldn't read the MCP server's reply",
@@ -477,11 +496,14 @@ async fn relay(
     }
     match answers.into_iter().next() {
         Some(answer) => json_reply(answer, &session.id),
-        None => (
-            StatusCode::BAD_GATEWAY,
-            "the MCP server's reply didn't pass the gate",
-        )
-            .into_response(),
+        None => {
+            abandon(&session, request_id.as_ref());
+            (
+                StatusCode::BAD_GATEWAY,
+                "the MCP server's reply didn't pass the gate",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -492,45 +514,17 @@ fn stream(
     session: Arc<Session>,
     response: reqwest::Response,
     protocol: Option<HeaderValue>,
+    request_id: Option<Value>,
+    guard: Option<StreamGuard>,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Bytes>(64);
     let id = session.id.clone();
     tokio::spawn(async move {
-        let mut parser = sse::Parser::new(MAX_MESSAGE_BYTES);
-        let mut chunks = response.bytes_stream();
-        while let Some(chunk) = chunks.next().await {
-            let Ok(chunk) = chunk else { break };
-            let events = match parser.push(&chunk) {
-                Ok(events) => events,
-                Err(problem) => {
-                    warn!(server = %session.server, %problem, "stopped relaying the MCP server's stream");
-                    break;
-                }
-            };
-            for event in events {
-                if event.data.is_empty()
-                    || event.kind.as_deref().is_some_and(|kind| kind != "message")
-                {
-                    continue;
-                }
-                let Some(actions) = session.with_gate(|gate| gate.from_server(&event.data)) else {
-                    return;
-                };
-                for action in actions {
-                    match action {
-                        Action::ToClient(message) => {
-                            let event = sse::encode(event.id.as_deref(), &message);
-                            if sender.send(Bytes::from(event)).await.is_err() {
-                                return; // the client left; dropping the stream closes the server's too
-                            }
-                        }
-                        Action::ToServer(message) => {
-                            answer_server(&app, &session, message, protocol.clone());
-                        }
-                    }
-                }
-            }
-        }
+        // A server stream stays counted while it's open.
+        let _guard = guard;
+        relay_events(&app, &session, response, protocol.as_ref(), &sender).await;
+        // The stream ended: if it never carried the answer, forget the request.
+        abandon(&session, request_id.as_ref());
     });
     let body = Body::from_stream(futures_util::stream::unfold(
         receiver,
@@ -549,6 +543,51 @@ fn stream(
         headers.insert(SESSION_HEADER, id);
     }
     response
+}
+
+async fn relay_events(
+    app: &Arc<App>,
+    session: &Arc<Session>,
+    response: reqwest::Response,
+    protocol: Option<&HeaderValue>,
+    sender: &mpsc::Sender<Bytes>,
+) {
+    let mut parser = sse::Parser::new(MAX_MESSAGE_BYTES);
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let Ok(chunk) = chunk else { return };
+        let events = match parser.push(&chunk) {
+            Ok(events) => events,
+            Err(problem) => {
+                warn!(server = %session.server, %problem, "stopped relaying the MCP server's stream");
+                return;
+            }
+        };
+        for event in events {
+            if event.data.is_empty() || event.kind.as_deref().is_some_and(|kind| kind != "message")
+            {
+                continue;
+            }
+            // A session with a live stream isn't idle.
+            session.touch();
+            let Some(actions) = session.with_gate(|gate| gate.from_server(&event.data)) else {
+                return;
+            };
+            for action in actions {
+                match action {
+                    Action::ToClient(message) => {
+                        let event = sse::encode(event.id.as_deref(), &message);
+                        if sender.send(Bytes::from(event)).await.is_err() {
+                            return; // the client left; dropping the stream closes the server's too
+                        }
+                    }
+                    Action::ToServer(message) => {
+                        answer_server(app, session, message, protocol.cloned());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Sends the gate's answer to a server request back to the server.
@@ -585,6 +624,13 @@ async fn open_stream(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let Some(guard) = session.open_stream() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "this session already has its most server streams open",
+        )
+            .into_response();
+    };
     let protocol = protocol_version(&headers);
     let upstream = &app.upstreams[&name];
     let request = match upstream
@@ -609,7 +655,7 @@ async fn open_stream(
     let response = match request.send().await {
         Ok(response) => response,
         Err(failure) => {
-            warn!(server = name, error = %failure, "couldn't reach the MCP server");
+            warn!(server = name, error = %failure.without_url(), "couldn't reach the MCP server");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
@@ -619,7 +665,7 @@ async fn open_stream(
     if !response.status().is_success() || !is_event_stream(response.headers()) {
         return StatusCode::BAD_GATEWAY.into_response();
     }
-    stream(app, session, response, protocol)
+    stream(app, session, response, protocol, None, Some(guard))
 }
 
 /// Ends a session (`DELETE`).

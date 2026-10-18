@@ -64,7 +64,12 @@ Pin a package *version* (`@1.0.0` above); without one, `npx` fetches the
 newest release on every run, so the code can change while its descriptions
 don't, and mcp-mandate warns about it.
 
-**2. Write a policy.** Start from [policies/example.toml](policies/example.toml):
+**2. Write a policy.** Start from [policies/example.toml](policies/example.toml).
+Keep the policy and pins files where neither the agent nor a server can
+write to them: whoever can edit them decides what the gate allows. A
+folder such as `~/.config/mcp-mandate/` works, as long as your agent's own
+file tools aren't allowed there. mcp-mandate warns when either file is
+inside the folder the server runs in, or writable by other users.
 
 ```toml
 pins = "everything.pins.toml"
@@ -111,30 +116,52 @@ mcp-mandate audit verify policy.audit.jsonl
 - **Pinning.** Tools, prompts, resources, resource templates and the server's
   instructions are compared with their pins. Anything changed since approval
   (a "rug pull") or never approved is hidden from lists, and calls to it are
-  blocked. A server with no pins file gets nothing through.
+  blocked. A server with no pins file gets nothing through. A resource read
+  must name a pinned resource or fit a pinned template: `{name}` fills one
+  path segment, `{+path}` several but never `.` or `..` (plain or
+  percent-encoded), and other template operators match nothing.
 - **Policy.** Each tool is allowed, held or denied (default: denied). When
   several rules match, the most restrictive wins. Denied tools are hidden
   from the model.
-- **Arguments.** Size limits, shell metacharacters in the arguments you
-  name, and the tool's own JSON Schema.
+- **Arguments.** Size limits, the tool's own JSON Schema, and shell
+  metacharacters in the arguments you name (`no_shell_metacharacters`).
+  That last check refuses `;`, `&`, `|`, `$`, `` ` ``, `<`, `>`, `(`, `)`,
+  `{`, `}`, newlines and NUL in those arguments' string values (top level
+  only), which stops command chaining
+  and substitution in POSIX shells. It doesn't stop option injection
+  (`--upload-pack=…`, `-o ProxyCommand=…`), Windows `cmd.exe`
+  metacharacters (`%`, `^`, `!`), or anything in nested values.
 - **Requests from the server.** `sampling/createMessage` (the server asks the
   client's model to write) and `elicitation/create` (the server asks you a
   question) are denied unless the policy allows them.
 - **Unknown requests** are denied, so a new protocol feature can't slip
   through unchecked.
 - **Taint.** Once a tool that reads untrusted content answers (a web
-  fetch, an inbox, anything a stranger could have written), or a resource is
-  read, the session is tainted for the rest of its life. Tools that can send
-  data out are then held, so a model hijacked by what it read can't complete
-  an exfiltration. Which tools are which comes from your policy's
-  `reads_untrusted` and `sends_out` labels, or else the tool's pinned
-  `openWorldHint`; a tool that says nothing counts as both.
-- **Secrets.** API keys, tokens, private keys and password assignments are
-  replaced with `[REDACTED: kind]` in everything the server sends (except
-  image and audio data), and a tool call whose arguments carry one is
-  blocked unless its rule sets `allow_secrets = true`. Add your own patterns
-  under `[[secrets.patterns]]`. Personal data such as emails isn't redacted
-  yet.
+  fetch, an inbox, anything a stranger could have written), a resource is
+  read, or a prompt is fetched (only a prompt's listing is pinned, not the
+  messages it returns), the session is tainted for the rest of its life. Tools that can send data out are then held, so a model hijacked by
+  what it read can't complete an exfiltration. Which tools are which comes
+  from your policy's `reads_untrusted` and `sends_out` labels, or else the
+  tool's pinned `openWorldHint`; a tool that says nothing counts as both.
+  (`[taint] resources_are_untrusted` and `prompts_are_untrusted` turn off
+  the other two.)
+- **Taint is shared across an agent's servers.** Reading a web page through
+  one server holds sending email through another. Every `mcp-mandate run`
+  started by the same agent process shares one taint, kept in a file only
+  you can read. When mcp-mandate is started through a shell or wrapper, set
+  `MCP_MANDATE_AGENT` to the same name in each server's configuration so
+  they're still counted as one agent. On the HTTPS gateway, taint is shared
+  across every session of the same caller.
+- **Secrets.** API keys, tokens, private keys, and password or secret
+  assignments (`DB_PASSWORD=…`, `"password": "…"`,
+  `AWS_SECRET_ACCESS_KEY=…`) are replaced with `[REDACTED: kind]` in
+  everything the server sends. A resource's base64 `blob` is decoded and
+  checked; base64 image and audio data isn't. A request whose tool or prompt
+  arguments, resource URI or completion text carries a secret is blocked
+  (unless the tool's rule sets `allow_secrets = true`), and so is a sampling
+  or elicitation answer. Secrets encoded some other way (base64 in text,
+  hex, split across messages) pass. Add your own patterns under
+  `[[secrets.patterns]]`. Personal data such as emails isn't redacted yet.
 - **Audit log.** Every message that crosses the gate is recorded with what
   the gate did and why, in a hash chain that shows any later edit. See
   [The audit log](#the-audit-log).
@@ -173,6 +200,11 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   - the audience (the gateway, or the server being used);
   - the subject, the expiry and the not-before time.
 
+  Set `audience` to an API or resource identifier, never to a client id:
+  the token's type isn't checked, so with a client id an ID token would
+  pass as an access token. If the provider can't be reached, its keys are
+  used for at most 24 hours after they were fetched.
+
   Any token that passes may use every configured server, so decide who can
   get one in your identity provider. A missing or bad token gets `401` with
   a link to the gateway's OAuth metadata (RFC 9728), which MCP clients use
@@ -182,7 +214,7 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   variable or file (never the config file itself), or short-lived OAuth
   client-credential tokens. Only the headers MCP needs are passed on, and
   redirects aren't followed, so a server can't bounce the credential
-  elsewhere.
+  elsewhere. A server that echoes the credential back gets it redacted.
 - **Sessions** belong to the caller who opened them, and each has its own
   gate: its own taint, its own audit session. The server's session id is
   never shown to the client. Idle sessions close after 30 minutes.
@@ -191,8 +223,13 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   the caller (`sub`) and their OAuth client.
 - **HTTPS:** mcp-mandate serves TLS itself with your certificate, or plain
   HTTP behind a proxy that handles TLS (`terminated_by_proxy = true`). Plain
-  HTTP is otherwise allowed only on localhost. Servers must use `https://`
-  unless they're on localhost.
+  HTTP is otherwise allowed only on localhost. Behind a proxy, `listen` on
+  the address the proxy connects to, not `0.0.0.0`: anything that can reach
+  the port directly skips the proxy, and tokens cross that hop unencrypted.
+  Servers must use `https://` unless they're on localhost.
+- **Limits:** at most 1024 connections at once, 30 seconds to send a
+  request's headers, 32 open sessions per caller and 4 event streams per
+  session.
 
 ## Scout
 
@@ -218,7 +255,12 @@ mcp-mandate scout --pins everything.pins.toml --out everything.draft.toml \
   - tools whose annotations say read-only and closed-world are allowed;
   - tools that can change things or reach the outside world are held, with
     taint labels set from their annotations;
-  - a medium finding holds a tool, and a high finding denies it.
+  - a medium finding holds a tool, and a high finding denies it;
+  - two tools listed under one name are both denied.
+
+  The annotations are the server's own claims. Where they say closed-world,
+  the draft leaves the taint labels out and says so in a comment, rather
+  than writing `false` as if it were checked.
 
   Every rule names a tool exactly (never a pattern), and its comments say
   why. With `--pins`, the draft names the pins file and the report flags
@@ -227,14 +269,20 @@ mcp-mandate scout --pins everything.pins.toml --out everything.draft.toml \
   judge, such as a description that doesn't match the tool's schema.
   - It's off unless you pass `--llm`, and it sends the server's definitions
     to the Claude API with your own key (`ANTHROPIC_API_KEY`, or a `.env`
-    file; see `.env.example`).
-  - The key is never put in the environment the reviewed server inherits.
+    file in the current folder; see `.env.example`).
+  - The key is removed from the environment the reviewed server inherits,
+    wherever it came from.
   - It can only make the draft stricter, never looser: the descriptions it
     reads were written by the server and may try to talk it into "safe".
-  - If it fails or declines, the draft uses the scan alone.
+  - If it fails or declines (a server can cause that on purpose), the draft
+    holds every tool.
   - Building with `cargo build --no-default-features` leaves it out.
 
 Scout exits 0 whenever it ran; the findings are in the report.
+
+`scout` and `pin` start the server to see what it offers, so it runs with
+your permissions. For a server you don't trust yet, run them in a container
+or sandbox. Neither replaces an existing file unless you pass `--force`.
 
 ## The audit log
 
@@ -265,6 +313,16 @@ jq -c 'select(.verdict == "block") | {time, item, reason}' policy.audit.jsonl
 - **Tamper evidence.** Each line holds the hash of its own bytes and of the
   line before it, so editing, removing, adding or reordering lines breaks
   the chain, and `mcp-mandate audit verify` names the first broken line.
+- **A damaged log stops the gate.** If the last line is cut off (a crash, or
+  another process appending to the file), every gate sharing the log stops
+  passing messages until it's repaired. That's the fail-closed design, but
+  it also means anything that can write the log can stop your servers.
+  Each session's first entry records the policy's hash
+  (`policy_sha256`), so a policy changed behind your back shows up there.
+- **On Windows**, mcp-mandate checks only that the log's path still exists:
+  a log renamed away and replaced by a new file isn't noticed. On Linux and
+  macOS a replaced file is noticed, and the log is never opened through a
+  symlink.
 
 A chain can't show entries cut off its end, or a log rewritten from
 scratch with fresh hashes. To catch those, save the head hash that
@@ -281,9 +339,9 @@ mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
   any MCP security tool can replay: poisoned and changed tools, exfiltration
   after untrusted reads, secrets in both directions, shell injection, and
   protocol abuse. Every pull request runs all of them through the gate.
-  - Every attack must be stopped: blocked, hidden, redacted or dropped (54
+  - Every attack must be stopped: blocked, hidden, redacted or dropped (73
     today).
-  - Every benign case must pass untouched, so normal use isn't blocked (16
+  - Every benign case must pass untouched, so normal use isn't blocked (18
     today).
   - Every known gap must still behave as documented (below), so a fix gets
     noticed.
@@ -298,7 +356,11 @@ mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
 - **Real processes and servers.** End-to-end tests run the binary against
   scripted servers, a fake identity provider and fake remote servers. On
   Linux, macOS and Windows, stopping a server also stops everything it
-  started: its process group, or a Windows Job Object.
+  started: its process group, or a Windows Job Object. A server that tries
+  to escape can: a process that leaves its group (`setsid`, daemonizing),
+  or that it has started outside the Job Object (through WMI or the Task
+  Scheduler), keeps running. If mcp-mandate itself is killed with `SIGKILL`,
+  the server's group is left running.
 
 **Known gaps** (each proven by a corpus case):
 
@@ -307,6 +369,8 @@ mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
   `secret-access` and `send-to-address` checks help find such tools.
 - A secret with no recognizable shape passes. Add your own shapes under
   `[[secrets.patterns]]`.
+- A secret encoded in base64 image or audio data from a server passes (as
+  would a picture of one); only text and resource blobs are checked.
 
 ## What it doesn't do
 
@@ -318,6 +382,11 @@ mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
 - **It guards MCP messages, not the server process.** A local server runs
   with your operating-system permissions and could read files directly
   without making an MCP call. Use OS sandboxing to contain that.
+- **Its own files are part of what you have to protect.** The policy, pins
+  file and audit log *are* the gate's configuration and record. Anything
+  that can write them (a local server, or your agent's file tools) can loosen
+  the policy, approve a new tool, or cut the log. Keep them where neither
+  can write (see the [quick start](#quick-start)).
 - **It doesn't replace** your identity provider or the servers' own
   authentication.
 - **Behind the gateway, a server sees the gateway, not you.** Every caller

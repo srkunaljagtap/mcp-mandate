@@ -21,7 +21,7 @@ mod review;
 
 pub use draft::{Draft, ToolPlan, plan_tools};
 pub use report::render;
-pub use rules::{compare_with_pins, scan};
+pub use rules::{compare_with_pins, review_failed, scan};
 pub use text::printable;
 
 #[cfg(feature = "llm")]

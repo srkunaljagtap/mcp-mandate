@@ -10,9 +10,10 @@ updates:
         patterns: ["*"]
 
   # Rust dependencies: one grouped pull request a week for minor and patch
-  # updates; major versions get their own.
+  # updates; major versions get their own. The fuzz targets have their own
+  # lockfile.
   - package-ecosystem: cargo
-    directory: /
+    directories: ["/", "/fuzz"]
     schedule:
       interval: weekly
     groups:

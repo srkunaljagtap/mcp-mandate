@@ -5,9 +5,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use mcp_mandate_audit::{AuditError, Event, Recorder};
-use mcp_mandate_gate::{Action, Gate};
+use mcp_mandate_gate::{Action, Gate, SharedTaint};
 use mcp_mandate_pin::{Inventory, Pins};
 use mcp_mandate_policy::Policy;
 use serde::Deserialize;
@@ -33,6 +34,10 @@ struct Case {
     pinned: Pinned,
     #[serde(default)]
     skip_listing: bool,
+    /// Values the gate treats as secrets, as the HTTPS gateway does with
+    /// its upstream credentials.
+    #[serde(default)]
+    credentials: Vec<String>,
     steps: Vec<Step>,
 }
 
@@ -61,6 +66,9 @@ struct Pinned {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Step {
+    /// Which of the agent's servers (one gate each) the step goes through.
+    #[serde(default = "first_gate")]
+    gate: String,
     from: Side,
     send: Option<Value>,
     raw: Option<String>,
@@ -88,12 +96,30 @@ enum Outcome {
     Drop,
 }
 
+fn first_gate() -> String {
+    "a".to_owned()
+}
+
 /// An audit log that keeps nothing.
 struct Discard;
 
 impl Recorder for Discard {
     fn record(&mut self, _: &Event) -> Result<(), AuditError> {
         Ok(())
+    }
+}
+
+/// The taint one agent's gates share.
+#[derive(Default)]
+struct AgentTaint(Mutex<Option<String>>);
+
+impl SharedTaint for AgentTaint {
+    fn get(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn set(&self, source: &str) {
+        *self.0.lock().unwrap() = Some(source.to_owned());
     }
 }
 
@@ -158,8 +184,9 @@ fn names(message: &Value) -> Option<Vec<String>> {
         })
 }
 
-/// Runs one case; returns what went wrong, if anything.
-fn run(case: &Case) -> Vec<String> {
+/// A gate for one of the case's servers, with everything pinned listed
+/// unless the case skips that.
+fn start_gate(case: &Case, agent: &Arc<AgentTaint>) -> Gate {
     let policy = Policy::parse(case.policy.as_deref().unwrap_or(ALLOW_ALL), Path::new("."))
         .unwrap_or_else(|error| panic!("{}: bad policy: {error}", case.id));
     let inventory = Inventory {
@@ -170,7 +197,9 @@ fn run(case: &Case) -> Vec<String> {
         resource_templates: case.pinned.resource_templates.clone(),
     };
     let pins = Pins::from_inventory("corpus", &inventory);
-    let mut gate = Gate::new(policy, Some(pins), Box::new(Discard));
+    let mut gate = Gate::new(policy, Some(pins), Box::new(Discard))
+        .with_shared_taint(Arc::clone(agent) as Arc<dyn SharedTaint>);
+    gate.add_secret_literals(case.credentials.iter().cloned());
 
     if !case.skip_listing {
         let lists = [
@@ -196,7 +225,13 @@ fn run(case: &Case) -> Vec<String> {
             ));
         }
     }
+    gate
+}
 
+/// Runs one case; returns what went wrong, if anything.
+fn run(case: &Case) -> Vec<String> {
+    let agent = Arc::new(AgentTaint::default());
+    let mut gates: BTreeMap<&str, Gate> = BTreeMap::new();
     let mut problems = Vec::new();
     for (number, step) in case.steps.iter().enumerate() {
         let sent = match (&step.send, &step.raw) {
@@ -208,6 +243,9 @@ fn run(case: &Case) -> Vec<String> {
                 number + 1
             ),
         };
+        let gate = gates
+            .entry(step.gate.as_str())
+            .or_insert_with(|| start_gate(case, &agent));
         let actions = match step.from {
             Side::Client => gate.from_client(&sent),
             Side::Server => gate.from_server(&sent),

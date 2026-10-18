@@ -30,7 +30,10 @@ jobs:
       - run: rustup toolchain install nightly-2026-10-01 --profile minimal
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
+      # Fails if fuzz/Cargo.lock is out of date, so only the reviewed
+      # dependency versions are built.
+      - run: cargo +nightly-2026-10-01 fetch --locked --manifest-path fuzz/Cargo.toml
       - name: Fuzz for 5 minutes
         # A crash fails the job; libFuzzer prints the input that caused it.
         run: cargo +nightly-2026-10-01 fuzz run ${{ matrix.target }} -- -max_total_time=300

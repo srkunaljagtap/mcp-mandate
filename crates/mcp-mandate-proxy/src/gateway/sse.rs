@@ -1,6 +1,9 @@
 //! Server-sent events, the streaming half of MCP's Streamable HTTP: reading
 //! a server's stream event by event, and writing events to the client.
 
+/// Longest event id passed on; a longer one is dropped.
+const MAX_ID_BYTES: usize = 256;
+
 /// One event. Only events with no type or type `message` carry MCP
 /// messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +23,8 @@ pub struct Parser {
     line: Vec<u8>,
     data: Vec<u8>,
     has_data: bool,
+    /// The last byte was a CR, so an LF right after it ends nothing.
+    after_cr: bool,
     id: Option<String>,
     kind: Option<String>,
 }
@@ -32,6 +37,7 @@ impl Parser {
             line: Vec::new(),
             data: Vec::new(),
             has_data: false,
+            after_cr: false,
             id: None,
             kind: None,
         }
@@ -41,7 +47,13 @@ impl Parser {
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Event>, TooLarge> {
         let mut events = Vec::new();
         for &byte in chunk {
-            if byte != b'\n' {
+            // A line ends at LF, CR, or CRLF (counted once), as the spec says.
+            if byte == b'\n' && self.after_cr {
+                self.after_cr = false;
+                continue;
+            }
+            self.after_cr = byte == b'\r';
+            if byte != b'\n' && byte != b'\r' {
                 self.line.push(byte);
                 if self.line.len() > self.limit {
                     return Err(TooLarge(self.limit));
@@ -49,8 +61,7 @@ impl Parser {
                 continue;
             }
             let line = std::mem::take(&mut self.line);
-            let line = line.strip_suffix(b"\r").unwrap_or(&line);
-            if let Some(event) = self.line_done(line)? {
+            if let Some(event) = self.line_done(&line)? {
                 events.push(event);
             }
         }
@@ -91,7 +102,7 @@ impl Parser {
                     return Err(TooLarge(self.limit));
                 }
             }
-            b"id" if !value.contains(&0) => {
+            b"id" if !value.contains(&0) && value.len() <= MAX_ID_BYTES => {
                 self.id = Some(String::from_utf8_lossy(value).into_owned());
             }
             b"event" => self.kind = Some(String::from_utf8_lossy(value).into_owned()),
@@ -104,16 +115,33 @@ impl Parser {
 /// Writes one message as an event, keeping `id` so the client can resume.
 pub fn encode(id: Option<&str>, message: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(message.len() + 32);
-    if let Some(id) = id.filter(|id| !id.contains(['\n', '\r'])) {
+    if let Some(id) = id.filter(|id| id.len() <= MAX_ID_BYTES && !id.contains(['\n', '\r'])) {
         out.extend_from_slice(b"id: ");
         out.extend_from_slice(id.as_bytes());
         out.push(b'\n');
     }
     out.extend_from_slice(b"event: message\n");
+    // Any line ending (LF, CR or CRLF) starts a new `data:` line, so a
+    // client that splits on bare CRs reads the same message.
     let message = message.trim_ascii_end();
-    for line in message.split(|&byte| byte == b'\n') {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < message.len() {
+        match message[index] {
+            b'\r' | b'\n' => {
+                lines.push(&message[start..index]);
+                let crlf = message[index] == b'\r' && message.get(index + 1) == Some(&b'\n');
+                index += if crlf { 2 } else { 1 };
+                start = index;
+            }
+            _ => index += 1,
+        }
+    }
+    lines.push(&message[start..]);
+    for line in lines {
         out.extend_from_slice(b"data: ");
-        out.extend_from_slice(line.strip_suffix(b"\r").unwrap_or(line));
+        out.extend_from_slice(line);
         out.push(b'\n');
     }
     out.push(b'\n');
@@ -157,6 +185,22 @@ mod tests {
     fn refuses_oversized_events() {
         let mut parser = Parser::new(8);
         assert!(parser.push(b"data: 0123456789\n").is_err());
+    }
+
+    #[test]
+    fn a_bare_cr_ends_a_line_and_long_ids_are_dropped() {
+        let long_id = "i".repeat(300);
+        let stream = format!("id: {long_id}\rdata: {{}}\r\rdata: x\r\n\r\n");
+        let events = parse(&[stream.as_bytes()]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            (events[0].id.as_deref(), events[0].data.as_slice()),
+            (None, &b"{}"[..])
+        );
+        let written = encode(Some(&long_id), b"{\r \"a\": 1\r}");
+        let text = String::from_utf8(written).unwrap();
+        assert!(!text.contains('\r'), "{text:?}");
+        assert!(!text.contains("id:"), "{text:?}");
     }
 
     #[test]

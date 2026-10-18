@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -54,15 +55,22 @@ pub enum AuditError {
     TooLarge { size: usize },
 }
 
-/// An audit log file that this process appends to.
+/// One session's view of an audit log file: its entries carry the session's
+/// id.
 ///
 /// Several processes can share one log (two agents running the same
 /// server, say): each append takes an exclusive lock on the file, picks up
-/// entries other processes added since, and links to the last one.
+/// entries other processes added since, and links to the last one. Within
+/// one process, sessions made with [`Log::new_session`] share one open file.
 pub struct Log {
+    session: String,
+    file: Arc<Mutex<LogFile>>,
+}
+
+/// The open file behind one or more sessions.
+struct LogFile {
     path: PathBuf,
     file: File,
-    session: String,
     /// The last entry's number and hash, and the file's length after it.
     seq: u64,
     prev: String,
@@ -85,8 +93,49 @@ struct Line<'a> {
 
 impl Log {
     /// Opens (or creates) the log at `path` and checks that its last entry
-    /// can be continued. Each `Log` is one session, with its own id.
+    /// can be continued: the first session on it.
     pub fn open(path: &Path) -> Result<Self, AuditError> {
+        Ok(Self {
+            session: new_session_id(),
+            file: Arc::new(Mutex::new(LogFile::open(path)?)),
+        })
+    }
+
+    /// Another session recording to the same open file.
+    pub fn new_session(&self) -> Self {
+        Self {
+            session: new_session_id(),
+            file: Arc::clone(&self.file),
+        }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.file
+            .lock()
+            .map(|file| file.path.clone())
+            .unwrap_or_default()
+    }
+
+    /// This session's id, recorded in each of its entries.
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+}
+
+impl Recorder for Log {
+    fn record(&mut self, event: &Event) -> Result<(), AuditError> {
+        let Ok(mut file) = self.file.lock() else {
+            return Err(AuditError::Write {
+                path: PathBuf::new(),
+                source: std::io::Error::other("an earlier write panicked"),
+            });
+        };
+        file.record(&self.session, event)
+    }
+}
+
+impl LogFile {
+    fn open(path: &Path) -> Result<Self, AuditError> {
         let open_error = |source| AuditError::Open {
             path: path.to_owned(),
             source,
@@ -105,8 +154,11 @@ impl Log {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            // The log shows which tools were used: keep it private.
-            options.mode(0o600);
+            // The log shows which tools were used: keep it private. And
+            // never follow a symlink planted where the log should be.
+            options
+                .mode(0o600)
+                .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
         }
         let file = options.open(path).map_err(open_error)?;
         let mut log = Self {
@@ -114,7 +166,6 @@ impl Log {
             #[cfg(unix)]
             identity: identity(&file.metadata().map_err(open_error)?),
             file,
-            session: new_session_id(),
             seq: 0,
             prev: GENESIS.to_owned(),
             len: 0,
@@ -127,17 +178,21 @@ impl Log {
         Ok(log)
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// This session's id, recorded in each of its entries.
-    pub fn session(&self) -> &str {
-        &self.session
+    fn record(&mut self, session: &str, event: &Event) -> Result<(), AuditError> {
+        self.file
+            .lock()
+            .map_err(|source| self.write_error(source))?;
+        let appended = self.append(session, event);
+        let unlocked = self
+            .file
+            .unlock()
+            .map_err(|source| self.write_error(source));
+        appended?;
+        unlocked
     }
 
     /// Appends one entry. Call with the file locked.
-    fn append(&mut self, event: &Event) -> Result<(), AuditError> {
+    fn append(&mut self, session: &str, event: &Event) -> Result<(), AuditError> {
         self.check_identity()?;
         let len = self.file_len()?;
         if len < self.len {
@@ -154,7 +209,7 @@ impl Log {
         let line = Line {
             seq: self.seq + 1,
             time: rfc3339(SystemTime::now()),
-            session: &self.session,
+            session,
             event,
             prev: &self.prev,
         };
@@ -238,21 +293,6 @@ impl Log {
             path: self.path.clone(),
             source,
         }
-    }
-}
-
-impl Recorder for Log {
-    fn record(&mut self, event: &Event) -> Result<(), AuditError> {
-        self.file
-            .lock()
-            .map_err(|source| self.write_error(source))?;
-        let appended = self.append(event);
-        let unlocked = self
-            .file
-            .unlock()
-            .map_err(|source| self.write_error(source));
-        appended?;
-        unlocked
     }
 }
 
@@ -347,6 +387,40 @@ pub(crate) mod tests {
         assert_eq!(entries[1]["prev"], entries[0]["hash"]);
         assert_ne!(entries[1]["session"], first);
         assert_eq!(verify(&path, None).unwrap().sessions, 2);
+    }
+
+    #[test]
+    fn sessions_can_share_one_open_file() {
+        let path = temp_dir("one-file").join("audit.jsonl");
+        let mut first = Log::open(&path).unwrap();
+        let mut second = first.new_session();
+        first.record(&message(Verdict::Allow)).unwrap();
+        second.record(&message(Verdict::Block)).unwrap();
+        first.record(&message(Verdict::Allow)).unwrap();
+        assert_ne!(first.session(), second.session());
+        let report = verify(&path, None).unwrap();
+        assert_eq!((report.entries, report.sessions), (3, 2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_log_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_dir("private").join("audit.jsonl");
+        Log::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_a_symlink() {
+        let dir = temp_dir("symlink");
+        let target = dir.join("elsewhere");
+        let path = dir.join("audit.jsonl");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(Log::open(&path).is_err());
+        assert!(!target.exists());
     }
 
     #[test]

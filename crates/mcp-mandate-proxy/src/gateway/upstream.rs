@@ -14,6 +14,8 @@ use crate::ProxyError;
 
 pub const SESSION_HEADER: &str = "mcp-session-id";
 pub const PROTOCOL_HEADER: &str = "mcp-protocol-version";
+/// Longest a fetched access token is used, whatever its `expires_in` says.
+const MAX_TOKEN_SECONDS: u64 = 24 * 3600;
 
 /// The HTTP client for servers: no redirects (a redirect could carry the
 /// gateway's credential to another host), and a limit on waiting for a
@@ -159,6 +161,32 @@ impl Upstream {
             .await?)
     }
 
+    /// Every form of the credential the gateway uses for this server (the
+    /// header value, the bare token, the client secret, the current access
+    /// token), so a server echoing it back can't hand it to a caller.
+    pub fn credential_strings(&self) -> Vec<String> {
+        let with_bare = |value: &str| {
+            let mut forms = vec![value.to_owned()];
+            if let Some(bare) = value.strip_prefix("Bearer ") {
+                forms.push(bare.to_owned());
+            }
+            forms
+        };
+        match &self.credential {
+            Credential::None => Vec::new(),
+            Credential::Header(_, value) => with_bare(value.to_str().unwrap_or_default()),
+            Credential::ClientCredentials(client) => {
+                let mut forms = vec![client.client_secret.expose().to_owned()];
+                if let Ok(cached) = client.cached.try_lock()
+                    && let Some((token, _)) = &*cached
+                {
+                    forms.extend(with_bare(token.to_str().unwrap_or_default()));
+                }
+                forms
+            }
+        }
+    }
+
     /// The URL without its query, which could hold a secret, for logs.
     pub fn display_url(&self) -> String {
         let mut url = self.url.clone();
@@ -173,12 +201,13 @@ impl ClientCredentials {
     /// endpoint (OAuth client credentials, for this server's URL as the
     /// resource, RFC 8707).
     async fn token(&self, http: &reqwest::Client) -> Result<HeaderValue, CredentialError> {
-        let mut cached = self.cached.lock().await;
-        if let Some((token, until)) = &*cached
+        if let Some((token, until)) = &*self.cached.lock().await
             && Instant::now() < *until
         {
             return Ok(token.clone());
         }
+        // Fetched without holding the lock, so a slow token endpoint doesn't
+        // queue every request behind it (two may fetch at once; harmless).
         let mut form = vec![
             ("grant_type", "client_credentials"),
             ("resource", self.resource.as_str()),
@@ -194,7 +223,7 @@ impl ClientCredentials {
             .body(form_encode(&form))
             .send()
             .await
-            .map_err(CredentialError::Fetch)?;
+            .map_err(|error| CredentialError::Fetch(error.without_url()))?;
         if !response.status().is_success() {
             return Err(CredentialError::Status(response.status().as_u16()));
         }
@@ -212,10 +241,13 @@ impl ClientCredentials {
         let mut token = HeaderValue::from_str(&format!("Bearer {}", reply.access_token))
             .map_err(|_| CredentialError::Invalid)?;
         token.set_sensitive(true);
-        // Renew a little early, so a token never expires mid-request.
-        let lifetime = Duration::from_secs(reply.expires_in.unwrap_or(300));
-        let until = Instant::now() + lifetime.saturating_sub(Duration::from_secs(30));
-        *cached = Some((token.clone(), until));
+        // Renew a little early, so a token never expires mid-request, and
+        // at least daily whatever the endpoint claims.
+        let lifetime = Duration::from_secs(reply.expires_in.unwrap_or(300).min(MAX_TOKEN_SECONDS));
+        let until = Instant::now()
+            .checked_add(lifetime.saturating_sub(Duration::from_secs(30)))
+            .unwrap_or_else(Instant::now);
+        *self.cached.lock().await = Some((token.clone(), until));
         Ok(token)
     }
 }

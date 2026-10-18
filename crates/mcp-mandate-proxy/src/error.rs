@@ -31,11 +31,19 @@ pub enum ProxyError {
     #[error("couldn't write to the MCP server")]
     Io(#[from] std::io::Error),
     #[error("couldn't reach the MCP server")]
-    Http(#[from] reqwest::Error),
+    Http(#[source] reqwest::Error),
     #[error("the MCP server answered `{method}` with HTTP {status}")]
     Status { method: String, status: u16 },
     #[error("the MCP server's reply to `{0}` isn't a JSON-RPC message")]
     BadReply(String),
     #[error("couldn't get a credential for the MCP server")]
     Credential(#[from] crate::gateway::CredentialError),
+}
+
+impl From<reqwest::Error> for ProxyError {
+    /// Drops the request's URL from the error: a server's URL can carry a
+    /// key in its query, and these errors end up in logs.
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error.without_url())
+    }
 }

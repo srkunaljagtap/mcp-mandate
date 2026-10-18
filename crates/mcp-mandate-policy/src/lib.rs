@@ -188,12 +188,16 @@ pub struct Secrets {
 pub struct Taint {
     /// Reading a server's resources (`resources/read`) taints the session.
     pub resources_are_untrusted: bool,
+    /// Fetching a prompt (`prompts/get`) taints the session: what a prompt
+    /// returns isn't pinned, only its listing.
+    pub prompts_are_untrusted: bool,
 }
 
 impl Default for Taint {
     fn default() -> Self {
         Self {
             resources_are_untrusted: true,
+            prompts_are_untrusted: true,
         }
     }
 }

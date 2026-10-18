@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use mcp_mandate_audit::{self as audit, Log, Recorder, VerifyError};
@@ -12,6 +13,7 @@ use mcp_mandate_gate::Gate;
 use mcp_mandate_pin::{Inventory, Kind, Pins, unpinned_package};
 use mcp_mandate_policy::{Mode, Policy};
 use mcp_mandate_proxy::ProxyError;
+use mcp_mandate_proxy::agent_taint::AgentTaint;
 use mcp_mandate_proxy::gateway::{self, GatewayConfig};
 use mcp_mandate_proxy::stdio::{self, ServerCommand};
 use mcp_mandate_scout as scout;
@@ -186,8 +188,10 @@ fn run(policy: &Path, command: ServerCommand) -> ExitCode {
 /// start recorded.
 fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error>> {
     let policy = Policy::load(path)?;
+    warn_if_exposed("policy", path);
     let pins = match &policy.pins {
         Some(pins_path) => {
+            warn_if_exposed("pins file", pins_path);
             let pins = Pins::load(pins_path)?;
             info!(
                 pins = %pins_path.display(),
@@ -217,7 +221,40 @@ fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error
         session = log.session(),
         "recording every decision to the audit log"
     );
-    Ok(Gate::new(policy, pins, Box::new(log)))
+    let gate = Gate::new(policy, pins, Box::new(log));
+    // Reading untrusted content through this server holds sending through
+    // the agent's other servers too.
+    Ok(match AgentTaint::for_this_agent() {
+        Some(shared) => gate.with_shared_taint(Arc::new(shared)),
+        None => gate,
+    })
+}
+
+/// Warns when a file that configures the gate sits where the agent or a
+/// server could rewrite it: inside the folder the server runs in (the
+/// agent's own file tools reach it without passing the gate), or writable by
+/// other users. Whoever can edit these files decides what the gate allows.
+fn warn_if_exposed(what: &str, path: &Path) {
+    let Ok(full) = std::fs::canonicalize(path) else {
+        return; // loading it reports the problem
+    };
+    if let Ok(here) = std::env::current_dir().and_then(std::fs::canonicalize)
+        && full.starts_with(&here)
+    {
+        warn!(
+            file = %path.display(),
+            "the {what} is inside the folder the server runs in, where the agent's file tools can rewrite it; keep it in a folder they can't write to, such as ~/.config/mcp-mandate"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&full)
+            && metadata.permissions().mode() & 0o022 != 0
+        {
+            warn!(file = %path.display(), "the {what} is writable by other users");
+        }
+    }
 }
 
 fn mode_name(mode: Mode) -> &'static str {
@@ -324,7 +361,7 @@ fn count(n: u64, one: &str, many: &str) -> String {
 /// Exits 0 whatever it finds; the findings are in the report.
 fn scout(out: &Path, force: bool, pins: Option<&Path>, llm: bool, target: Target) -> ExitCode {
     init_logging();
-    if out.exists() && !force {
+    if taken(out) && !force {
         error!(out = %out.display(), "the draft already exists; pass --force to replace it");
         return ExitCode::from(2);
     }
@@ -369,7 +406,7 @@ fn scout(out: &Path, force: bool, pins: Option<&Path>, llm: bool, target: Target
     let server = source.label();
     let pins = pins.map(|pins| pins_reference(out, pins));
     let draft = scout::Draft::new(&inventory, &findings, &server, pins.as_deref());
-    if let Err(error) = std::fs::write(out, &draft.text) {
+    if let Err(error) = write_output(out, &draft.text, force) {
         error!(out = %out.display(), %error, "couldn't write the draft policy");
         return ExitCode::FAILURE;
     }
@@ -383,6 +420,42 @@ fn scout(out: &Path, force: bool, pins: Option<&Path>, llm: bool, target: Target
     );
     let _ = std::io::stdout().write_all(text.as_bytes());
     ExitCode::SUCCESS
+}
+
+/// Whether anything is at `path`, a dangling symlink included.
+fn taken(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Writes an output file. Without `--force` it must be new: whatever is at
+/// the path, even a dangling symlink, is left alone. With `--force` the text
+/// goes to a temporary file first, which then takes the path's place, so a
+/// symlink there is replaced rather than written through.
+fn write_output(out: &Path, text: &str, force: bool) -> std::io::Result<()> {
+    let create = |path: &Path| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    };
+    if !force {
+        return create(out);
+    }
+    let name = out
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a file name"))?;
+    let temporary = out.with_file_name(format!(
+        ".{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let written = create(&temporary).and_then(|()| std::fs::rename(&temporary, out));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 /// How the draft names the pins file: as given when the draft is written in
@@ -417,12 +490,18 @@ fn reviewer(llm: bool) -> Result<Option<scout::claude::Client>, String> {
         .map_err(|error| report(&error))
 }
 
-/// `ANTHROPIC_API_KEY` from a `.env` file, read without putting it in this
-/// process's environment: the server Scout starts inherits the environment
-/// and must never see the key.
+/// `ANTHROPIC_API_KEY` from the `.env` file in the current folder (never a
+/// parent folder's), read without putting it in this process's environment.
+/// The server Scout starts never gets the key either way: it's removed from
+/// the environment the server inherits.
 #[cfg(feature = "llm")]
 fn key_from_dotenv() -> Option<String> {
-    dotenvy::dotenv_iter()
+    key_from_dotenv_in(Path::new("."))
+}
+
+#[cfg(feature = "llm")]
+fn key_from_dotenv_in(folder: &Path) -> Option<String> {
+    dotenvy::from_path_iter(folder.join(".env"))
         .ok()?
         .filter_map(Result::ok)
         .find(|(name, _)| name == "ANTHROPIC_API_KEY")
@@ -465,8 +544,9 @@ fn review(
         }
         Err(error) => {
             let error = report(&error);
-            warn!(%error, "Claude's review failed; the draft uses the rule scan only");
-            format!("failed ({error}); the draft uses the rule scan only")
+            warn!(%error, "Claude's review failed; the draft holds every tool");
+            findings.extend(scout::review_failed(inventory));
+            format!("failed ({error}); the draft holds every tool")
         }
     }
 }
@@ -493,7 +573,7 @@ fn review(
 /// `mcp-mandate pin`: records what the server offers into a pins file.
 fn pin(out: &Path, force: bool, target: Target) -> ExitCode {
     init_logging();
-    if out.exists() && !force {
+    if taken(out) && !force {
         error!(
             out = %out.display(),
             "the pins file already exists; pass --force to replace it (re-pinning trusts whatever the server shows now)"
@@ -518,8 +598,8 @@ fn pin(out: &Path, force: bool, target: Target) -> ExitCode {
         }
     };
     let pins = Pins::from_inventory(source.label(), &inventory);
-    if let Err(error) = pins.save(out) {
-        error!(error = %report(&error), "couldn't write the pins file");
+    if let Err(error) = write_output(out, &pins.to_toml(), force) {
+        error!(out = %out.display(), %error, "couldn't write the pins file");
         return ExitCode::FAILURE;
     }
     eprintln!(
@@ -785,5 +865,43 @@ mod tests {
             summary(&Pins::new("server")),
             "nothing (the server offers no tools, prompts or resources)"
         );
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn the_api_key_is_read_only_from_the_current_folders_env_file() {
+        let parent = std::env::temp_dir().join(format!("mcp-mandate-env-{}", std::process::id()));
+        let project = parent.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(parent.join(".env"), "ANTHROPIC_API_KEY=from-the-parent\n").unwrap();
+        assert_eq!(key_from_dotenv_in(&project), None);
+        std::fs::write(project.join(".env"), "ANTHROPIC_API_KEY=from-here\n").unwrap();
+        assert_eq!(key_from_dotenv_in(&project).as_deref(), Some("from-here"));
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn output_files_are_new_unless_forced_and_never_written_through_a_link() {
+        let dir = std::env::temp_dir().join(format!("mcp-mandate-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("draft.toml");
+        write_output(&out, "one", false).unwrap();
+        assert!(write_output(&out, "two", false).is_err());
+        write_output(&out, "two", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "two");
+        #[cfg(unix)]
+        {
+            let target = dir.join("elsewhere");
+            let link = dir.join("link.toml");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(taken(&link));
+            assert!(write_output(&link, "x", false).is_err());
+            assert!(!target.exists());
+            write_output(&link, "x", true).unwrap();
+            assert!(!target.exists());
+            assert_eq!(std::fs::read_to_string(&link).unwrap(), "x");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

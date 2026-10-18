@@ -51,6 +51,11 @@ Each file is one class of attack:
   - `drop`: discarded.
 - `absent` and `present` are text that must not or must appear in what
   comes out. `seen` is the names a list response shows after the gate.
+- `gate` (default `a`) names which of the agent's servers a step goes
+  through. Each server gets its own gate with the same policy and pins, and
+  the gates share taint, as an agent's servers do.
+- `credentials` are values the gate treats as secrets, as the HTTPS gateway
+  does with the credentials it signs in to remote servers with.
 
 The secrets in these files are made up, or are documented examples such as
 AWS's `AKIAIOSFODNN7EXAMPLE`.

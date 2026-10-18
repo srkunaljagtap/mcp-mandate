@@ -28,8 +28,10 @@
 //! or redacted.
 
 pub mod jsonrpc;
+mod template;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use mcp_mandate_audit::{self as audit, MessageKind, Origin, Recorder};
 use mcp_mandate_pin::{Kind, Pins, Verdict, fingerprint};
@@ -39,6 +41,7 @@ use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
 use crate::jsonrpc::{Message, ParseError, classify};
+use crate::template::Template;
 
 /// JSON-RPC error code for requests the gate blocks (from the range
 /// JSON-RPC leaves to implementations).
@@ -88,6 +91,16 @@ impl From<String> for Refusal {
     }
 }
 
+/// Taint shared by every gate serving the same agent, so reading untrusted
+/// content through one server holds sending through all of them (each
+/// server normally has its own gate).
+pub trait SharedTaint: Send + Sync {
+    /// What tainted the agent's sessions, if anything has.
+    fn get(&self) -> Option<String>;
+    /// Records that `source` tainted them.
+    fn set(&self, source: &str);
+}
+
 /// One session's gate.
 pub struct Gate {
     policy: Policy,
@@ -95,7 +108,10 @@ pub struct Gate {
     secrets: SecretDetector,
     /// Client requests whose responses the gate inspects, by id.
     pending: HashMap<String, Pending>,
+    /// Server requests passed to the client, by id, with their method.
+    server_pending: HashMap<String, String>,
     session: Session,
+    shared_taint: Option<Arc<dyn SharedTaint>>,
     audit: Box<dyn Recorder>,
     /// The audit entry for the message being checked.
     event: audit::Event,
@@ -111,6 +127,8 @@ enum Pending {
     ToolCall(String),
     /// A resource read, whose content may taint the session.
     ResourceRead,
+    /// A prompt, whose messages may taint the session.
+    PromptGet,
     /// Any other request: its response only needs to be expected.
     Other(String),
 }
@@ -129,9 +147,8 @@ struct Session {
     tools: HashMap<String, ToolInfo>,
     prompts: HashSet<String>,
     resources: HashSet<String>,
-    /// Approved resource templates and the fixed URI prefix before their
-    /// first `{`.
-    templates: HashMap<String, String>,
+    /// Approved resource templates, ready to match URIs.
+    templates: HashMap<String, Template>,
     /// Items whose content no longer matches their pin.
     changed: HashSet<(Kind, String)>,
     /// What tainted the session, once something has. It stays tainted.
@@ -148,7 +165,7 @@ impl Session {
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"}));
                 let info = ToolInfo {
-                    validator: jsonschema::validator_for(&schema).ok(),
+                    validator: validator(&schema),
                     traits: Traits::of(item, labels),
                 };
                 self.tools.insert(name.to_owned(), info);
@@ -160,8 +177,8 @@ impl Session {
                 self.resources.insert(name.to_owned());
             }
             Kind::ResourceTemplate => {
-                let prefix = name.split('{').next().unwrap_or_default().to_owned();
-                self.templates.insert(name.to_owned(), prefix);
+                self.templates
+                    .insert(name.to_owned(), Template::parse(name));
             }
         }
     }
@@ -189,8 +206,18 @@ impl Session {
             || self
                 .templates
                 .values()
-                .any(|prefix| !prefix.is_empty() && uri.starts_with(prefix.as_str()))
+                .any(|template| template.matches(uri))
     }
+}
+
+/// A tool's input schema compiled for checking, with `pattern` keywords run
+/// by a linear-time regex engine (a backtracking one could be made to spin
+/// by a crafted schema). `None` when it can't be compiled.
+fn validator(schema: &Value) -> Option<jsonschema::Validator> {
+    jsonschema::options()
+        .with_pattern_options(jsonschema::PatternOptions::regex())
+        .build(schema)
+        .ok()
 }
 
 impl Gate {
@@ -211,16 +238,44 @@ impl Gate {
             policy,
             pins,
             pending: HashMap::new(),
+            server_pending: HashMap::new(),
             session: Session::default(),
+            shared_taint: None,
             audit,
             event: audit::Event::default(),
             more_changes: 0,
         }
     }
 
-    /// What tainted the session, if anything has.
-    pub fn taint(&self) -> Option<&str> {
-        self.session.taint.as_deref()
+    /// Shares taint with the other gates serving the same agent.
+    pub fn with_shared_taint(mut self, shared: Arc<dyn SharedTaint>) -> Self {
+        self.shared_taint = Some(shared);
+        self
+    }
+
+    /// Adds exact strings to treat as secrets, such as the credential the
+    /// gateway itself uses for this server: redacted if the server echoes
+    /// them, blocked if the client sends them. Strings shorter than 8
+    /// characters are ignored (they'd match ordinary text).
+    pub fn add_secret_literals<I: IntoIterator<Item = String>>(&mut self, literals: I) {
+        for literal in literals {
+            self.secrets.add_literal("gateway-credential", &literal);
+        }
+    }
+
+    /// Forgets a client request that will never be answered through the
+    /// gate (its transport failed), so it doesn't stay pending forever.
+    pub fn abandon(&mut self, id: &Value) {
+        self.pending.remove(&id_key(id));
+    }
+
+    /// What tainted the session, if anything has: here, or through another
+    /// gate serving the same agent.
+    pub fn taint(&self) -> Option<String> {
+        self.session
+            .taint
+            .clone()
+            .or_else(|| self.shared_taint.as_ref().and_then(|shared| shared.get()))
     }
 
     pub fn mode(&self) -> Mode {
@@ -233,10 +288,18 @@ impl Gate {
         self.begin(Origin::Client, frame, &message);
         let actions = match message {
             Ok(Message::Request { id, method }) => {
-                if self.pending.len() >= MAX_PENDING {
-                    let reason = "too many requests are waiting for the server".to_owned();
+                let refusal = if self.pending.contains_key(&id_key(&id)) {
+                    // Reusing an id still in flight would make the gate
+                    // attribute one request's answer to the other.
+                    Some("a request with this id is still waiting for its answer")
+                } else if self.pending.len() >= MAX_PENDING {
+                    Some("too many requests are waiting for the server")
+                } else {
+                    None
+                };
+                if let Some(reason) = refusal {
                     let reply = reply_for(&method);
-                    let actions = self.block_client(frame, &id, &method, reason, reply);
+                    let actions = self.block_client(frame, &id, &method, reason.to_owned(), reply);
                     return self.record(Origin::Client, frame, actions);
                 }
                 let actions = self.client_request(frame, &id, &method);
@@ -257,12 +320,52 @@ impl Gate {
                 }
                 to_server(frame)
             }
-            Ok(Message::Response { .. }) => to_server(frame),
+            Ok(Message::Response { id, .. }) => self.client_response(frame, &id),
             Ok(Message::Batch { len }) => self.batch(len, Action::ToServer(frame.to_vec())),
             Err(ParseError::Empty) => return Vec::new(),
             Err(error) => self.drop_line(&error, "client→server", frame),
         };
         self.record(Origin::Client, frame, actions)
+    }
+
+    /// The client's answer to a server request. It must answer a request
+    /// the gate passed on, and an answer to a sampling or elicitation
+    /// request (the model's or the user's words) mustn't carry a secret.
+    fn client_response(&mut self, frame: &[u8], id: &Value) -> Vec<Action> {
+        let Some(method) = self.server_pending.remove(&id_key(id)) else {
+            self.note_block(
+                "an answer to no request the server is waiting for",
+                audit::Verdict::Drop,
+            );
+            if self.observe() {
+                return to_server(frame);
+            }
+            warn!("dropped a client answer to no request the server is waiting for");
+            return Vec::new();
+        };
+        self.event.method = Some(method.clone());
+        let carries_words = matches!(
+            method.as_str(),
+            "sampling/createMessage" | "elicitation/create"
+        );
+        let secret = carries_words
+            .then(|| serde_json::from_slice::<Value>(frame).ok())
+            .flatten()
+            .and_then(|message| self.secret_in(&message));
+        let Some(kind) = secret else {
+            return to_server(frame);
+        };
+        let reason = format!(
+            "the answer to the server's `{method}` request contains what looks like a secret ({kind})"
+        );
+        self.note_block(&reason, audit::Verdict::Block);
+        if self.observe() {
+            warn!(%reason, "would block (observe mode)");
+            return to_server(frame);
+        }
+        warn!(%reason, "blocked");
+        let text = format!("Blocked by mcp-mandate: {reason}");
+        vec![Action::ToServer(encode(&rpc_error(id, &text)))]
     }
 
     /// Decides what happens to one message from the server, and records it.
@@ -274,7 +377,18 @@ impl Gate {
                 Some(pending) => self.server_response(frame, Some(pending)),
                 None => self.unexpected_response(frame),
             },
-            Ok(Message::Request { id, method }) => self.server_request(frame, &id, &method),
+            Ok(Message::Request { id, method }) => {
+                let actions = if self.server_pending.len() >= MAX_PENDING {
+                    let reason = "too many of its requests are waiting for the client".to_owned();
+                    self.block_server(frame, &id, &method, reason)
+                } else {
+                    self.server_request(frame, &id, &method)
+                };
+                if matches!(actions.as_slice(), [Action::ToClient(_)]) {
+                    self.server_pending.insert(id_key(&id), method);
+                }
+                actions
+            }
             Ok(Message::Notification { method }) => {
                 if method.ends_with("/list_changed") {
                     info!(%method, "the server says a list changed; the new list will be checked against the pins");
@@ -337,6 +451,18 @@ impl Gate {
             event
                 .changes
                 .push(format!("and {} more", self.more_changes));
+        }
+        // Names, URIs and reasons can quote what was blocked: a secret that
+        // got a request blocked mustn't end up in the log.
+        for text in event
+            .item
+            .iter_mut()
+            .chain(event.reason.iter_mut())
+            .chain(event.changes.iter_mut())
+        {
+            if let Some((redacted, _)) = self.secrets.redact_text(text) {
+                *text = redacted;
+            }
         }
         let Err(failure) = self.audit.record(&event) else {
             return actions;
@@ -423,7 +549,16 @@ impl Gate {
             "resources/read" | "resources/subscribe" | "resources/unsubscribe" => {
                 self.resource_request(frame, id, method)
             }
-            "ping" | "completion/complete" | "logging/setLevel" => to_server(frame),
+            "ping" | "logging/setLevel" => to_server(frame),
+            "completion/complete" => match self.secret_in(&params(frame)) {
+                Some(kind) => {
+                    let reason = format!(
+                        "the completion request contains what looks like a secret ({kind})"
+                    );
+                    self.block_client(frame, id, method, reason, Reply::Error)
+                }
+                None => to_server(frame),
+            },
             _ if self.policy.unknown_requests == Rule::Allow => to_server(frame),
             _ => {
                 let reason = format!("`{method}` isn't a request mcp-mandate knows how to check");
@@ -482,8 +617,8 @@ impl Gate {
             }
             Rule::Deny => return Err(format!("tool `{name}` is denied by policy").into()),
         }
-        if let Some(source) = &self.session.taint
-            && info.traits.sends_out
+        if info.traits.sends_out
+            && let Some(source) = self.taint()
         {
             return Err(format!(
                 "this session has read untrusted content ({source}) and tool `{name}` can send data out, so it needs your approval, and approvals aren't supported yet"
@@ -542,6 +677,9 @@ impl Gate {
                         "prompt `{name}`: its arguments contain what looks like a secret ({kind})"
                     )
                 } else {
+                    // Its messages are checked when they come back: what
+                    // a prompt returns isn't pinned, only its listing.
+                    self.pending.insert(id_key(id), Pending::PromptGet);
                     return to_server(frame);
                 }
             }
@@ -633,6 +771,7 @@ impl Gate {
                 self.event.item = Some(clip(tool, MAX_NAME));
             }
             Some(Pending::ResourceRead) => self.event.method = Some("resources/read".to_owned()),
+            Some(Pending::PromptGet) => self.event.method = Some("prompts/get".to_owned()),
             Some(Pending::Other(method)) => self.event.method = Some(method.clone()),
             None => {}
         }
@@ -652,6 +791,22 @@ impl Gate {
             warn!("dropped a server message: {reason}");
             return Vec::new();
         };
+        if let Some(Pending::List(method)) = &pending
+            && message.get("error").is_none()
+            && !expected_shape(method, &message)
+        {
+            // A lenient client could show what a malformed answer holds.
+            let reason = format!(
+                "the server's answer to `{method}` isn't shaped as MCP requires, so it can't be checked"
+            );
+            self.note_block(&reason, audit::Verdict::Drop);
+            if self.observe() {
+                warn!("would drop: {reason} (observe mode)");
+                return to_client(frame);
+            }
+            warn!("dropped: {reason}");
+            return Vec::new();
+        }
         let mut modified = match pending {
             Some(Pending::List(method)) => match method.as_str() {
                 "initialize" => self.check_initialize(&mut message),
@@ -681,6 +836,12 @@ impl Gate {
                 }
                 false
             }
+            Some(Pending::PromptGet) => {
+                if self.policy.taint.prompts_are_untrusted {
+                    self.mark_tainted("a prompt from the server".to_owned());
+                }
+                false
+            }
             Some(Pending::Other(_)) | None => false,
         };
         if redact {
@@ -695,11 +856,15 @@ impl Gate {
         }
     }
 
-    /// Taints the session (once; it stays tainted).
+    /// Taints the session (once; it stays tainted), and every other session
+    /// of the same agent.
     fn mark_tainted(&mut self, source: String) {
         if self.session.taint.is_none() {
             warn!(%source, "the session read untrusted content: tools that can send data out are now held");
             self.event.taint = Some(clip(&source, MAX_REASON));
+            if let Some(shared) = &self.shared_taint {
+                shared.set(&source);
+            }
             self.session.taint = Some(source);
         }
     }
@@ -708,7 +873,7 @@ impl Gate {
     /// them). Returns whether the message changed.
     fn redact(&mut self, message: &mut Value) -> bool {
         if self.observe() {
-            if let Some(kind) = self.secrets.find_in_json(message) {
+            if let Some(kind) = self.secrets.find_in_response(message) {
                 warn!(%kind, "would redact a secret from a server message (observe mode)");
                 self.note_change(format!("secrets redacted: {kind}"));
             }
@@ -748,9 +913,20 @@ impl Gate {
             .unwrap_or("unknown");
         self.event.item = Some(clip(&format!("{server} {server_version}"), MAX_NAME));
 
-        let Some(text) = result.get("instructions").and_then(Value::as_str) else {
-            return false;
+        let text = match result.get("instructions") {
+            None => return false,
+            Some(Value::String(text)) => text.clone(),
+            Some(_) => {
+                // Instructions that aren't text can't be checked against a pin.
+                self.note_change("the server's instructions removed: they aren't text".to_owned());
+                if self.observe() {
+                    return false;
+                }
+                result.remove("instructions");
+                return true;
+            }
         };
+        let text = text.as_str();
         let verdict = self
             .pins
             .as_ref()
@@ -1012,6 +1188,20 @@ fn describe(error: &dyn std::error::Error) -> String {
 
 fn to_server(frame: &[u8]) -> Vec<Action> {
     vec![Action::ToServer(frame.to_vec())]
+}
+
+/// Whether a successful answer to a list (or to `initialize`) has the shape
+/// MCP requires.
+fn expected_shape(method: &str, message: &Value) -> bool {
+    let result = &message["result"];
+    match method {
+        "initialize" => result.is_object(),
+        "tools/list" => result["tools"].is_array(),
+        "prompts/list" => result["prompts"].is_array(),
+        "resources/list" => result["resources"].is_array(),
+        "resources/templates/list" => result["resourceTemplates"].is_array(),
+        _ => true,
+    }
 }
 
 fn forwards_to_server(actions: &[Action]) -> bool {

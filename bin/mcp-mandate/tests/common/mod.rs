@@ -51,8 +51,18 @@ pub fn scripted_server(responses: &[&str]) -> (String, Vec<(String, String)>) {
 }
 
 pub fn start(args: &[&str], envs: &[(String, String)]) -> Child {
+    // Every process the tests start shares this test binary as its parent:
+    // each gets its own agent name, so their taint stays apart unless a
+    // test gives two of them the same one.
+    static NEXT_AGENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let agent = format!(
+        "test-{}-{}",
+        std::process::id(),
+        NEXT_AGENT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
     Command::new(env!("CARGO_BIN_EXE_mcp-mandate"))
         .args(args)
+        .env("MCP_MANDATE_AGENT", agent)
         .envs(envs.iter().map(|(key, value)| (key, value)))
         .env("MCP_MANDATE_LOG", "debug")
         .stdin(Stdio::piped())

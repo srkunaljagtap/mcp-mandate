@@ -132,6 +132,25 @@ pub fn scan(inventory: &Inventory) -> Vec<Finding> {
     findings
 }
 
+/// What to note when Claude's review was asked for but failed: a medium
+/// finding for every tool, so the draft holds them all. A server can make
+/// the review fail on purpose (huge or provoking definitions), and must not
+/// get a draft that quietly rests on the rule scan alone.
+pub fn review_failed(inventory: &Inventory) -> Vec<Finding> {
+    inventory
+        .tools
+        .iter()
+        .filter_map(|tool| Pins::item_name(Kind::Tool, tool))
+        .map(|name| Finding {
+            subject: Subject::tool(name),
+            severity: Severity::Medium,
+            check: "review-failed",
+            detail: "Claude's review was asked for but failed, so this tool wasn't reviewed"
+                .to_owned(),
+        })
+        .collect()
+}
+
 /// Compares what the server shows now with a pins file: anything the
 /// review covered but the gate wouldn't approve.
 pub fn compare_with_pins(inventory: &Inventory, pins: &Pins) -> Vec<Finding> {
@@ -318,6 +337,20 @@ mod tests {
             .into_iter()
             .map(|finding| (finding.check, finding.severity))
             .collect()
+    }
+
+    #[test]
+    fn a_failed_review_holds_every_tool() {
+        let local = json!({"readOnlyHint": true, "openWorldHint": false});
+        let mut quiet = tool("quiet", "Reads a note.");
+        quiet["annotations"] = local;
+        let inventory = Inventory {
+            tools: vec![quiet],
+            ..Inventory::default()
+        };
+        let findings = review_failed(&inventory);
+        let plans = crate::plan_tools(&inventory, &findings);
+        assert_eq!(plans[0].proposal, crate::draft::Proposal::Hold);
     }
 
     #[test]

@@ -123,15 +123,25 @@ pub async fn run(command: &ServerCommand, gate: Gate) -> Result<i32, ProxyError>
 
 /// Starts the server with piped stdin and stdout.
 fn start(command: &ServerCommand) -> Result<(ServerProcess, ChildStdin, ChildStdout), ProxyError> {
+    start_with(command, &[])
+}
+
+/// Starts the server without the environment variables named in `withheld`.
+fn start_with(
+    command: &ServerCommand,
+    withheld: &[&str],
+) -> Result<(ServerProcess, ChildStdin, ChildStdout), ProxyError> {
     let program = resolve(&command.program)?;
-    let mut server = ServerProcess::spawn(
-        Command::new(&program)
-            .args(&command.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()),
-    )
-    .map_err(|source| ProxyError::Spawn {
+    let mut builder = Command::new(&program);
+    builder
+        .args(&command.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    for name in withheld {
+        builder.env_remove(name);
+    }
+    let mut server = ServerProcess::spawn(&mut builder).map_err(|source| ProxyError::Spawn {
         program: command.program.to_string_lossy().into_owned(),
         source,
     })?;
@@ -322,7 +332,9 @@ fn log_reader(side: Side, result: Result<Result<u64, FrameError>, tokio::task::J
 /// (tools, prompts, resources, resource templates and its instructions),
 /// then stops it. This is what `mcp-mandate pin` records.
 pub async fn inventory(command: &ServerCommand) -> Result<Inventory, ProxyError> {
-    let (mut server, stdin, stdout) = start(command)?;
+    // The server is being reviewed, so not yet trusted: it doesn't get the
+    // Claude API key Scout may be using.
+    let (mut server, stdin, stdout) = start_with(command, &["ANTHROPIC_API_KEY"])?;
     info!(server = %command, pid = server.id(), "started MCP server to list what it offers");
     let mut client = InventoryClient {
         writer: stdin,

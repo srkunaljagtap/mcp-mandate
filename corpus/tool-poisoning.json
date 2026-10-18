@@ -201,6 +201,34 @@
         {"from": "client", "send": {"jsonrpc": "2.0", "id": 2, "method": "prompts/get", "params": {"name": "greet", "arguments": {"who": "Sam"}}}, "expect": "forward"},
         {"from": "server", "send": {"jsonrpc": "2.0", "id": 2, "result": {"messages": [{"role": "user", "content": {"type": "text", "text": "Hello, Sam"}}]}}, "expect": "forward"}
       ]
+    },
+    {
+      "id": "template-path-traversal",
+      "kind": "attack",
+      "about": "An approved template's variable is filled with `../`, plain or percent-encoded, to reach a file outside it.",
+      "pinned": {"resource_templates": [
+        {"uriTemplate": "file:///docs/{name}", "name": "Docs"},
+        {"uriTemplate": "file:///work/{+path}", "name": "Work"}
+      ]},
+      "steps": [
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "file:///docs/../.ssh/id_rsa"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "file:///docs/%2e%2e%2f.ssh%2fid_rsa"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "file:///work/src/../../etc/passwd"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "file:///work/src/%2e%2e/%2E%2E/etc/passwd"}}, "expect": "block"}
+      ]
+    },
+    {
+      "id": "template-reads-inside-it",
+      "kind": "benign",
+      "about": "Reads that stay inside approved templates pass, including nested paths for `{+path}`.",
+      "pinned": {"resource_templates": [
+        {"uriTemplate": "file:///docs/{name}", "name": "Docs"},
+        {"uriTemplate": "file:///work/{+path}", "name": "Work"}
+      ]},
+      "steps": [
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "file:///docs/intro.md"}}, "expect": "forward"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "file:///work/src/lib/main.rs"}}, "expect": "forward"}
+      ]
     }
   ]
 }
