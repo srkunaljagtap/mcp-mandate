@@ -126,6 +126,25 @@ recognizable shape in a plain argument isn't caught, so pass secrets to
 servers through environment variables instead. A remote server is named by
 its URL without its query, so a key in the URL's path is kept.
 
+**If the pins file already exists**, `pin` stops with "the pins file already
+exists; pass --force to replace it". That's on purpose: re-pinning trusts
+whatever the server shows now, so it would quietly accept a tool that has
+changed since you pinned it (a "rug pull").
+
+- Already pinned it? Skip this step and carry on.
+- Want to know whether the server has changed? Compare it with the existing
+  pins without overwriting anything. Scout's report flags whatever isn't
+  pinned or has changed:
+
+  ```sh
+  mcp-mandate scout --pins everything.pins.toml --out check.draft.toml -- npx -y @modelcontextprotocol/server-everything@1.0.0
+  ```
+
+  Scout won't overwrite an existing `check.draft.toml` either: pick a new
+  name, or delete the old one first.
+- Pass `--force` to `pin` only once you've read what changed and decided to
+  trust it.
+
 **2. Write a policy.** Start from [policies/example.toml](https://github.com/srkunaljagtap/mcp-mandate/blob/main/policies/example.toml).
 Keep the policy and pins files where neither the agent nor a server can
 write to them: whoever can edit them decides what the gate allows. A
