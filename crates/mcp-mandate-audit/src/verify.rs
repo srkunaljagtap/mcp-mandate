@@ -2,11 +2,13 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::hash::{BuildHasher, RandomState};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::log::MAX_LINE_BYTES;
 use crate::{GENESIS, unseal};
 
 /// What a log that verified contains.
@@ -70,11 +72,32 @@ pub fn verify(path: &Path, anchor: Option<&str>) -> Result<Report, VerifyError> 
         source,
     };
     let file = File::open(path).map_err(read_error)?;
-    // Waits out any write in progress, so the last line is whole.
+    // Waits out any write in progress, so the last line is whole. Writers
+    // only ever add whole lines after this length, so what's before it
+    // stays put: it's checked without holding writers up meanwhile.
     file.lock_shared().map_err(read_error)?;
-    let checked = check(BufReader::new(&file), anchor, &read_error);
+    let len = file.metadata().map(|metadata| metadata.len());
     let _ = file.unlock();
-    checked
+    let reader = SharedReads(&file).take(len.map_err(read_error)?);
+    check(
+        BufReader::with_capacity(64 * 1024, reader),
+        anchor,
+        &read_error,
+    )
+}
+
+/// Reads a log holding its shared lock only for each read. On Windows,
+/// where locks are enforced, a read while a writer holds its lock would
+/// fail.
+struct SharedReads<'a>(&'a File);
+
+impl Read for SharedReads<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.lock_shared()?;
+        let read = self.0.read(buf);
+        let _ = self.0.unlock();
+        read
+    }
 }
 
 /// Like [`verify`], for a log read from anywhere (a pipe, a download).
@@ -99,12 +122,19 @@ fn check(
         head: GENESIS.to_owned(),
         anchor_at: None,
     };
+    // Sessions are kept as hashes, and lines read only up to the longest
+    // the log writes: a file that isn't a log can't fill memory.
+    let hasher = RandomState::new();
     let mut sessions = HashSet::new();
     let mut open = HashSet::new();
     let mut line = Vec::new();
     loop {
         line.clear();
-        if reader.read_until(b'\n', &mut line).map_err(read_error)? == 0 {
+        let read = (&mut reader)
+            .take(MAX_LINE_BYTES as u64)
+            .read_until(b'\n', &mut line)
+            .map_err(read_error)?;
+        if read == 0 {
             break;
         }
         let number = report.entries + 1;
@@ -113,7 +143,11 @@ fn check(
             problem,
         };
         let Some(body) = line.strip_suffix(b"\n") else {
-            return Err(broken(Problem::Incomplete));
+            return Err(broken(if line.len() == MAX_LINE_BYTES {
+                Problem::NotAnEntry
+            } else {
+                Problem::Incomplete
+            }));
         };
         let sealed = unseal(body).map_err(broken)?;
         let field = |name: &str| sealed.fields.get(name).and_then(Value::as_str);
@@ -133,13 +167,14 @@ fn check(
             None => return Err(broken(Problem::NotAnEntry)),
         }
         if let Some(session) = field("session") {
-            sessions.insert(session.to_owned());
+            let session = hasher.hash_one(session);
+            sessions.insert(session);
             match field("event") {
                 Some("session-start") => {
-                    open.insert(session.to_owned());
+                    open.insert(session);
                 }
                 Some("session-end") => {
-                    open.remove(session);
+                    open.remove(&session);
                 }
                 _ => {}
             }
@@ -170,6 +205,7 @@ fn check(
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::log::tests::{message, temp_dir};
@@ -283,6 +319,61 @@ mod tests {
             verify(&path, Some(&head)),
             Err(VerifyError::AnchorMissing { .. })
         ));
+    }
+
+    #[test]
+    fn stops_reading_a_line_longer_than_any_entry() {
+        let endless = std::io::repeat(b'{').take(3 * MAX_LINE_BYTES as u64);
+        assert!(matches!(
+            verify_reader(BufReader::new(endless), None),
+            Err(VerifyError::Broken {
+                line: 1,
+                problem: Problem::NotAnEntry
+            })
+        ));
+    }
+
+    #[test]
+    fn writers_are_not_held_up_while_a_log_is_checked() {
+        // A log long enough that checking it takes a while.
+        let path = temp_dir("busy").join("audit.jsonl");
+        let mut lines = Vec::new();
+        let mut prev = GENESIS.to_owned();
+        for seq in 1..=20_000 {
+            let entry =
+                serde_json::json!({"seq": seq, "session": "s", "event": "message", "prev": prev});
+            let (line, hash) = crate::seal(serde_json::to_vec(&entry).unwrap());
+            lines.extend_from_slice(&line);
+            prev = hash;
+        }
+        std::fs::write(&path, &lines).unwrap();
+
+        let started = Instant::now();
+        let checking = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let from = started.elapsed();
+                let report = verify(&path, None);
+                (report, from, started.elapsed())
+            })
+        };
+        // A writer takes the lock whenever it can while the check runs.
+        let writer = File::open(&path).unwrap();
+        let mut locked_at = Vec::new();
+        while !checking.is_finished() {
+            if writer.try_lock().is_ok() {
+                locked_at.push(started.elapsed());
+                writer.unlock().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (report, from, to) = checking.join().unwrap();
+        assert_eq!(report.unwrap().entries, 20_000);
+        let middle = from + (to - from) / 4..to - (to - from) / 4;
+        assert!(
+            locked_at.iter().any(|at| middle.contains(at)),
+            "the writer never got the lock between {middle:?}: {locked_at:?}"
+        );
     }
 }
 

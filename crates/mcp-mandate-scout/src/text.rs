@@ -29,6 +29,23 @@ pub(crate) fn is_hidden(c: char) -> bool {
     )
 }
 
+/// The terminal control characters in `text`: escapes, backspace, a
+/// carriage return that doesn't end a line, and the like. A terminal acts
+/// on them instead of showing them, so they can hide or overwrite text for
+/// a person reading it while the model still reads it. Line breaks
+/// (CRLF included) and tabs don't count.
+pub(crate) fn control_characters(text: &str) -> Vec<char> {
+    let mut found = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let layout = c == '\n' || c == '\t' || (c == '\r' && chars.peek() == Some(&'\n'));
+        if c.is_control() && !layout {
+            found.push(c);
+        }
+    }
+    found
+}
+
 /// `text` made safe for a terminal or a one-line comment: control and
 /// hidden characters are shown as `\u{…}` escapes (a raw escape sequence
 /// could rewrite the screen), and anything past `max` characters is cut.
@@ -69,5 +86,14 @@ mod tests {
     #[test]
     fn ordinary_text_is_not_hidden() {
         assert!(!"Echoes the message — café, 日本語".chars().any(is_hidden));
+    }
+
+    #[test]
+    fn finds_terminal_controls_but_not_line_breaks() {
+        assert_eq!(
+            control_characters("a\u{1b}[8mb\u{9b}c\u{8}d\re"),
+            ['\u{1b}', '\u{9b}', '\u{8}', '\r']
+        );
+        assert!(control_characters("one\r\ntwo\nthree\tfour").is_empty());
     }
 }

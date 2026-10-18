@@ -151,10 +151,20 @@ fn wait_until_gone(pid: &str) -> bool {
     false
 }
 
-/// Starts a "server" that launches a background helper (a grandchild of
-/// mcp-mandate) and reports its pid through a file.
+/// Starts a "server" behind `mcp-mandate run` that launches a background
+/// helper (a grandchild of mcp-mandate) and reports its pid through a file.
 fn start_server_with_helper(test: &str, server_tail: &str) -> (Child, Option<ChildStdin>, String) {
     let policy = empty_policy(test);
+    start_with_helper(test, &["run", "--policy", &policy], server_tail)
+}
+
+/// The same for any mcp-mandate command (`args`, before `--`) that starts
+/// a server.
+fn start_with_helper(
+    test: &str,
+    args: &[&str],
+    server_tail: &str,
+) -> (Child, Option<ChildStdin>, String) {
     let pid_file =
         std::env::temp_dir().join(format!("mcp-mandate-{test}-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pid_file);
@@ -162,10 +172,12 @@ fn start_server_with_helper(test: &str, server_tail: &str) -> (Child, Option<Chi
         "sleep 300 & echo $! > '{}'; {server_tail}",
         pid_file.display()
     );
-    let mut child = start(
-        &["run", "--policy", &policy, "--", "sh", "-c", &script],
-        &[],
-    );
+    let args: Vec<&str> = args
+        .iter()
+        .copied()
+        .chain(["--", "sh", "-c", script.as_str()])
+        .collect();
+    let mut child = start(&args, &[]);
     let stdin = child.stdin.take();
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -199,6 +211,36 @@ fn sigterm_stops_the_server_and_everything_it_started() {
         wait_until_gone(&helper),
         "the server's helper process survived"
     );
+}
+
+#[test]
+fn sigterm_while_pinning_stops_the_server_and_everything_it_started() {
+    let out = std::env::temp_dir().join(format!(
+        "mcp-mandate-{}-interrupted.pins.toml",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&out);
+    // The server never answers, so `pin` is still waiting for it.
+    let (child, stdin, helper) = start_with_helper(
+        "pin-sigterm",
+        &["pin", "--out", &out.display().to_string()],
+        "sleep 300",
+    );
+    assert!(is_running(&helper));
+
+    let sent = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let done = finish(child, stdin);
+
+    assert_eq!(done.status.code(), Some(143), "stderr: {}", done.stderr);
+    assert!(
+        wait_until_gone(&helper),
+        "the server's helper process survived"
+    );
+    assert!(!out.exists(), "nothing was pinned");
 }
 
 #[test]

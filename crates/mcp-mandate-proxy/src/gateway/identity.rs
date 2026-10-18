@@ -59,6 +59,8 @@ pub struct Caller {
     pub subject: String,
     /// The OAuth client it was issued to (`azp` or `client_id`).
     pub client: Option<String>,
+    /// When the token expires (`exp`, seconds since the Unix epoch).
+    pub expires: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +96,7 @@ struct Claims {
     sub: String,
     azp: Option<String>,
     client_id: Option<String>,
+    exp: u64,
 }
 
 impl Identity {
@@ -148,6 +151,7 @@ impl Identity {
         Ok(Caller {
             subject: data.claims.sub,
             client: data.claims.azp.or(data.claims.client_id),
+            expires: data.claims.exp,
         })
     }
 

@@ -803,3 +803,190 @@ fn clips_long_names_and_refuses_long_ids() {
     assert_eq!(gate.from_client(&huge_id), Vec::new());
     assert_eq!(log.last().verdict, Some(audit::Verdict::Drop));
 }
+
+const GITHUB_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+#[test]
+fn redacts_audit_fields_before_clipping_them() {
+    let (mut gate, log) = gate_with_log(POLICY, Some(pins()));
+    // The token starts 222 bytes in, so clipping first would keep `ghp_`
+    // and 30 more characters: too short to be recognized, but enough to
+    // recover the token.
+    let uri = format!(
+        "test://docs/{}?token={GITHUB_TOKEN}",
+        "a".repeat(222 - "test://docs/?token=".len())
+    );
+    assert_eq!(uri.find("ghp_"), Some(222));
+    let reply =
+        only_to_client(&gate.from_client(&request(1, "resources/read", json!({"uri": uri}))));
+    assert_eq!(reply["error"]["code"], BLOCKED_ERROR_CODE);
+    let item = log.last().item.unwrap();
+    assert!(!item.contains("ghp_"), "{item}");
+    assert!(item.ends_with("[REDACTED: github-token]"), "{item}");
+
+    // Methods and string ids are redacted too.
+    gate.from_client(&line(
+        json!({"jsonrpc": "2.0", "id": GITHUB_TOKEN, "method": "ping"}),
+    ));
+    assert_eq!(log.last().id, Some(json!("[REDACTED: github-token]")));
+    gate.from_server(&line(
+        json!({"jsonrpc": "2.0", "method": format!("notifications/{GITHUB_TOKEN}")}),
+    ));
+    let recorded = serde_json::to_string(&log.events()).unwrap();
+    assert!(!recorded.contains("ghp_"), "{recorded}");
+}
+
+/// A gate that lets the server ask the client's model to write.
+fn sampling_gate() -> (Gate, Memory) {
+    gate_with_log(
+        &format!("{POLICY}\n[server_requests]\nsampling = \"allow\"\n"),
+        Some(pins()),
+    )
+}
+
+fn sampling_request(id: u64) -> Vec<u8> {
+    request(
+        id,
+        "sampling/createMessage",
+        json!({"messages": [], "maxTokens": 10}),
+    )
+}
+
+#[test]
+fn an_answer_the_gate_replaces_with_an_error_is_recorded_as_blocked() {
+    let (mut gate, log) = sampling_gate();
+    assert!(matches!(
+        gate.from_server(&sampling_request(7)).as_slice(),
+        [Action::ToClient(_)]
+    ));
+    let answer = response(
+        7,
+        json!({"role": "assistant", "model": "m", "content": {"type": "text", "text": GITHUB_TOKEN}}),
+    );
+    let actions = gate.from_client(&answer);
+    let [Action::ToServer(bytes)] = actions.as_slice() else {
+        panic!("expected an error to the server, got {actions:?}");
+    };
+    let error: Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(error["error"]["code"], BLOCKED_ERROR_CODE);
+
+    let event = log.last();
+    assert_eq!(event.verdict, Some(audit::Verdict::Block));
+    assert_eq!(event.forwarded_sha256, None);
+}
+
+#[test]
+fn a_server_request_cannot_reuse_an_id_still_in_flight() {
+    let (mut gate, _) = sampling_gate();
+    gate.from_server(&sampling_request(7));
+    let actions = gate.from_server(&request(7, "ping", json!({})));
+    let [Action::ToServer(bytes)] = actions.as_slice() else {
+        panic!("expected an error to the server, got {actions:?}");
+    };
+    let error: Value = serde_json::from_slice(bytes).unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("still waiting for its answer")
+    );
+
+    // So the answer is still checked as a sampling answer.
+    let answer = response(
+        7,
+        json!({"content": {"type": "text", "text": GITHUB_TOKEN}}),
+    );
+    let actions = gate.from_client(&answer);
+    assert!(
+        !matches!(actions.as_slice(), [Action::ToServer(bytes)] if *bytes == answer),
+        "the secret got through"
+    );
+}
+
+#[test]
+fn a_request_the_server_cancels_stops_waiting() {
+    let mut gate = gate(POLICY, Some(pins()));
+    let roots = request(5, "roots/list", json!({}));
+    assert_eq!(
+        gate.from_server(&roots),
+        vec![Action::ToClient(roots.clone())]
+    );
+    let cancel = line(
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 5}}),
+    );
+    assert_eq!(
+        gate.from_server(&cancel),
+        vec![Action::ToClient(cancel.clone())]
+    );
+    assert!(gate.server_pending.is_empty());
+
+    // A late answer is dropped, and the id can be used again.
+    assert_eq!(
+        gate.from_client(&response(5, json!({"roots": []}))),
+        Vec::new()
+    );
+    assert_eq!(
+        gate.from_server(&roots),
+        vec![Action::ToClient(roots.clone())]
+    );
+}
+
+#[test]
+fn server_requests_waiting_for_the_client_stay_bounded() {
+    // In observe mode too, where a refused request is still passed on.
+    let mut gate = gate(&format!("mode = \"observe\"\n{POLICY}"), Some(pins()));
+    for id in 0..MAX_PENDING {
+        gate.server_pending
+            .insert(id.to_string(), "ping".to_owned());
+    }
+    let ping = request(MAX_PENDING as u64, "ping", json!({}));
+    assert_eq!(
+        gate.from_server(&ping),
+        vec![Action::ToClient(ping.clone())]
+    );
+    assert_eq!(gate.server_pending.len(), MAX_PENDING);
+}
+
+#[test]
+fn a_request_the_audit_log_refuses_is_not_left_waiting() {
+    let (mut gate, log) = gate_with_log(POLICY, Some(pins()));
+    let roots = request(5, "roots/list", json!({}));
+    assert_eq!(
+        gate.from_server(&roots),
+        vec![Action::ToClient(roots.clone())]
+    );
+    let ping = request(5, "ping", json!({}));
+    assert_eq!(
+        gate.from_client(&ping),
+        vec![Action::ToServer(ping.clone())]
+    );
+
+    log.fail(true);
+    // Passed by the gate but refused for the log: nobody waits for them.
+    gate.from_server(&request(6, "roots/list", json!({})));
+    assert!(!gate.server_pending.contains_key("6"));
+    gate.from_client(&request(6, "ping", json!({})));
+    assert!(!gate.pending.contains_key("6"));
+    // Refused for reusing an id in flight: the requests waiting under it
+    // still are.
+    gate.from_server(&roots);
+    assert!(gate.server_pending.contains_key("5"));
+    gate.from_client(&ping);
+    assert!(gate.pending.contains_key("5"));
+}
+
+#[test]
+fn a_message_with_a_form_feed_around_it_is_dropped() {
+    // JSON doesn't allow one there, so the message can't be read in full,
+    // and so it can't be checked for secrets.
+    let mut gate = gate(POLICY, None);
+    let completion = request(
+        1,
+        "completion/complete",
+        json!({"argument": {"name": "token", "value": GITHUB_TOKEN}}),
+    );
+    let mut padded = b"\x0c".to_vec();
+    padded.extend_from_slice(&completion);
+    assert_eq!(gate.from_client(&padded), Vec::new());
+}

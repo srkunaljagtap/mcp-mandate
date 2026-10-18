@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use mcp_mandate_gate::{Action, Gate};
 use mcp_mandate_pin::Inventory;
+use mcp_mandate_taint::SecretDetector;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
@@ -31,35 +32,168 @@ use tracing::{debug, error, info, warn};
 
 use crate::framing::{FrameError, MAX_MESSAGE_BYTES, read_frame};
 use crate::inventory::{self, Rpc, result_of};
-use crate::process::{ServerProcess, Signals, TERM_GRACE};
+use crate::process::{ServerProcess, TERM_GRACE};
 
 /// How long a server gets to exit on its own after its input closes.
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// How long to keep delivering a server's last output after it stops.
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
-/// Messages queued per output before a reader waits for its writer.
-const QUEUE: usize = 256;
+/// Messages queued per output before a reader waits for its writer. Each
+/// can be up to [`MAX_MESSAGE_BYTES`], so this also bounds memory.
+const QUEUE: usize = 16;
+/// How long a reader waits for room in a full queue before giving up on a
+/// side that has stopped reading (a hung server, or an agent that's gone).
+const SEND_STALL: Duration = Duration::from_secs(300);
 /// How long `inventory` waits for a server to answer everything it's asked.
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The MCP server to run: a program and its arguments.
+///
+/// It displays as a label for people, in logs and in the files they keep
+/// (pins, Scout's draft). Arguments can carry passwords and tokens, so
+/// anything that looks like one is masked: a URL's user name, password,
+/// query and fragment, the value of a variable (`NAME=value`), of an option
+/// or header named like a secret (`--api-key`, `Authorization:`), and
+/// anything shaped like a known kind of key.
 #[derive(Debug, Clone)]
 pub struct ServerCommand {
     pub program: OsString,
     pub args: Vec<OsString>,
 }
 
+/// Shown in place of a value that may be secret.
+const MASK: &str = "***";
+
+/// Parts of a name (of an option, a variable or a header) that say its
+/// value is a secret.
+const SECRET_NAMES: [&str; 9] = [
+    "key",
+    "token",
+    "secret",
+    "pass",
+    "pwd",
+    "auth",
+    "credential",
+    "cookie",
+    "session",
+];
+
 impl fmt::Display for ServerCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secrets = SecretDetector::default();
         write!(f, "{}", self.program.to_string_lossy())?;
+        // Whether the next argument is the value of `--api-key` or such.
+        let mut secret_next = false;
         for arg in &self.args {
-            write!(f, " {}", arg.to_string_lossy())?;
+            let mut secret = std::mem::take(&mut secret_next);
+            // Word by word, for scripts passed to a shell (`sh -c "…"`) and
+            // values with spaces (`Authorization: Bearer …`). Once a word
+            // reveals a secret, the rest of the argument is masked, up to
+            // the next option.
+            let mut words = Vec::new();
+            for word in arg.to_string_lossy().split_whitespace() {
+                let (open, word, close) = unquote(word);
+                if word.starts_with('-') {
+                    secret = false;
+                }
+                let shown = if secret {
+                    MASK.to_owned()
+                } else {
+                    redact_word(word, &secrets)
+                };
+                words.push(format!("{open}{shown}{close}"));
+                secret_next = reveals_secret(word);
+                secret |= secret_next;
+            }
+            write!(f, " {}", words.join(" "))?;
         }
         Ok(())
     }
 }
 
+/// One word of an argument, with anything that may be a secret masked.
+fn redact_word(word: &str, secrets: &SecretDetector) -> String {
+    let shown = if let Some(url) = without_credentials(word) {
+        url
+    } else if let Some((name, separator, value)) = assignment(word)
+        && !value.is_empty()
+    {
+        // A variable's value may be anything; an option's or a header's
+        // is a secret when its name says so.
+        if (separator == '=' && !name.starts_with('-')) || secret_name(name) {
+            format!("{name}{separator}{MASK}")
+        } else {
+            format!("{name}{separator}{}", redact_word(value, secrets))
+        }
+    } else {
+        word.to_owned()
+    };
+    secrets
+        .redact_text(&shown)
+        .map_or(shown, |(redacted, _)| redacted)
+}
+
+/// Whether `word` names a secret whose value comes after it: an option
+/// such as `--api-key`, or `Authorization:` followed by a space.
+fn reveals_secret(word: &str) -> bool {
+    match assignment(word) {
+        Some((name, _, value)) => value.is_empty() && secret_name(name),
+        None => word.starts_with('-') && secret_name(word),
+    }
+}
+
+/// A URL without its user name and password, query and fragment.
+fn without_credentials(word: &str) -> Option<String> {
+    let (scheme, rest) = word.split_once("://")?;
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !is_scheme {
+        return None;
+    }
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let host = match authority.rfind('@') {
+        Some(at) => format!("{MASK}@{}", &authority[at + 1..]),
+        None => authority.to_owned(),
+    };
+    let path = &tail[..tail.find(['?', '#']).unwrap_or(tail.len())];
+    Some(format!("{scheme}://{host}{path}"))
+}
+
+/// Splits `--name=value`, `NAME=value` or `Name:value` at the separator
+/// that follows the name.
+fn assignment(word: &str) -> Option<(&str, char, &str)> {
+    let (name, rest) = word.split_at(word.find(['=', ':'])?);
+    let separator = if rest.starts_with('=') { '=' } else { ':' };
+    let value = &rest[1..];
+    let bare = name.trim_start_matches('-');
+    let option = bare.len() < name.len();
+    let valid = bare.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && bare
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        // An option's value follows `=`, and `pkg==1.2` is a version.
+        && !(option && separator == ':')
+        && !(separator == '=' && value.starts_with('='));
+    valid.then_some((name, separator, value))
+}
+
+fn secret_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SECRET_NAMES.iter().any(|part| name.contains(part))
+}
+
+/// Splits the quotes a shell script puts around a word from the word.
+fn unquote(word: &str) -> (&str, &str, &str) {
+    let quote = |c: char| c == '"' || c == '\'';
+    let start = word.len() - word.trim_start_matches(quote).len();
+    let end = start.max(word.trim_end_matches(quote).len());
+    (&word[..start], &word[start..end], &word[end..])
+}
+
 pub use crate::ProxyError;
+pub use crate::process::Signals;
 
 #[derive(Debug, Clone, Copy)]
 enum Side {
@@ -93,7 +227,9 @@ pub async fn run(command: &ServerCommand, gate: Gate) -> Result<i32, ProxyError>
     let (mut server, server_in, server_out) = start(command)?;
     info!(server = %command, pid = server.id(), "started MCP server");
 
-    let gate = Arc::new(Mutex::new(gate));
+    // Taken out when the session ends, so a reader still running then
+    // (stopping isn't instant) can't check or record anything after it.
+    let gate = Arc::new(Mutex::new(Some(gate)));
     let (to_client, client_queue) = mpsc::channel(QUEUE);
     let (to_server, server_queue) = mpsc::channel(QUEUE);
     let tasks = Tasks {
@@ -115,7 +251,9 @@ pub async fn run(command: &ServerCommand, gate: Gate) -> Result<i32, ProxyError>
         )),
     };
     let result = supervise(&mut server, &mut signals, tasks).await;
-    if let Ok(mut gate) = gate.lock() {
+    if let Ok(mut slot) = gate.lock()
+        && let Some(mut gate) = slot.take()
+    {
         gate.end_session(result.as_ref().ok().copied());
     }
     result
@@ -261,7 +399,7 @@ async fn deliver_remaining(tasks: &mut Tasks, server_reader_running: bool) {
 async fn read_side<R>(
     mut reader: R,
     side: Side,
-    gate: Arc<Mutex<Gate>>,
+    gate: Arc<Mutex<Option<Gate>>>,
     to_server: mpsc::Sender<Outgoing>,
     to_client: mpsc::Sender<Outgoing>,
 ) -> Result<u64, FrameError>
@@ -275,8 +413,12 @@ where
         let actions = {
             // A poisoned lock means a check panicked: stop rather than
             // carry on with a gate in an unknown state.
-            let Ok(mut gate) = gate.lock() else {
+            let Ok(mut slot) = gate.lock() else {
                 error!(%side, "the gate failed; closing the session");
+                return Ok(read);
+            };
+            // No gate: the session has ended.
+            let Some(gate) = slot.as_mut() else {
                 return Ok(read);
             };
             match side {
@@ -285,19 +427,31 @@ where
             }
         };
         for action in actions {
-            let (queue, bytes) = match action {
-                Action::ToServer(bytes) => (&to_server, bytes),
-                Action::ToClient(bytes) => (&to_client, bytes),
+            let (queue, peer, bytes) = match action {
+                Action::ToServer(bytes) => (&to_server, "the MCP server", bytes),
+                Action::ToClient(bytes) => (&to_client, "the client", bytes),
             };
-            if queue.send(Outgoing::Frame(bytes)).await.is_err() {
+            match timeout(SEND_STALL, queue.send(Outgoing::Frame(bytes))).await {
+                Ok(Ok(())) => {}
                 // That output is gone, so the session is ending.
-                return Ok(read);
+                Ok(Err(_)) => return Ok(read),
+                Err(_) => {
+                    return Err(FrameError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "{peer} hasn't read anything for {} seconds",
+                            SEND_STALL.as_secs()
+                        ),
+                    )));
+                }
             }
         }
     }
     if let Side::Client = side {
-        // The client hung up: close the server's input so it can exit.
-        let _ = to_server.send(Outgoing::Close).await;
+        // The client hung up: close the server's input so it can exit. If
+        // the server isn't reading (its queue is full), don't wait for it:
+        // it's given a grace period and then stopped.
+        let _ = to_server.try_send(Outgoing::Close);
     }
     Ok(read)
 }
@@ -331,7 +485,14 @@ fn log_reader(side: Side, result: Result<Result<u64, FrameError>, tokio::task::J
 /// Starts the server, does the MCP handshake, lists everything it offers
 /// (tools, prompts, resources, resource templates and its instructions),
 /// then stops it. This is what `mcp-mandate pin` records.
-pub async fn inventory(command: &ServerCommand) -> Result<Inventory, ProxyError> {
+///
+/// If `stop` finishes first (a stop signal, with the exit code that reports
+/// it), the server and everything it started are stopped, and the result
+/// is [`ProxyError::Interrupted`].
+pub async fn inventory(
+    command: &ServerCommand,
+    stop: impl Future<Output = i32>,
+) -> Result<Inventory, ProxyError> {
     // The server is being reviewed, so not yet trusted: it doesn't get the
     // Claude API key Scout may be using.
     let (mut server, stdin, stdout) = start_with(command, &["ANTHROPIC_API_KEY"])?;
@@ -342,8 +503,23 @@ pub async fn inventory(command: &ServerCommand) -> Result<Inventory, ProxyError>
         frame: Vec::new(),
         next_id: 0,
     };
-    let listed = timeout(INVENTORY_TIMEOUT, inventory::collect(&mut client)).await;
+    let listed = tokio::select! {
+        listed = timeout(INVENTORY_TIMEOUT, inventory::collect(&mut client)) => Ok(listed),
+        code = stop => Err(code),
+    };
     drop(client); // closes the server's input
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(code) => {
+            warn!(code, "received a stop signal; stopping the MCP server");
+            let status = server
+                .terminate(TERM_GRACE)
+                .await
+                .map_err(ProxyError::Wait)?;
+            info!(%status, "MCP server exited");
+            return Err(ProxyError::Interrupted(code));
+        }
+    };
     if timeout(EXIT_GRACE, server.wait()).await.is_err() {
         let _ = server.terminate(TERM_GRACE).await;
     }
@@ -453,10 +629,12 @@ mod tests {
 
     /// A gate for a server that was never pinned: protocol plumbing passes,
     /// every tool call is blocked.
-    fn unpinned_gate() -> Arc<Mutex<Gate>> {
+    fn unpinned_gate() -> Arc<Mutex<Option<Gate>>> {
         let policy = Policy::parse("", Path::new(".")).unwrap();
-        Arc::new(Mutex::new(Gate::new(policy, None, Box::new(Discard))))
+        Arc::new(Mutex::new(Some(Gate::new(policy, None, Box::new(Discard)))))
     }
+
+    const PING: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
 
     /// Feeds `input` to the client side; returns what was queued for the
     /// server and for the client.
@@ -535,12 +713,216 @@ mod tests {
         assert_eq!(output, b"{\"a\":1}\n");
     }
 
+    #[tokio::test]
+    async fn forwards_nothing_once_the_session_has_ended() {
+        let (to_server, mut server_queue) = mpsc::channel(16);
+        let (to_client, mut client_queue) = mpsc::channel(16);
+        let ended = Arc::new(Mutex::new(None));
+        read_side(
+            BufReader::new(PING),
+            Side::Client,
+            ended,
+            to_server,
+            to_client,
+        )
+        .await
+        .unwrap();
+        assert!(server_queue.try_recv().is_err());
+        assert!(client_queue.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_on_a_side_that_stopped_reading() {
+        // Room for one message, and nobody taking it.
+        let (to_server, _server_queue) = mpsc::channel(1);
+        let (to_client, _client_queue) = mpsc::channel(1);
+        let input = [
+            PING,
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
+        ]
+        .concat();
+        let reading = read_side(
+            BufReader::new(&input[..]),
+            Side::Client,
+            unpinned_gate(),
+            to_server,
+            to_client,
+        );
+        let error = timeout(SEND_STALL * 2, reading)
+            .await
+            .expect("the reader gave up")
+            .unwrap_err();
+        assert!(
+            matches!(&error, FrameError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_up_does_not_wait_for_a_server_that_stopped_reading() {
+        let (to_server, mut server_queue) = mpsc::channel(1);
+        let (to_client, _client_queue) = mpsc::channel(1);
+        let reading = read_side(
+            BufReader::new(PING),
+            Side::Client,
+            unpinned_gate(),
+            to_server,
+            to_client,
+        );
+        let read = timeout(Duration::from_secs(1), reading)
+            .await
+            .expect("the reader finished")
+            .unwrap();
+        assert_eq!(read, 1);
+        assert_eq!(
+            server_queue.try_recv().unwrap(),
+            Outgoing::Frame(PING.to_vec())
+        );
+    }
+
+    /// Whether a process with this id is running (a zombie, exited but not
+    /// yet reaped, counts as gone).
+    #[cfg(unix)]
+    fn alive(pid: &str) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_signal_while_listing_stops_the_server_and_what_it_started() {
+        let pid_file =
+            std::env::temp_dir().join(format!("mcp-mandate-{}-listing.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        // The server starts a helper, then never answers.
+        let command = ServerCommand {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("sleep 300 & echo $! > '{}'; sleep 300", pid_file.display()).into(),
+            ],
+        };
+        let helper = || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .map(|pid| pid.trim().to_owned())
+                .filter(|pid| !pid.is_empty())
+        };
+        // The signal arrives once the helper runs.
+        let stop = async {
+            while helper().is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            130
+        };
+
+        let listed = timeout(Duration::from_secs(30), inventory(&command, stop))
+            .await
+            .expect("listing stopped");
+        assert!(
+            matches!(listed, Err(ProxyError::Interrupted(130))),
+            "{listed:?}"
+        );
+        let helper = helper().unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        for _ in 0..50 {
+            if !alive(&helper) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("process {helper} outlived the server it was started by");
+    }
+
+    /// How a command shows in logs, pins files and Scout's draft.
+    fn shown(program: &str, args: &[&str]) -> String {
+        ServerCommand {
+            program: program.into(),
+            args: args.iter().map(OsString::from).collect(),
+        }
+        .to_string()
+    }
+
     #[test]
     fn displays_the_server_command() {
-        let command = ServerCommand {
-            program: "npx".into(),
-            args: vec!["-y".into(), "server".into()],
-        };
-        assert_eq!(command.to_string(), "npx -y server");
+        assert_eq!(shown("npx", &["-y", "server"]), "npx -y server");
+        assert_eq!(
+            shown(
+                "uvx",
+                &["mcp-server-git==0.6.2", "--repository", "/home/me/repo"]
+            ),
+            "uvx mcp-server-git==0.6.2 --repository /home/me/repo"
+        );
+        assert_eq!(
+            shown("node", &["C:\\servers\\index.js", "localhost:8080"]),
+            "node C:\\servers\\index.js localhost:8080"
+        );
+    }
+
+    #[test]
+    fn masks_what_looks_like_a_secret_in_the_server_command() {
+        assert_eq!(
+            shown(
+                "npx",
+                &[
+                    "-y",
+                    "@modelcontextprotocol/server-postgres",
+                    "postgresql://app:S3cret@db/prod?sslmode=require"
+                ]
+            ),
+            "npx -y @modelcontextprotocol/server-postgres postgresql://***@db/prod"
+        );
+        assert_eq!(
+            shown(
+                "server",
+                &["--api-key", "abc123", "--port", "8080", "--token=abc123"]
+            ),
+            "server --api-key *** --port 8080 --token=***"
+        );
+        assert_eq!(
+            shown(
+                "npx",
+                &[
+                    "mcp-remote",
+                    "https://example.com/sse?key=abc123#frag",
+                    "--header",
+                    "Authorization: Bearer abc123",
+                    "--url=https://user:pw@example.com/"
+                ]
+            ),
+            "npx mcp-remote https://example.com/sse --header Authorization: *** *** --url=https://***@example.com/"
+        );
+        assert_eq!(
+            shown(
+                "docker",
+                &[
+                    "run",
+                    "-i",
+                    "-e",
+                    "GITHUB_TOKEN",
+                    "-e",
+                    "TEAM=T123",
+                    "image"
+                ]
+            ),
+            "docker run -i -e GITHUB_TOKEN -e TEAM=*** image"
+        );
+        let token = format!("ghp_{}", "a1".repeat(18));
+        assert_eq!(
+            shown("server", &[&token]),
+            "server [REDACTED: github-token]"
+        );
+        assert_eq!(
+            shown(
+                "sh",
+                &["-c", "API_KEY=abc123 node server.js --token 'abc 123'"]
+            ),
+            "sh -c API_KEY=*** node server.js --token '*** ***'"
+        );
     }
 }

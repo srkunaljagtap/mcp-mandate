@@ -7,6 +7,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 /// instead of being buffered without limit.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Buffer space kept between messages. More, left over from a large
+/// message, is given back rather than held for the rest of the session.
+const KEPT_CAPACITY: usize = 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
     #[error("message is larger than {limit} bytes")]
@@ -28,6 +32,7 @@ where
     R: AsyncBufRead + Unpin,
 {
     buf.clear();
+    buf.shrink_to(KEPT_CAPACITY);
     loop {
         let (used, complete) = {
             let available = reader.fill_buf().await?;
@@ -80,6 +85,27 @@ mod tests {
     async fn refuses_frames_over_the_limit() {
         let error = frames(b"0123456789\n", 8).await.unwrap_err();
         assert!(matches!(error, FrameError::TooLarge { limit: 8 }));
+    }
+
+    #[tokio::test]
+    async fn gives_back_the_space_a_large_message_needed() {
+        let mut input = vec![b'x'; 4 * KEPT_CAPACITY];
+        input.extend_from_slice(b"\n{}\n");
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        let mut frame = Vec::new();
+        assert!(
+            read_frame(&mut reader, &mut frame, MAX_MESSAGE_BYTES)
+                .await
+                .unwrap()
+        );
+        assert_eq!(frame.len(), 4 * KEPT_CAPACITY + 1);
+        assert!(
+            read_frame(&mut reader, &mut frame, MAX_MESSAGE_BYTES)
+                .await
+                .unwrap()
+        );
+        assert_eq!(frame, b"{}\n");
+        assert!(frame.capacity() <= KEPT_CAPACITY, "{}", frame.capacity());
     }
 }
 

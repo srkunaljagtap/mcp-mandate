@@ -1107,6 +1107,7 @@ dependencies = [
  "mcp-mandate-gate",
  "mcp-mandate-pin",
  "mcp-mandate-policy",
+ "mcp-mandate-taint",
  "nix",
  "reqwest",
  "rustls-pki-types",

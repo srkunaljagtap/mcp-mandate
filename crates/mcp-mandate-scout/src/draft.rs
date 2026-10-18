@@ -47,31 +47,50 @@ pub struct ToolPlan {
 /// denies the tool; a medium one holds it.
 pub fn plan_tools(inventory: &Inventory, findings: &[Finding]) -> Vec<ToolPlan> {
     let mut listed: HashMap<&str, usize> = HashMap::new();
+    let mut twins: HashMap<String, usize> = HashMap::new();
     for tool in &inventory.tools {
         if let Some(name) = Pins::item_name(Kind::Tool, tool) {
             *listed.entry(name).or_default() += 1;
+            *twins.entry(as_on_windows(name)).or_default() += 1;
         }
     }
+    let about = by_subject(findings);
     let mut plans: Vec<ToolPlan> = inventory
         .tools
         .iter()
         .filter_map(|tool| {
             let name = Pins::item_name(Kind::Tool, tool)?;
             // Two definitions under one name: which one a client (or the
-            // pins file) keeps is unclear, so neither is trusted.
+            // pins file) keeps is unclear, so neither is trusted. Glob
+            // patterns read `\` differently across platforms (Windows reads
+            // it as `/`), so a name with one can't be matched exactly, and
+            // names that differ only in `/` and `\` can be one name to the
+            // gate: those are denied too.
             let (base, reach, open_world) = if listed[name] > 1 {
                 (
                     Proposal::Deny,
                     "is listed more than once under this name",
                     true,
                 )
+            } else if twins[&as_on_windows(name)] > 1 {
+                (
+                    Proposal::Deny,
+                    "has a twin whose name differs only in `/` and `\\`, which a policy on Windows can treat as one name",
+                    true,
+                )
+            } else if name.contains('\\') {
+                (
+                    Proposal::Deny,
+                    "has a `\\` in its name, which glob patterns read differently across platforms, so no rule names it exactly",
+                    true,
+                )
             } else {
                 by_annotations(tool)
             };
-            let subject = Subject::tool(name);
-            let flagged = findings
-                .iter()
-                .filter(|finding| finding.subject == subject)
+            let flagged = about
+                .get(&Subject::tool(name))
+                .into_iter()
+                .flatten()
                 .map(|finding| match finding.severity {
                     Severity::High => Proposal::Deny,
                     Severity::Medium => Proposal::Hold,
@@ -92,6 +111,21 @@ pub fn plan_tools(inventory: &Inventory, findings: &[Finding]) -> Vec<ToolPlan> 
     plans.sort_by(|a, b| a.name.cmp(&b.name));
     plans.dedup_by(|a, b| a.name == b.name);
     plans
+}
+
+/// The findings grouped by what they're about, so each tool's are found
+/// without going through all of them.
+fn by_subject(findings: &[Finding]) -> HashMap<&Subject, Vec<&Finding>> {
+    let mut about: HashMap<&Subject, Vec<&Finding>> = HashMap::new();
+    for finding in findings {
+        about.entry(&finding.subject).or_default().push(finding);
+    }
+    about
+}
+
+/// A tool name with each `\` read as `/`, as glob matching on Windows can.
+fn as_on_windows(name: &str) -> String {
+    name.replace('\\', "/")
 }
 
 /// Reads MCP's tool annotations, with the spec's defaults for what's left
@@ -137,6 +171,7 @@ impl Draft {
         pins: Option<&str>,
     ) -> Self {
         let tools = plan_tools(inventory, findings);
+        let about = by_subject(findings);
         let count = |severity| {
             findings
                 .iter()
@@ -177,8 +212,7 @@ impl Draft {
         text.push_str("\n[defaults]\ntools = \"deny\"\n");
         for plan in &tools {
             let _ = write!(text, "\n# {}: {}\n", printable(&plan.name, 80), plan.reach);
-            let subject = Subject::tool(&plan.name);
-            for finding in findings.iter().filter(|finding| finding.subject == subject) {
+            for finding in about.get(&Subject::tool(&plan.name)).into_iter().flatten() {
                 let _ = writeln!(
                     text,
                     "#   {} ({}): {}",
@@ -187,12 +221,13 @@ impl Draft {
                     printable(&finding.detail, 160)
                 );
             }
-            let Some(pattern) = literal_glob(&plan.name) else {
+            let pattern = literal_glob(&plan.name);
+            if plan.name.contains('\\') {
                 text.push_str(
-                    "# Its name can't be matched exactly, so it's left to the default (deny).\n",
+                    "# Each `\\` is matched with `?`, which also matches a `/` there (and any\n\
+                     # other character), so the rule can only deny.\n",
                 );
-                continue;
-            };
+            }
             let _ = write!(
                 text,
                 "[[tools]]\nmatch = {}\naction = \"{}\"\n",
@@ -236,13 +271,11 @@ impl Draft {
     }
 }
 
-/// A glob that matches exactly `name`: glob metacharacters are put in
-/// brackets. `None` for a name with a backslash, whose escaping differs
-/// between platforms.
-fn literal_glob(name: &str) -> Option<String> {
-    if name.contains('\\') {
-        return None;
-    }
+/// A glob that matches `name`: glob metacharacters are put in brackets, so
+/// it matches exactly. A `\`, which glob patterns read differently across
+/// platforms, becomes `?`: that matches it everywhere, but also a `/` (its
+/// twin on Windows) or any other character, so it's only fit for a deny.
+fn literal_glob(name: &str) -> String {
     let mut pattern = String::with_capacity(name.len());
     for c in name.chars() {
         match c {
@@ -251,10 +284,11 @@ fn literal_glob(name: &str) -> Option<String> {
                 pattern.push(c);
                 pattern.push(']');
             }
+            '\\' => pattern.push('?'),
             c => pattern.push(c),
         }
     }
-    Some(pattern)
+    pattern
 }
 
 /// `text` as a TOML basic string.
@@ -446,8 +480,64 @@ mod tests {
 
     #[test]
     fn literal_globs_escape_pattern_characters() {
-        assert_eq!(literal_glob("get*").as_deref(), Some("get[*]"));
-        assert_eq!(literal_glob("{a,b}").as_deref(), Some("[{]a,b[}]"));
-        assert_eq!(literal_glob("a\\b"), None);
+        assert_eq!(literal_glob("get*"), "get[*]");
+        assert_eq!(literal_glob("{a,b}"), "[{]a,b[}]");
+        assert_eq!(literal_glob("a\\b"), "a?b");
+    }
+
+    #[test]
+    fn names_with_a_backslash_and_their_slash_twins_are_denied() {
+        let local = json!({"readOnlyHint": true, "openWorldHint": false});
+        let tools = inventory(vec![
+            tool("notes/read", Some(local.clone())),
+            tool("notes\\read", Some(local.clone())),
+            tool("files\\list", Some(local.clone())),
+            tool("files/open", Some(local)),
+        ]);
+        let draft = Draft::new(&tools, &scan(&tools), "server", None);
+        let policy = Policy::parse(&draft.text, Path::new(".")).unwrap_or_else(|error| {
+            panic!("{error}:\n{}", draft.text);
+        });
+        // Where a policy reads `\` as `/` (Windows), an allow for one twin
+        // would also allow the other; the draft allows neither.
+        for name in ["notes/read", "notes\\read", "files\\list", "files/list"] {
+            assert_eq!(
+                policy.for_tool(name).action,
+                Action::Deny,
+                "{name}:\n{}",
+                draft.text
+            );
+        }
+        assert_eq!(policy.for_tool("files/open").action, Action::Allow);
+        assert_eq!(
+            (draft.count(Proposal::Allow), draft.count(Proposal::Deny)),
+            (1, 3)
+        );
+    }
+
+    #[test]
+    fn plans_a_large_server_without_comparing_every_tool_with_every_finding() {
+        let tools = inventory(
+            (0..50_000)
+                .map(|n| tool(&format!("t{n}"), Some(json!({"readOnlyHint": true}))))
+                .collect(),
+        );
+        let findings: Vec<Finding> = (0..50_000)
+            .map(|n| Finding {
+                subject: Subject::tool(&format!("t{n}")),
+                severity: Severity::Low,
+                check: "outside-address",
+                detail: "mentions an outside address".to_owned(),
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let draft = Draft::new(&tools, &findings, "server", None);
+        assert_eq!(draft.count(Proposal::Hold), 50_000);
+        // Comparing every pair would take minutes.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

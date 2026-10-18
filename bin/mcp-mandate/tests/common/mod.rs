@@ -60,9 +60,24 @@ pub fn start(args: &[&str], envs: &[(String, String)]) -> Child {
         std::process::id(),
         NEXT_AGENT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     );
-    Command::new(env!("CARGO_BIN_EXE_mcp-mandate"))
-        .args(args)
-        .env("MCP_MANDATE_AGENT", agent)
+    spawn(command(args).env("MCP_MANDATE_AGENT", agent), envs)
+}
+
+/// Like [`start`], but the agent is identified as it is by default: by the
+/// process that started mcp-mandate, which is this test binary for every
+/// process started this way.
+pub fn start_unnamed(args: &[&str], envs: &[(String, String)]) -> Child {
+    spawn(command(args).env_remove("MCP_MANDATE_AGENT"), envs)
+}
+
+fn command(args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-mandate"));
+    command.args(args).env("XDG_RUNTIME_DIR", runtime_dir());
+    command
+}
+
+fn spawn(command: &mut Command, envs: &[(String, String)]) -> Child {
+    command
         .envs(envs.iter().map(|(key, value)| (key, value)))
         .env("MCP_MANDATE_LOG", "debug")
         .stdin(Stdio::piped())
@@ -70,6 +85,12 @@ pub fn start(args: &[&str], envs: &[(String, String)]) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start mcp-mandate")
+}
+
+/// A runtime folder for the processes the tests start, so the taint they
+/// share stays out of the user's own.
+pub fn runtime_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("mcp-mandate-{}-runtime", std::process::id()))
 }
 
 /// Waits for the process (failing the test after 30 s instead of hanging),
@@ -130,7 +151,15 @@ pub struct Session {
 
 impl Session {
     pub fn start(args: &[&str], envs: &[(String, String)]) -> Self {
-        let mut child = start(args, envs);
+        Self::of(start(args, envs))
+    }
+
+    /// A session whose agent is identified by default (see [`start_unnamed`]).
+    pub fn start_unnamed(args: &[&str], envs: &[(String, String)]) -> Self {
+        Self::of(start_unnamed(args, envs))
+    }
+
+    fn of(mut child: Child) -> Self {
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().unwrap();
         let mut err = child.stderr.take().unwrap();
@@ -169,6 +198,11 @@ impl Session {
             .recv_timeout(Duration::from_secs(10))
             .expect("no message from mcp-mandate within 10 seconds");
         serde_json::from_str(&line).unwrap()
+    }
+
+    /// The `mcp-mandate` process's id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// Hangs up and waits for the process; returns its exit status and logs.

@@ -29,11 +29,16 @@
 //!
 //! When several rules match a tool, the most restrictive action wins
 //! (deny over hold over allow), so rule order never matters.
+//!
+//! A rule's `match` is a glob on the whole tool name (`*`, `?`, `[abc]`,
+//! `{a,b}`), case-sensitive. It means the same on every platform: `\` makes
+//! the next character literal (`run\*` matches only `run*`), and `/` and `\`
+//! in a name are ordinary characters.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobMatcher};
+use globset::GlobBuilder;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -232,7 +237,8 @@ struct ToolRuleFile {
 #[derive(Clone)]
 struct ToolRule {
     pattern: String,
-    matcher: GlobMatcher,
+    /// The glob, as a regex on the name's bytes.
+    matcher: regex::bytes::Regex,
     action: Option<Action>,
     max_argument_bytes: Option<usize>,
     no_shell_metacharacters: Vec<String>,
@@ -277,12 +283,22 @@ pub enum PolicyError {
         #[source]
         source: globset::Error,
     },
+    #[error("tool pattern `{pattern}` is too complex")]
+    PatternTooComplex {
+        pattern: String,
+        #[source]
+        source: regex::Error,
+    },
     #[error("secret pattern `{name}` isn't a valid regular expression")]
     SecretPattern {
         name: String,
         #[source]
         source: regex::Error,
     },
+    #[error(
+        "secret pattern `{name}` can match empty text, so it would match everywhere (every call blocked, every message filled with redaction markers)"
+    )]
+    SecretPatternMatchesEmpty { name: String },
 }
 
 /// What the policy says about one tool.
@@ -316,8 +332,16 @@ impl Policy {
             path: path.to_owned(),
             source,
         })?;
+        Self::parse_file(&text, path)
+    }
+
+    /// Parses the text of the policy file at `path`, as [`load`](Self::load)
+    /// does once it has read it: relative paths resolve against its folder,
+    /// and errors name it. For callers that also hash the text: the hash
+    /// then describes exactly the policy in force.
+    pub fn parse_file(text: &str, path: &Path) -> Result<Self, PolicyError> {
         let base = path.parent().unwrap_or(Path::new("."));
-        Self::parse_with(&text, base, default_audit_log(path)).map_err(|error| match error {
+        Self::parse_with(text, base, default_audit_log(path)).map_err(|error| match error {
             PolicyError::Parse { source, .. } => PolicyError::Parse {
                 path: path.to_owned(),
                 source,
@@ -342,15 +366,9 @@ impl Policy {
             .tools
             .into_iter()
             .map(|rule| {
-                let matcher = Glob::new(&rule.pattern)
-                    .map_err(|source| PolicyError::Pattern {
-                        pattern: rule.pattern.clone(),
-                        source,
-                    })?
-                    .compile_matcher();
                 Ok(ToolRule {
+                    matcher: tool_matcher(&rule.pattern)?,
                     pattern: rule.pattern,
-                    matcher,
                     action: rule.action,
                     max_argument_bytes: rule.max_argument_bytes,
                     no_shell_metacharacters: rule.no_shell_metacharacters,
@@ -371,6 +389,9 @@ impl Policy {
                         source,
                     }
                 })?;
+                if matches_empty(&regex) {
+                    return Err(PolicyError::SecretPatternMatchesEmpty { name: pattern.name });
+                }
                 Ok((pattern.name, regex))
             })
             .collect::<Result<_, PolicyError>>()?;
@@ -404,7 +425,11 @@ impl Policy {
             matched: Vec::new(),
         };
         let mut allow_secrets: Option<bool> = None;
-        for rule in self.rules.iter().filter(|rule| rule.matcher.is_match(tool)) {
+        for rule in self
+            .rules
+            .iter()
+            .filter(|rule| rule.matcher.is_match(tool.as_bytes()))
+        {
             decision.matched.push(rule.pattern.clone());
             if let Some(rule_action) = rule.action {
                 action = Some(action.map_or(rule_action, |current| current.max(rule_action)));
@@ -453,6 +478,37 @@ impl ToolDecision {
         }
         Ok(())
     }
+}
+
+/// Compiles a rule's glob. globset's own matcher would treat the name as a
+/// path, and on Windows read `\` (in the glob and in the name) as `/`; its
+/// regex, run on the name's bytes, means the same everywhere.
+fn tool_matcher(pattern: &str) -> Result<regex::bytes::Regex, PolicyError> {
+    let glob = GlobBuilder::new(pattern)
+        .backslash_escape(true)
+        .literal_separator(false)
+        .build()
+        .map_err(|source| PolicyError::Pattern {
+            pattern: pattern.to_owned(),
+            source,
+        })?;
+    // As globset compiles it: `*` and `?` match newlines too.
+    regex::bytes::RegexBuilder::new(glob.regex())
+        .dot_matches_new_line(true)
+        .build()
+        .map_err(|source| PolicyError::PatternTooComplex {
+            pattern: pattern.to_owned(),
+            source,
+        })
+}
+
+/// Whether `regex` can match empty text (as `token|`, `[a-z]*` or `\b`
+/// do), tried on empty text and on text with word and line boundaries.
+/// Such a pattern would match everywhere.
+fn matches_empty(regex: &regex::Regex) -> bool {
+    ["", " ", "a", "a b", "a1_-. é\n\r\nz"]
+        .iter()
+        .any(|text| regex.find_iter(text).any(|found| found.is_empty()))
 }
 
 /// The first shell metacharacter in any string inside `value`.
@@ -544,6 +600,55 @@ mod tests {
     }
 
     #[test]
+    fn rejects_secret_patterns_that_match_empty_text() {
+        for regex in [
+            "token|",
+            "[a-z]*",
+            r"\S*",
+            "[A-Z0-9]{0,40}",
+            r"\b",
+            r"\b[a-z]*\b",
+            "(?m)^",
+        ] {
+            let text = format!(
+                "[[secrets.patterns]]\nname = \"typo\"\nregex = {}\n",
+                toml::Value::String(regex.to_owned())
+            );
+            assert!(
+                matches!(
+                    Policy::parse(&text, Path::new(".")),
+                    Err(PolicyError::SecretPatternMatchesEmpty { .. })
+                ),
+                "accepted {regex}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_globs_mean_the_same_on_every_platform() {
+        let policy = policy(
+            r#"
+            [[tools]]
+            match = 'run\*'
+            action = "allow"
+
+            [[tools]]
+            match = "admin/*"
+            action = "deny"
+
+            [[tools]]
+            match = "Echo"
+            action = "allow"
+            "#,
+        );
+        assert_eq!(policy.for_tool("run*").matched, [r"run\*"]);
+        assert!(policy.for_tool("runx").matched.is_empty());
+        assert_eq!(policy.for_tool("admin/x/y").matched, ["admin/*"]);
+        assert!(policy.for_tool(r"admin\x").matched.is_empty());
+        assert!(policy.for_tool("echo").matched.is_empty(), "case-sensitive");
+    }
+
+    #[test]
     fn resolves_pins_next_to_the_policy() {
         let policy = policy("pins = \"server.pins.toml\"");
         assert_eq!(
@@ -575,6 +680,24 @@ mod tests {
             dir.join("logs/audit.jsonl")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_text_already_read_as_if_loaded_from_its_file() {
+        let file = Path::new("/policies/server.policy.toml");
+        let policy = Policy::parse_file("pins = \"server.pins.toml\"", file).unwrap();
+        assert_eq!(
+            policy.pins,
+            Some(PathBuf::from("/policies/server.pins.toml"))
+        );
+        assert_eq!(
+            policy.audit_log,
+            PathBuf::from("/policies/server.policy.audit.jsonl")
+        );
+        let Err(error) = Policy::parse_file("mode = ", file) else {
+            panic!("expected a parse error");
+        };
+        assert!(error.to_string().contains("server.policy.toml"), "{error}");
     }
 
     #[test]

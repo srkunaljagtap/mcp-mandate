@@ -39,6 +39,11 @@ impl Secret {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    #[cfg(test)]
+    pub(super) fn new(value: &str) -> Self {
+        Self(value.to_owned())
+    }
 }
 
 impl fmt::Debug for Secret {
@@ -379,21 +384,39 @@ fn check_server(
     }
     let url = safe_url(&format!("servers.{name}.url"), &server.url)?;
     let policy_path = base.join(&server.policy);
-    let policy = Policy::load(&policy_path).map_err(|source| ConfigError::Policy {
+    // Each file is read once, and what's parsed is what's hashed for the
+    // audit log, so the hashes describe exactly what the gate enforces.
+    let policy_error = |source: PolicyError| ConfigError::Policy {
         server: name.to_owned(),
         source: Box::new(source),
+    };
+    let policy_text = std::fs::read_to_string(&policy_path).map_err(|source| {
+        policy_error(PolicyError::Read {
+            path: policy_path.clone(),
+            source,
+        })
     })?;
-    let pins = match pinned {
-        Pinned::Load => policy
-            .pins
-            .as_deref()
-            .map(Pins::load)
-            .transpose()
-            .map_err(|source| ConfigError::Pins {
+    let policy = Policy::parse_file(&policy_text, &policy_path).map_err(policy_error)?;
+    let policy_sha256 = Some(mcp_mandate_audit::sha256_hex(policy_text.as_bytes()));
+    let (pins, pins_sha256) = match (pinned, policy.pins.as_deref()) {
+        (Pinned::Load, Some(path)) => {
+            let pins_error = |source: PinsError| ConfigError::Pins {
                 server: name.to_owned(),
                 source: Box::new(source),
-            })?,
-        Pinned::Skip => None,
+            };
+            let text = std::fs::read_to_string(path).map_err(|source| {
+                pins_error(PinsError::Read {
+                    path: path.to_owned(),
+                    source,
+                })
+            })?;
+            let pins = Pins::parse(&text, path).map_err(pins_error)?;
+            (
+                Some(pins),
+                Some(mcp_mandate_audit::sha256_hex(text.as_bytes())),
+            )
+        }
+        _ => (None, None),
     };
     let secret = |variable: Option<String>, file: Option<PathBuf>, what: &str| {
         read_secret(name, what, variable, file.map(|file| base.join(file)), env)
@@ -441,16 +464,10 @@ fn check_server(
             resource: resource.unwrap_or_else(|| url.as_str().to_owned()),
         },
     };
-    let hash = |path: &Path| {
-        std::fs::read(path)
-            .ok()
-            .map(|bytes| mcp_mandate_audit::sha256_hex(&bytes))
-    };
-    let pins_sha256 = policy.pins.as_deref().and_then(hash);
     Ok(ServerConfig {
         name: name.to_owned(),
         url,
-        policy_sha256: hash(&policy_path),
+        policy_sha256,
         policy_path,
         policy,
         pins,
@@ -599,6 +616,16 @@ auth = { type = "bearer", token_env = "TOKEN" }
             "secrets stay out of Debug"
         );
         assert!(!config.identity.algorithms.contains(&Algorithm::HS256));
+    }
+
+    #[test]
+    fn records_the_hash_of_the_policy_it_parsed() {
+        let top = "listen = \"127.0.0.1:8080\"\npublic_url = \"http://localhost:8080\"";
+        let config = check(&config(top)).unwrap();
+        let server = &config.servers["github"];
+        let empty = mcp_mandate_audit::sha256_hex(b"");
+        assert_eq!(server.policy_sha256.as_deref(), Some(empty.as_str()));
+        assert_eq!(server.pins_sha256, None, "the policy names no pins file");
     }
 
     #[test]

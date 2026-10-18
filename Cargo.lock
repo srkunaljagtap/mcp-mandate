@@ -1290,6 +1290,7 @@ dependencies = [
  "mcp-mandate-gate",
  "mcp-mandate-pin",
  "mcp-mandate-policy",
+ "mcp-mandate-taint",
  "nix",
  "proptest",
  "rcgen",

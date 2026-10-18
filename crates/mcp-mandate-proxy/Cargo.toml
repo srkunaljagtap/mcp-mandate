@@ -18,6 +18,7 @@ mcp-mandate-audit.workspace = true
 mcp-mandate-gate.workspace = true
 mcp-mandate-pin.workspace = true
 mcp-mandate-policy.workspace = true
+mcp-mandate-taint.workspace = true
 reqwest.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true

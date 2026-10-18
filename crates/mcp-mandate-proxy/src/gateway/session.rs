@@ -3,30 +3,43 @@
 //! gateway's session id to the server's.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mcp_mandate_gate::{Gate, SharedTaint};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use super::identity::Caller;
 
 /// Most sessions open at once, in all and per caller.
 const MAX_SESSIONS: usize = 10_000;
 const MAX_SESSIONS_PER_CALLER: usize = 32;
+/// Most requests in flight at once per session. A request answered with a
+/// stream counts until the stream ends.
+const MAX_REQUESTS_PER_SESSION: usize = 16;
 /// Most server streams (GET) open at once per session.
 const MAX_STREAMS_PER_SESSION: usize = 4;
+/// Most answers to the server's own requests being sent at once per
+/// session.
+const MAX_ANSWERS_PER_SESSION: usize = 8;
 
 pub struct Session {
     /// The id the client sees: random, and never the server's own.
     pub id: String,
     pub server: String,
     pub caller: Caller,
-    gate: Mutex<Gate>,
+    /// An async lock, so a check waiting its turn doesn't hold a thread.
+    gate: Arc<tokio::sync::Mutex<Gate>>,
     upstream_id: Mutex<Option<String>>,
     last_used: Mutex<Instant>,
-    /// Server streams (GET) open now.
-    streams: Arc<AtomicUsize>,
+    /// Set once the session is closed: nothing passes through it after.
+    closed: watch::Sender<bool>,
+    /// A check panicked, so the gate may be half-updated.
+    broken: AtomicBool,
+    requests: Arc<Semaphore>,
+    streams: Arc<Semaphore>,
+    answers: Arc<Semaphore>,
 }
 
 impl Session {
@@ -35,25 +48,82 @@ impl Session {
             id: new_id(),
             server: server.to_owned(),
             caller,
-            gate: Mutex::new(gate),
+            gate: Arc::new(tokio::sync::Mutex::new(gate)),
             upstream_id: Mutex::new(None),
             last_used: Mutex::new(Instant::now()),
-            streams: Arc::new(AtomicUsize::new(0)),
+            closed: watch::Sender::new(false),
+            broken: AtomicBool::new(false),
+            requests: Arc::new(Semaphore::new(MAX_REQUESTS_PER_SESSION)),
+            streams: Arc::new(Semaphore::new(MAX_STREAMS_PER_SESSION)),
+            answers: Arc::new(Semaphore::new(MAX_ANSWERS_PER_SESSION)),
         }
     }
 
-    /// Runs `check` with the session's gate. `None` if a check panicked
-    /// earlier: the session is then unusable.
-    pub fn with_gate<T>(&self, check: impl FnOnce(&mut Gate) -> T) -> Option<T> {
-        self.gate.lock().ok().map(|mut gate| check(&mut gate))
+    /// Runs `check` with the session's gate, on a thread where blocking is
+    /// fine: a check takes CPU time, and writes the audit log, which may
+    /// wait for a lock. `None` once the session is closed, or if a check
+    /// panicked: the session is then unusable.
+    pub async fn check<T: Send + 'static>(
+        &self,
+        check: impl FnOnce(&mut Gate) -> T + Send + 'static,
+    ) -> Option<T> {
+        if self.unusable() {
+            return None;
+        }
+        let mut gate = Arc::clone(&self.gate).lock_owned().await;
+        // Closed while waiting its turn: its end is recorded, so nothing
+        // more is.
+        if self.unusable() {
+            return None;
+        }
+        match tokio::task::spawn_blocking(move || check(&mut gate)).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                self.broken.store(true, Ordering::SeqCst);
+                None
+            }
+        }
+    }
+
+    fn unusable(&self) -> bool {
+        *self.closed.borrow() || self.broken.load(Ordering::SeqCst)
+    }
+
+    /// Closes the session: nothing passes through it from now on, and its
+    /// streams stop. Returns whether this call closed it; whoever did then
+    /// [records its end](Self::record_end).
+    pub fn close(&self) -> bool {
+        !self.closed.send_replace(true)
+    }
+
+    /// Completes once the session is closed.
+    pub async fn closed(&self) {
+        let mut closed = self.closed.subscribe();
+        let _ = closed.wait_for(|closed| *closed).await;
+    }
+
+    /// Records the end of the session in its audit log, once any check
+    /// under way is done.
+    pub async fn record_end(&self) {
+        let mut gate = Arc::clone(&self.gate).lock_owned().await;
+        let _ = tokio::task::spawn_blocking(move || gate.end_session(None)).await;
+    }
+
+    /// Counts a request in flight; `None` when the session has too many.
+    /// It's uncounted when the returned permit drops.
+    pub fn start_request(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.requests).try_acquire_owned().ok()
     }
 
     /// Counts a new server stream; `None` when the session has too many.
-    /// The stream is uncounted when the returned guard drops.
-    pub fn open_stream(&self) -> Option<StreamGuard> {
-        let open = self.streams.fetch_add(1, Ordering::SeqCst);
-        let guard = StreamGuard(Arc::clone(&self.streams));
-        (open < MAX_STREAMS_PER_SESSION).then_some(guard)
+    pub fn open_stream(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.streams).try_acquire_owned().ok()
+    }
+
+    /// Counts an answer being sent to the server; `None` when the session
+    /// has too many.
+    pub fn start_answer(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.answers).try_acquire_owned().ok()
     }
 
     pub fn upstream_id(&self) -> Option<String> {
@@ -76,11 +146,6 @@ impl Session {
         self.last_used
             .lock()
             .map_or(Duration::MAX, |last_used| last_used.elapsed())
-    }
-
-    /// Records the end of the session in its audit log.
-    pub fn end(&self) {
-        self.with_gate(|gate| gate.end_session(None));
     }
 }
 
@@ -160,15 +225,6 @@ fn new_id() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Keeps a session's server stream counted while it's open.
-pub struct StreamGuard(Arc<AtomicUsize>);
-
-impl Drop for StreamGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// Taint per caller, shared by all their sessions on every server: reading
 /// through one server holds sending through any other. A caller's taint is
 /// forgotten once they have no session open.
@@ -220,27 +276,37 @@ impl SharedTaint for CallerTaint {
 mod tests {
     use std::path::Path;
 
-    use mcp_mandate_audit::{AuditError, Event, Recorder};
+    use std::sync::atomic::AtomicUsize;
+
+    use mcp_mandate_audit::{AuditError, Event, EventKind, Recorder};
     use mcp_mandate_policy::Policy;
 
     use super::*;
 
-    /// An audit log that keeps nothing.
-    struct Discard;
+    /// An audit log that only counts session ends.
+    struct Ends(Arc<AtomicUsize>);
 
-    impl Recorder for Discard {
-        fn record(&mut self, _: &Event) -> Result<(), AuditError> {
+    impl Recorder for Ends {
+        fn record(&mut self, event: &Event) -> Result<(), AuditError> {
+            if event.event == EventKind::SessionEnd {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         }
     }
 
     fn session(caller: &str) -> Arc<Session> {
+        session_counting_ends(caller, &Arc::default())
+    }
+
+    fn session_counting_ends(caller: &str, ends: &Arc<AtomicUsize>) -> Arc<Session> {
         let policy = Policy::parse("", Path::new(".")).unwrap();
         let caller = Caller {
             subject: caller.to_owned(),
             client: None,
+            expires: u64::MAX,
         };
-        let gate = Gate::new(policy, None, Box::new(Discard));
+        let gate = Gate::new(policy, None, Box::new(Ends(Arc::clone(ends))));
         Arc::new(Session::new("alpha", caller, gate))
     }
 
@@ -254,15 +320,50 @@ mod tests {
         sessions.insert(session("bob")).unwrap();
     }
 
+    type Start = fn(&Session) -> Option<OwnedSemaphorePermit>;
+
     #[test]
-    fn a_session_has_a_stream_limit() {
+    fn a_session_has_limits_on_streams_requests_and_answers() {
         let session = session("alice");
-        let open: Vec<StreamGuard> = (0..MAX_STREAMS_PER_SESSION)
-            .map(|_| session.open_stream().unwrap())
-            .collect();
-        assert!(session.open_stream().is_none());
-        drop(open);
-        assert!(session.open_stream().is_some());
+        let limits: [(Start, usize); 3] = [
+            (Session::open_stream, MAX_STREAMS_PER_SESSION),
+            (Session::start_request, MAX_REQUESTS_PER_SESSION),
+            (Session::start_answer, MAX_ANSWERS_PER_SESSION),
+        ];
+        for (start, limit) in limits {
+            let open: Vec<OwnedSemaphorePermit> =
+                (0..limit).map(|_| start(&session).unwrap()).collect();
+            assert!(start(&session).is_none());
+            drop(open);
+            assert!(start(&session).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_closes_once_and_nothing_passes_through_it_after() {
+        let ends = Arc::default();
+        let session = session_counting_ends("alice", &ends);
+        assert_eq!(session.check(|gate| gate.taint()).await, Some(None));
+        let waiting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.closed().await }
+        });
+        assert!(session.close());
+        assert!(!session.close(), "closed already");
+        session.record_end().await;
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+        assert_eq!(session.check(|gate| gate.taint()).await, None);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("its streams were told")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_check_that_panics_leaves_the_session_unusable() {
+        let session = session("alice");
+        assert_eq!(session.check(|_| panic!("a bug")).await, None::<()>);
+        assert_eq!(session.check(|gate| gate.taint()).await, None);
     }
 
     #[test]

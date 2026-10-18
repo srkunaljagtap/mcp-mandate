@@ -1,0 +1,6 @@
+# Windows builds link the C runtime statically, so mcp-mandate.exe runs on
+# machines without the Visual C++ redistributable (VCRUNTIME140.dll). Set
+# here rather than in the release workflow, so CI builds and tests exactly
+# what is released.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

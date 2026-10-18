@@ -4,7 +4,6 @@
 
 use mcp_mandate_pin::Inventory;
 use serde_json::{Value, json};
-use tracing::warn;
 
 use crate::ProxyError;
 
@@ -14,6 +13,10 @@ pub(crate) const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Most pages read from one list before giving up.
 const MAX_PAGES: usize = 100;
+/// Most items one list may hold. Far more than any honest server offers;
+/// a hostile one could otherwise fill memory, and make the review that
+/// follows crawl.
+const MAX_ITEMS: usize = 10_000;
 
 /// A way to send requests to an MCP server.
 pub(crate) trait Rpc {
@@ -66,8 +69,14 @@ pub(crate) async fn collect(rpc: &mut impl Rpc) -> Result<Inventory, ProxyError>
     Ok(inventory)
 }
 
-/// Calls a list method, following `nextCursor` across pages.
+/// Calls a list method, following `nextCursor` across pages. A list too
+/// long to read whole is an error: a partial one would pin or review only
+/// some of what the server offers.
 async fn list_all(rpc: &mut impl Rpc, method: &str, field: &str) -> Result<Vec<Value>, ProxyError> {
+    let too_long = |limit: String| ProxyError::TooLong {
+        method: method.to_owned(),
+        limit,
+    };
     let mut items = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_PAGES {
@@ -75,21 +84,19 @@ async fn list_all(rpc: &mut impl Rpc, method: &str, field: &str) -> Result<Vec<V
             Some(cursor) => json!({"cursor": cursor}),
             None => json!({}),
         };
-        let result = rpc.request(method, params).await?;
-        if let Some(page) = result.get(field).and_then(Value::as_array) {
-            items.extend(page.iter().cloned());
+        let mut result = rpc.request(method, params).await?;
+        if let Some(Value::Array(page)) = result.get_mut(field).map(Value::take) {
+            items.extend(page);
+        }
+        if items.len() > MAX_ITEMS {
+            return Err(too_long(format!("{MAX_ITEMS} items")));
         }
         match result.get("nextCursor").and_then(Value::as_str) {
             Some(next) => cursor = Some(next.to_owned()),
             None => return Ok(items),
         }
     }
-    warn!(
-        method,
-        pages = MAX_PAGES,
-        "stopped listing after too many pages"
-    );
-    Ok(items)
+    Err(too_long(format!("{MAX_PAGES} pages")))
 }
 
 /// The `result` of a JSON-RPC response, or the server's error as a
@@ -106,4 +113,44 @@ pub(crate) fn result_of(method: &str, message: &Value) -> Result<Value, ProxyErr
         });
     }
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server whose tool list never ends: each page holds `per_page`
+    /// tools and points to another.
+    struct Endless {
+        per_page: usize,
+    }
+
+    impl Rpc for Endless {
+        async fn request(&mut self, method: &str, _: Value) -> Result<Value, ProxyError> {
+            let tools: Vec<Value> = (0..self.per_page)
+                .map(|n| json!({"name": format!("t{n}")}))
+                .collect();
+            Ok(match method {
+                "initialize" => json!({"capabilities": {"tools": {}}}),
+                _ => json!({"tools": tools, "nextCursor": "more"}),
+            })
+        }
+
+        async fn notify(&mut self, _: &str) -> Result<(), ProxyError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_list_too_long_to_read_whole_is_an_error() {
+        // Too many pages, and too many items.
+        for per_page in [0, 5_000] {
+            let listed = collect(&mut Endless { per_page }).await;
+            assert!(
+                matches!(listed, Err(ProxyError::TooLong { .. })),
+                "{per_page} per page: {:?}",
+                listed.map(|inventory| inventory.tools.len())
+            );
+        }
+    }
 }

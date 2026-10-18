@@ -14,7 +14,6 @@ pub const MODEL: &str = "claude-opus-5-5";
 const MAX_TOKENS: u32 = 16_000;
 /// Largest set of server definitions Scout sends, in bytes.
 const MAX_PAYLOAD: usize = 200_000;
-const MAX_FINDINGS: usize = 100;
 const MAX_REASON: usize = 300;
 
 const SYSTEM: &str = r#"You are a security reviewer. A person is deciding whether to let an AI agent use an MCP server, and you review what the server shows the agent: its instructions, its tools (names, descriptions, input schemas, annotations), prompts and resources.
@@ -116,7 +115,9 @@ struct RawFinding {
 }
 
 /// Reads Claude's reply. Findings about items the server doesn't offer are
-/// dropped and counted, never trusted.
+/// dropped and counted, never trusted. Every other finding is kept, however
+/// many there are: `MAX_TOKENS` already bounds the reply, and a cap could
+/// drop a high one.
 fn parse(text: &str, inventory: &Inventory) -> Result<(Vec<Finding>, usize), ReviewError> {
     let object = match (text.find('{'), text.rfind('}')) {
         (Some(start), Some(end)) if start < end => &text[start..=end],
@@ -130,7 +131,7 @@ fn parse(text: &str, inventory: &Inventory) -> Result<(Vec<Finding>, usize), Rev
         serde_json::from_str(object).map_err(|error| ReviewError::Format(error.to_string()))?;
     let mut findings = Vec::new();
     let mut ignored = 0;
-    for raw in reply.findings.into_iter().take(MAX_FINDINGS) {
+    for raw in reply.findings {
         let severity = match raw.severity.as_str() {
             "high" => Severity::High,
             "medium" => Severity::Medium,
@@ -238,6 +239,21 @@ mod tests {
             }]
         );
         assert_eq!(ignored, 3);
+    }
+
+    #[test]
+    fn keeps_every_finding_however_many() {
+        let mut raw: Vec<Value> = (0..120)
+            .map(|n| json!({"kind": "tool", "name": "echo", "severity": "low", "reason": format!("Note {n}.")}))
+            .collect();
+        raw[110] =
+            json!({"kind": "tool", "name": "notes", "severity": "high", "reason": "Exfiltrates."});
+        let reply = json!({"findings": raw}).to_string();
+        let (findings, ignored) = parse(&reply, &inventory()).unwrap();
+        assert_eq!((findings.len(), ignored), (120, 0));
+        assert!(findings.iter().any(|finding| {
+            finding.subject == Subject::tool("notes") && finding.severity == Severity::High
+        }));
     }
 
     #[test]

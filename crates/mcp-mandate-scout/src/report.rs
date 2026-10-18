@@ -42,14 +42,16 @@ pub fn render(
             );
         }
     }
+    // A failed review's line quotes the error, which can echo the reply.
     let _ = write!(
         text,
         "\nDraft policy: {} allowed, {} held, {} denied → {out}\n\
-         Claude review: {review}\n\
+         Claude review: {}\n\
          Scout only proposes: read the draft and change what you disagree with before using it.\n",
         draft.count(Proposal::Allow),
         draft.count(Proposal::Hold),
         draft.count(Proposal::Deny),
+        printable(review, 500),
     );
     text
 }
@@ -104,7 +106,7 @@ mod tests {
             &findings,
             &draft,
             "draft.toml",
-            "not run",
+            "failed (\u{1b}[2Kbad reply)",
         );
 
         assert!(
@@ -126,6 +128,9 @@ mod tests {
             report.contains("1 allowed, 0 held, 1 denied → draft.toml"),
             "{report}"
         );
-        assert!(report.contains("Claude review: not run"), "{report}");
+        assert!(
+            report.contains("Claude review: failed (\\u{1b}[2Kbad reply)"),
+            "{report}"
+        );
     }
 }

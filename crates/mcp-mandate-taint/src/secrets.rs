@@ -4,7 +4,9 @@ use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{
+    STANDARD, STANDARD_PAD_INDIFFERENT, URL_SAFE_PAD_INDIFFERENT,
+};
 use regex::Regex;
 use serde_json::Value;
 
@@ -57,8 +59,10 @@ const BUILT_IN: &[(&str, &str)] = &[
     (
         // `DB_PASSWORD=…`, `aws_secret_access_key = …`, `"apiKey": "…"`:
         // a name that says secret, anywhere in a longer name, then a value.
+        // Quotes may be escaped (JSON inside text), and a quoted value runs
+        // to its closing quote, spaces and all.
         "secret-assignment",
-        r#"(?i)[A-Za-z0-9_.-]*(?:password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|(?:auth|access|refresh|session|bearer)[_-]?token|credentials?)[A-Za-z0-9_.-]*["']?\s*[:=]\s*["']?[^\s"',;\[\]]{8,}"#,
+        r#"(?i)[A-Za-z0-9_.-]*(?:password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|(?:auth|access|refresh|session|bearer)[_-]?token|credentials?)[A-Za-z0-9_.-]*\\?["']?\s*[:=]\s*(?:\\?"[^"\n]{8,}|'[^'\n]{8,}|[^\s"',;\[\]]{8,})"#,
     ),
 ];
 
@@ -73,8 +77,14 @@ static SECRET_FIELD: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Shortest value of a secret field, or exact secret, worth flagging.
 const MIN_SECRET_CHARS: usize = 8;
-/// Largest resource blob decoded to look for secrets inside it.
-const MAX_BLOB_BYTES: usize = 1024 * 1024;
+/// A decoded blob that isn't text is checked this many bytes at a time, so
+/// its lossy text copy stays small...
+const BLOB_WINDOW: usize = 1024 * 1024;
+/// ...with windows overlapping by this much, so a secret no longer than
+/// this always falls wholly inside one.
+const BLOB_OVERLAP: usize = 64 * 1024;
+/// What replaces the value of a field named like a secret.
+const SECRET_FIELD_MARKER: &str = "[REDACTED: secret-field]";
 
 static BUILT_IN_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
     BUILT_IN
@@ -88,6 +98,8 @@ static BUILT_IN_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
 #[derive(Debug, Clone)]
 pub struct SecretDetector {
     patterns: Vec<SecretPattern>,
+    /// How many of `patterns`, at the end, are exact strings.
+    literals: usize,
 }
 
 impl Default for SecretDetector {
@@ -101,7 +113,10 @@ impl SecretDetector {
     pub fn new(custom: Vec<SecretPattern>) -> Self {
         let mut patterns = BUILT_IN_PATTERNS.clone();
         patterns.extend(custom);
-        Self { patterns }
+        Self {
+            patterns,
+            literals: 0,
+        }
     }
 
     /// The kind of the first secret found in `text`.
@@ -127,6 +142,40 @@ impl SecretDetector {
         }
         if let Ok(pattern) = SecretPattern::new(name, &escaped) {
             self.patterns.push(pattern);
+            self.literals += 1;
+        }
+    }
+
+    /// Replaces every exact string added or set before with `literals`,
+    /// reported as `name`: for a secret that changes, such as a renewed
+    /// token, so the old ones don't pile up. Short strings are skipped, as
+    /// [`add_literal`](Self::add_literal) skips them. Nothing is rebuilt
+    /// when the strings are the ones already set, so this is cheap to call
+    /// before every message.
+    pub fn set_literals(&mut self, name: &str, literals: &[String]) {
+        let mut wanted: Vec<String> = Vec::new();
+        for literal in literals {
+            let escaped = regex::escape(literal);
+            if literal.chars().count() >= MIN_SECRET_CHARS && !wanted.contains(&escaped) {
+                wanted.push(escaped);
+            }
+        }
+        let kept = self.patterns.len() - self.literals;
+        let current = &self.patterns[kept..];
+        let unchanged = current.len() == wanted.len()
+            && current.iter().zip(&wanted).all(|(pattern, escaped)| {
+                pattern.name == name && pattern.regex.as_str() == escaped
+            });
+        if unchanged {
+            return;
+        }
+        self.patterns.truncate(kept);
+        self.literals = 0;
+        for escaped in wanted {
+            if let Ok(pattern) = SecretPattern::new(name, &escaped) {
+                self.patterns.push(pattern);
+                self.literals += 1;
+            }
         }
     }
 
@@ -201,11 +250,11 @@ impl SecretDetector {
     }
 
     /// Redacts secrets everywhere in what a server sends: every string, every
-    /// object key, and the value of every field named like a secret. Binary
-    /// payloads are left alone only where MCP puts them (the base64 `data`
-    /// of an image or audio block); a resource's base64 `blob` is decoded and
-    /// checked, and replaced if it holds a secret. Returns the kinds
-    /// redacted.
+    /// object key, and the value of every field named like a secret (each
+    /// string, if it's a list). Binary payloads are left alone only where MCP
+    /// puts them (the base64 `data` of an image or audio block); a resource's
+    /// base64 `blob` is decoded and checked, and replaced if it holds a
+    /// secret. Returns the kinds redacted.
     pub fn redact_json(&self, value: &mut Value) -> Vec<String> {
         let mut kinds = Vec::new();
         self.redact_value(value, &mut kinds);
@@ -228,7 +277,7 @@ impl SecretDetector {
                 // Keys can't be changed in place, so the map is rebuilt.
                 for (mut key, mut item) in std::mem::take(map) {
                     if secret_field(&key, &item) {
-                        item = Value::String("[REDACTED: secret-field]".to_owned());
+                        self.redact_field(&mut item, kinds);
                         kinds.push("secret-field".to_owned());
                     } else if binary == Some(key.as_str()) {
                         if let Some(kind) = self.blob_secret(&key, &item) {
@@ -242,6 +291,14 @@ impl SecretDetector {
                         key = redacted;
                         kinds.extend(found);
                     }
+                    // Two keys can redact to the same text: number the later
+                    // ones rather than lose them.
+                    if map.contains_key(&key) {
+                        key = (2..)
+                            .map(|n| format!("{key} #{n}"))
+                            .find(|numbered| !map.contains_key(numbered))
+                            .expect("some number is free");
+                    }
                     map.insert(key, item);
                 }
             }
@@ -249,20 +306,73 @@ impl SecretDetector {
         }
     }
 
-    /// A secret inside a binary field: a resource blob is decoded (up to a
-    /// size limit) and its text checked; image and audio data aren't, as
-    /// long as it is base64. Anything that isn't is judged as text.
-    fn blob_secret(&self, key: &str, value: &Value) -> Option<String> {
-        let text = value.as_str()?;
-        match STANDARD.decode(text.trim()) {
-            Ok(_) if key != "blob" => None,
-            Ok(bytes) if bytes.len() <= MAX_BLOB_BYTES => self
-                .find(&String::from_utf8_lossy(&bytes))
-                .map(str::to_owned),
-            // Too large to check, or not base64 at all: judged as text.
-            _ => self.find(text).map(str::to_owned),
+    /// Replaces the value of a field named like a secret, or each secret in
+    /// it if it's a list (anything else in the list is redacted as usual).
+    fn redact_field(&self, value: &mut Value, kinds: &mut Vec<String>) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    if secret_value(item) {
+                        *item = Value::String(SECRET_FIELD_MARKER.to_owned());
+                    } else {
+                        self.redact_value(item, kinds);
+                    }
+                }
+            }
+            _ => *value = Value::String(SECRET_FIELD_MARKER.to_owned()),
         }
     }
+
+    /// A secret inside a binary field: a resource blob is decoded and its
+    /// content checked; image and audio data aren't, as long as it is
+    /// base64. Anything that isn't canonical base64 is judged as text, and a
+    /// blob is also decoded the way lenient clients do it.
+    fn blob_secret(&self, key: &str, value: &Value) -> Option<String> {
+        let text = value.as_str()?;
+        let blob = key == "blob";
+        let found = match STANDARD.decode(text.trim()) {
+            Ok(bytes) if blob => self.find_in_bytes(&bytes),
+            Ok(_) => None,
+            Err(_) if blob => self
+                .find(text)
+                .or_else(|| decode_leniently(text).and_then(|bytes| self.find_in_bytes(&bytes))),
+            Err(_) => self.find(text),
+        };
+        found.map(str::to_owned)
+    }
+
+    /// The kind of the first secret in decoded bytes. Text is checked whole;
+    /// anything else a window at a time.
+    fn find_in_bytes(&self, bytes: &[u8]) -> Option<&str> {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return self.find(text);
+        }
+        let mut start = 0;
+        loop {
+            let end = bytes.len().min(start + BLOB_WINDOW);
+            if let Some(kind) = self.find(&String::from_utf8_lossy(&bytes[start..end])) {
+                return Some(kind);
+            }
+            if end == bytes.len() {
+                return None;
+            }
+            start = end - BLOB_OVERLAP;
+        }
+    }
+}
+
+/// `text` decoded as base64 the way lenient decoders read it: ignoring line
+/// breaks and other whitespace, with or without padding, in the standard or
+/// the URL-safe alphabet.
+fn decode_leniently(text: &str) -> Option<Vec<u8>> {
+    let compact: Vec<u8> = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    STANDARD_PAD_INDIFFERENT
+        .decode(&compact)
+        .or_else(|_| URL_SAFE_PAD_INDIFFERENT.decode(&compact))
+        .ok()
 }
 
 /// What replaces a blob that held a secret: still valid base64.
@@ -288,12 +398,32 @@ fn binary_field(map: &serde_json::Map<String, Value>) -> Option<&'static str> {
     }
 }
 
-/// Whether `key` names a secret and `value` is a string long enough to be
-/// one.
+/// Whether `key` names a secret and `value` holds one: a string long enough
+/// to be one, or a list with such a string in it.
 fn secret_field(key: &str, value: &Value) -> bool {
-    value.as_str().is_some_and(|text| {
-        text.chars().count() >= MIN_SECRET_CHARS && !text.starts_with("[REDACTED")
-    }) && SECRET_FIELD.is_match(key)
+    let holds_one = match value {
+        Value::Array(items) => items.iter().any(secret_value),
+        value => secret_value(value),
+    };
+    holds_one && SECRET_FIELD.is_match(key)
+}
+
+/// Whether `value`, found under a name that says secret, is one: a string
+/// long enough, and not just what redaction left there.
+fn secret_value(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|text| text.chars().count() >= MIN_SECRET_CHARS && !is_redaction(text))
+}
+
+/// Whether `text` is exactly a redaction marker, `[REDACTED: kind]`, with
+/// nothing before or after it.
+fn is_redaction(text: &str) -> bool {
+    text.strip_prefix("[REDACTED: ")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|kind| {
+            !kind.is_empty() && !kind.contains(']') && !kind.contains(char::is_control)
+        })
 }
 
 #[cfg(test)]
@@ -388,9 +518,127 @@ mod tests {
             r#"apiKey: "abcd1234efgh5678""#,
             "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ",
             "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----",
+            // JSON inside text, as `aws secretsmanager` prints it.
+            r#"{"SecretString": "{\"username\":\"admin\",\"password\":\"hunter2hunter2\"}"}"#,
+            r#"DB_PASSWORD="correct horse battery staple""#,
         ] {
             assert!(detector.find(text).is_some(), "missed {text:?}");
         }
+    }
+
+    #[test]
+    fn redacts_a_quoted_value_up_to_its_closing_quote() {
+        let detector = SecretDetector::default();
+        for (text, secret) in [
+            (r#"PASSWORD="hunter22 x y""#, "x y"),
+            (r#"DB_PASSWORD="correct horse battery staple""#, "staple"),
+            ("db_password: 'correct horse battery'", "battery"),
+            (
+                r#"{"SecretString": "{\"username\":\"admin\",\"password\":\"hunter2hunter2\"}"}"#,
+                "hunter2",
+            ),
+        ] {
+            let (redacted, _) = detector
+                .redact_text(text)
+                .unwrap_or_else(|| panic!("missed {text:?}"));
+            assert!(!redacted.contains(secret), "{redacted}");
+        }
+        // An empty value doesn't take the next field with it.
+        let empty = r#"{"password": "", "username": "bob-the-builder"}"#;
+        assert_eq!(detector.find(empty), None);
+    }
+
+    #[test]
+    fn checks_resource_blobs_of_any_size() {
+        let detector = SecretDetector::default();
+        let mut text = "x".repeat(2 * BLOB_WINDOW);
+        text.push_str("\nAWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n");
+        let mut resource =
+            json!({"contents": [{"uri": "file:///app.log", "blob": STANDARD.encode(&text)}]});
+        assert_eq!(detector.redact_json(&mut resource), ["aws-access-key-id"]);
+        let blob = resource["contents"][0]["blob"].as_str().unwrap();
+        assert_eq!(
+            STANDARD.decode(blob).unwrap(),
+            b"[REDACTED: aws-access-key-id]"
+        );
+
+        // Binary content, with a key across the end of the first window.
+        let mut bytes = vec![0xff];
+        bytes.extend(std::iter::repeat_n(b'.', BLOB_WINDOW - 10));
+        bytes.extend_from_slice(b"AKIAIOSFODNN7EXAMPLE");
+        bytes.extend(std::iter::repeat_n(b'.', BLOB_WINDOW));
+        let binary = json!({"uri": "file:///core", "blob": STANDARD.encode(&bytes)});
+        assert_eq!(
+            detector.find_in_response(&binary),
+            Some("aws-access-key-id".to_owned())
+        );
+    }
+
+    #[test]
+    fn decodes_blobs_the_way_lenient_clients_do() {
+        let detector = SecretDetector::default();
+        let env = "# written by the deploy script ???\nAWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
+        // Broken into lines as MIME encoders write it, without padding.
+        let encoded = STANDARD.encode(env);
+        let wrapped = encoded
+            .trim_end_matches('=')
+            .as_bytes()
+            .chunks(76)
+            .map(|line| format!("{}\r\n", std::str::from_utf8(line).unwrap()))
+            .collect::<String>();
+        let url_safe = URL_SAFE_PAD_INDIFFERENT.encode(env);
+        assert!(url_safe.contains(['-', '_']), "{url_safe}");
+        for blob in [wrapped, url_safe] {
+            assert!(STANDARD.decode(blob.trim()).is_err(), "{blob}");
+            let resource = json!({"uri": "file:///.env", "blob": blob});
+            assert_eq!(
+                detector.find_in_response(&resource),
+                Some("aws-access-key-id".to_owned()),
+                "{blob}"
+            );
+        }
+    }
+
+    #[test]
+    fn treats_lists_named_like_secrets_as_secrets() {
+        let detector = SecretDetector::default();
+        let mut message = json!({
+            "api_keys": ["k1-opaque-0042", "k2-opaque-0043", 7, "short"],
+            "password": "[REDACTED] sk9f8q7w6e5r4t"
+        });
+        assert_eq!(
+            detector.find_in_json(&json!({"secrets": ["k1-opaque-0042"]})),
+            Some("secret-field".to_owned())
+        );
+        detector.redact_json(&mut message);
+        assert_eq!(
+            message,
+            json!({
+                "api_keys": ["[REDACTED: secret-field]", "[REDACTED: secret-field]", 7, "short"],
+                "password": "[REDACTED: secret-field]"
+            })
+        );
+        // What redaction left isn't taken for a secret again.
+        assert_eq!(detector.find_in_json(&message), None);
+    }
+
+    #[test]
+    fn keeps_every_key_when_two_redact_alike() {
+        let detector = SecretDetector::default();
+        let mut message = json!({
+            "AKIAIOSFODNN7EXAMPLE": {"user": "a"},
+            "AKIAI44QH8DHBEXAMPLE": {"user": "b"}
+        });
+        detector.redact_json(&mut message);
+        let keys: Vec<&String> = message.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            [
+                "[REDACTED: aws-access-key-id]",
+                "[REDACTED: aws-access-key-id] #2"
+            ],
+            "{message}"
+        );
     }
 
     #[test]
@@ -454,6 +702,34 @@ mod tests {
             Some("gateway-credential")
         );
         assert_eq!(detector.find("short"), None);
+    }
+
+    #[test]
+    fn exact_strings_that_change_replace_the_old_ones() {
+        let mut detector = SecretDetector::default();
+        let built_in = detector.patterns.len();
+        detector.add_literal("gateway-credential", "client-secret-0");
+        for renewal in 0..100 {
+            let token = format!("opaque-token-{renewal}");
+            let set = [token.clone(), format!("Bearer {token}"), "tiny".to_owned()];
+            detector.set_literals("gateway-credential", &set);
+            detector.set_literals("gateway-credential", &set);
+        }
+        assert_eq!(
+            detector.patterns.len(),
+            built_in + 2,
+            "the latest token's two forms, and nothing else"
+        );
+        assert_eq!(
+            detector.find("echo: opaque-token-99"),
+            Some("gateway-credential")
+        );
+        assert_eq!(detector.find("echo: opaque-token-98"), None);
+        assert_eq!(detector.find("echo: client-secret-0"), None);
+        let (text, _) = detector.redact_text("Bearer opaque-token-99").unwrap();
+        assert!(!text.contains("opaque-token-99"), "{text}");
+        detector.set_literals("gateway-credential", &[]);
+        assert_eq!(detector.patterns.len(), built_in);
     }
 
     #[test]

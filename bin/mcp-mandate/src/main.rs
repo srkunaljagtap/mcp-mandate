@@ -10,15 +10,18 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use mcp_mandate_audit::{self as audit, Log, Recorder, VerifyError};
 use mcp_mandate_gate::Gate;
-use mcp_mandate_pin::{Inventory, Kind, Pins, unpinned_package};
-use mcp_mandate_policy::{Mode, Policy};
+use mcp_mandate_pin::{Inventory, Kind, Pins, PinsError, unpinned_package};
+use mcp_mandate_policy::{Mode, Policy, PolicyError};
 use mcp_mandate_proxy::ProxyError;
 use mcp_mandate_proxy::agent_taint::AgentTaint;
 use mcp_mandate_proxy::gateway::{self, GatewayConfig};
 use mcp_mandate_proxy::stdio::{self, ServerCommand};
 use mcp_mandate_scout as scout;
+use tracing::field::{Field, Visit};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::field::{MakeVisitor, VisitFmt, VisitOutput};
+use tracing_subscriber::fmt::format::Writer;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -187,12 +190,23 @@ fn run(policy: &Path, command: ServerCommand) -> ExitCode {
 /// Loads the policy and pins, and opens the audit log with this session's
 /// start recorded.
 fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error>> {
-    let policy = Policy::load(path)?;
+    // Each file is read once, and what's parsed is what's hashed for the
+    // audit log, so the hashes describe exactly what the gate enforces.
+    let text = std::fs::read_to_string(path).map_err(|source| PolicyError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    let policy = Policy::parse_file(&text, path)?;
+    let policy_sha256 = audit::sha256_hex(text.as_bytes());
     warn_if_exposed("policy", path);
-    let pins = match &policy.pins {
+    let (pins, pins_sha256) = match &policy.pins {
         Some(pins_path) => {
             warn_if_exposed("pins file", pins_path);
-            let pins = Pins::load(pins_path)?;
+            let text = std::fs::read_to_string(pins_path).map_err(|source| PinsError::Read {
+                path: pins_path.clone(),
+                source,
+            })?;
+            let pins = Pins::parse(&text, pins_path)?;
             info!(
                 pins = %pins_path.display(),
                 tools = pins.count(Kind::Tool),
@@ -201,13 +215,13 @@ fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error
                 resource_templates = pins.count(Kind::ResourceTemplate),
                 "loaded pins"
             );
-            Some(pins)
+            (Some(pins), Some(audit::sha256_hex(text.as_bytes())))
         }
         None => {
             warn!(
                 "the policy names no pins file, so nothing the server offers is approved (see `mcp-mandate pin`)"
             );
-            None
+            (None, None)
         }
     };
     info!(policy = %path.display(), mode = mode_name(policy.mode), "loaded policy");
@@ -215,7 +229,13 @@ fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error
         warn!("observe mode: decisions are logged, but nothing is blocked or hidden");
     }
     let mut log = Log::open(&policy.audit_log)?;
-    log.record(&session_start(path, &policy, command)?)?;
+    log.record(&session_start(
+        path,
+        &policy,
+        command,
+        policy_sha256,
+        pins_sha256,
+    ))?;
     info!(
         audit_log = %log.path().display(),
         session = log.session(),
@@ -233,13 +253,15 @@ fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error
 /// Warns when a file that configures the gate sits where the agent or a
 /// server could rewrite it: inside the folder the server runs in (the
 /// agent's own file tools reach it without passing the gate), or writable by
-/// other users. Whoever can edit these files decides what the gate allows.
+/// other users, or in a folder they can write to. Whoever can edit these
+/// files decides what the gate allows.
 fn warn_if_exposed(what: &str, path: &Path) {
     let Ok(full) = std::fs::canonicalize(path) else {
         return; // loading it reports the problem
     };
+    let home = std::env::home_dir().and_then(|home| std::fs::canonicalize(home).ok());
     if let Ok(here) = std::env::current_dir().and_then(std::fs::canonicalize)
-        && full.starts_with(&here)
+        && in_server_folder(&full, &here, home.as_deref())
     {
         warn!(
             file = %path.display(),
@@ -249,12 +271,30 @@ fn warn_if_exposed(what: &str, path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(&full)
-            && metadata.permissions().mode() & 0o022 != 0
-        {
+        let mode =
+            |path: &Path| std::fs::metadata(path).map(|metadata| metadata.permissions().mode());
+        if mode(&full).is_ok_and(|mode| mode & 0o022 != 0) {
             warn!(file = %path.display(), "the {what} is writable by other users");
         }
+        // Whoever can write to a folder can replace the files in it, unless
+        // it has the sticky bit (as /tmp does).
+        if let Some(folder) = full.parent()
+            && mode(folder).is_ok_and(|mode| mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            warn!(
+                file = %path.display(),
+                "the {what}'s folder is writable by other users, who can replace the file"
+            );
+        }
     }
+}
+
+/// Whether `file` is inside `here`, the folder the server runs in. Not when
+/// that's a filesystem root or the home folder: clients start servers there
+/// by default, and they hold every file you have, the folders this warning
+/// recommends included.
+fn in_server_folder(file: &Path, here: &Path, home: Option<&Path>) -> bool {
+    file.starts_with(here) && here.parent().is_some() && home != Some(here)
 }
 
 fn mode_name(mode: Mode) -> &'static str {
@@ -264,13 +304,15 @@ fn mode_name(mode: Mode) -> &'static str {
     }
 }
 
-/// The audit entry that opens a session: what ran, under which policy.
+/// The audit entry that opens a session: what ran, under which policy. The
+/// hashes are of the policy and pins files' text as the gate loaded it.
 fn session_start(
     path: &Path,
     policy: &Policy,
     command: &ServerCommand,
-) -> Result<audit::Event, Box<dyn Error>> {
-    let hash_file = |file: &Path| std::fs::read(file).map(|bytes| audit::sha256_hex(&bytes));
+    policy_sha256: String,
+    pins_sha256: Option<String>,
+) -> audit::Event {
     // The server's arguments can carry tokens, so the command is recorded
     // only as a hash: each part's bytes, each followed by a NUL.
     let mut argv = Vec::new();
@@ -281,18 +323,18 @@ fn session_start(
     let program = Path::new(&command.program)
         .file_name()
         .unwrap_or(command.program.as_os_str());
-    Ok(audit::Event {
+    audit::Event {
         event: audit::EventKind::SessionStart,
         version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         mode: Some(mode_name(policy.mode).to_owned()),
         policy: Some(path.display().to_string()),
-        policy_sha256: Some(hash_file(path)?),
-        pins_sha256: policy.pins.as_deref().map(hash_file).transpose()?,
+        policy_sha256: Some(policy_sha256),
+        pins_sha256,
         server: Some(program.to_string_lossy().into_owned()),
         command_sha256: Some(audit::sha256_hex(&argv)),
         pid: Some(std::process::id()),
         ..audit::Event::default()
-    })
+    }
 }
 
 /// `mcp-mandate audit verify`: checks the log's hash chain and prints what
@@ -333,7 +375,14 @@ fn intact(path: &Path, found: &audit::Report) -> String {
     let sessions = count(found.sessions as u64, "session", "sessions");
     match (&found.first, &found.last) {
         (Some(first), Some(last)) => {
-            text += &format!("  {entries} in {sessions}, {first} to {last}\n");
+            // The times are whatever the log says, and anything that can
+            // write the log can seal an entry: a raw escape sequence or line
+            // break here could rewrite the rest of this report.
+            text += &format!(
+                "  {entries} in {sessions}, {} to {}\n",
+                scout::printable(first, 64),
+                scout::printable(last, 64)
+            );
         }
         _ => text += &format!("  {entries}\n"),
     }
@@ -433,10 +482,13 @@ fn taken(path: &Path) -> bool {
 /// symlink there is replaced rather than written through.
 fn write_output(out: &Path, text: &str, force: bool) -> std::io::Result<()> {
     let create = |path: &Path| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Readable and writable only by you, like the audit log, whatever
+        // the umask: whoever can edit a pins file approves what's in it.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(path)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()
     };
@@ -698,22 +750,38 @@ impl Source {
         Ok(Self::Remote(Box::new(server)))
     }
 
-    /// What the server is, for people: its command, or its URL without a
-    /// query (which could hold a secret).
+    /// What the server is, for people: its command with anything that looks
+    /// like a secret masked, or its URL without a user name, password,
+    /// query or fragment (any of which could hold one).
     fn label(&self) -> String {
         match self {
             Self::Local(command) => command.to_string(),
             Self::Remote(server) => {
                 let mut url = server.url.clone();
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
                 url.set_query(None);
+                url.set_fragment(None);
                 url.to_string()
             }
         }
     }
 
+    /// Lists what the server offers. A stop signal while a local server is
+    /// being listed stops it and everything it started, then ends the
+    /// program; a later one ends the program at once.
     fn list(&self, runtime: &tokio::runtime::Runtime) -> Result<Inventory, ProxyError> {
         match self {
-            Self::Local(command) => runtime.block_on(stdio::inventory(command)),
+            Self::Local(command) => runtime.block_on(async {
+                let mut signals = stdio::Signals::new();
+                let listed = stdio::inventory(command, signals.recv()).await;
+                if let Err(ProxyError::Interrupted(code)) = listed {
+                    std::process::exit(code);
+                }
+                // The signals stay caught from here on, so they need acting on.
+                tokio::spawn(async move { std::process::exit(signals.recv().await) });
+                listed
+            }),
             Self::Remote(server) => runtime.block_on(gateway::inventory(server)),
         }
     }
@@ -754,7 +822,78 @@ fn init_logging() {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .with_target(false)
+        .fmt_fields(EscapedFields)
         .init();
+}
+
+/// Writes log fields as the default format does, but with control and
+/// invisible characters escaped in every value, not only the message.
+/// Fields carry text a server or client chose (a method name, a server's
+/// error message), which must not move the cursor or forge a log line.
+#[derive(Clone, Copy)]
+struct EscapedFields;
+
+struct EscapedVisitor<'a> {
+    writer: Writer<'a>,
+    first: bool,
+    result: std::fmt::Result,
+}
+
+impl<'a> MakeVisitor<Writer<'a>> for EscapedFields {
+    type Visitor = EscapedVisitor<'a>;
+
+    fn make_visitor(&self, writer: Writer<'a>) -> Self::Visitor {
+        EscapedVisitor {
+            writer,
+            first: true,
+            result: Ok(()),
+        }
+    }
+}
+
+impl Visit for EscapedVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.record_debug(field, &format_args!("{value}"));
+        } else {
+            self.record_debug(field, &value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        // `log.*` fields are metadata of events from the `log` crate, which
+        // the format has already written.
+        if self.result.is_err() || field.name().starts_with("log.") {
+            return;
+        }
+        let separator = if std::mem::take(&mut self.first) {
+            ""
+        } else {
+            " "
+        };
+        // Nothing is cut: `usize::MAX` characters is no limit.
+        let value = scout::printable(&format!("{value:?}"), usize::MAX);
+        self.result = match field.name() {
+            "message" => write!(self.writer, "{separator}{value}"),
+            name => write!(
+                self.writer,
+                "{separator}{}={value}",
+                name.trim_start_matches("r#")
+            ),
+        };
+    }
+}
+
+impl VisitOutput<std::fmt::Result> for EscapedVisitor<'_> {
+    fn finish(self) -> std::fmt::Result {
+        self.result
+    }
+}
+
+impl VisitFmt for EscapedVisitor<'_> {
+    fn writer(&mut self) -> &mut dyn std::fmt::Write {
+        &mut self.writer
+    }
 }
 
 /// An error and its causes on one line: "couldn't start `x`: permission denied".
@@ -839,6 +978,80 @@ mod tests {
     }
 
     #[test]
+    fn the_verify_report_escapes_what_the_log_says() {
+        // Sealing has no key, so anything that can write the log can add a
+        // valid entry whose time is an escape sequence and a forged line.
+        let body = format!(
+            r#"{{"seq":1,"prev":"{}","time":"\u001b[2K\n  Head: forged"}}"#,
+            audit::GENESIS
+        );
+        let line = format!(
+            "{},\"hash\":\"{}\"}}\n",
+            &body[..body.len() - 1],
+            audit::sha256_hex(body.as_bytes())
+        );
+        let found = audit::verify_reader(line.as_bytes(), None).unwrap();
+        let text = intact(Path::new("x.audit.jsonl"), &found);
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(!text.contains("\n  Head: forged"), "{text}");
+        assert!(text.contains("\\u{1b}[2K\\u{a}  Head: forged"), "{text}");
+    }
+
+    #[test]
+    fn warns_about_the_server_folder_but_not_a_root_or_the_home_folder() {
+        let root = std::env::temp_dir().ancestors().last().unwrap().to_owned();
+        let home = root.join("home").join("me");
+        let project = home.join("project");
+        let policy = project.join("policy.toml");
+        let inside = |here: &Path, file: &Path| in_server_folder(file, here, Some(home.as_path()));
+        assert!(inside(&project, &policy));
+        assert!(!inside(&home, &policy));
+        assert!(!inside(&root, &policy));
+        assert!(!inside(&project, &home.join(".config").join("policy.toml")));
+    }
+
+    #[test]
+    fn log_fields_cant_move_the_cursor_or_forge_a_line() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .fmt_fields(EscapedFields)
+            .finish();
+        // A method name from a client, and a server's error message.
+        let method = "x\u{1b}[1A\u{1b}[2K\nWARN allowed";
+        let error = "\u{1b}]52;c;Zm9v\u{7}";
+        tracing::subscriber::with_default(subscriber, || {
+            warn!(%method, %error, note = "a\rb", "blocked\u{1b}[8m");
+        });
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logged.matches('\n').count(), 1, "{logged}");
+        assert!(!logged.contains(['\u{1b}', '\u{7}', '\r']), "{logged}");
+        assert!(
+            logged.contains(
+                "blocked\\u{1b}[8m method=x\\u{1b}[1A\\u{1b}[2K\\u{a}WARN allowed error=\\u{1b}]52;c;Zm9v\\u{7} note=\"a\\rb\""
+            ),
+            "{logged}"
+        );
+    }
+
+    #[test]
     fn pin_writes_to_a_default_file_and_needs_force_to_replace_it() {
         let cli = Cli::try_parse_from(["mcp-mandate", "pin", "--", "server"]).unwrap();
         let Command::Pin { out, force, .. } = cli.command else {
@@ -892,6 +1105,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "two");
         #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
+            // Private whatever the umask, a replaced file included.
+            let mode = std::fs::metadata(&out).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+            write_output(&dir.join("new.toml"), "one", false).unwrap();
+            let mode = std::fs::metadata(dir.join("new.toml"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+
             let target = dir.join("elsewhere");
             let link = dir.join("link.toml");
             std::os::unix::fs::symlink(&target, &link).unwrap();

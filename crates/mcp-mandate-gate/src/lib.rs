@@ -263,6 +263,14 @@ impl Gate {
         }
     }
 
+    /// Like [`add_secret_literals`](Self::add_secret_literals), but
+    /// replacing every exact string added or set before: for a credential
+    /// that's renewed, so expired tokens don't pile up. Cheap when the
+    /// strings haven't changed, so it can run before every message.
+    pub fn set_secret_literals(&mut self, literals: &[String]) {
+        self.secrets.set_literals("gateway-credential", literals);
+    }
+
     /// Forgets a client request that will never be answered through the
     /// gate (its transport failed), so it doesn't stay pending forever.
     pub fn abandon(&mut self, id: &Value) {
@@ -343,27 +351,37 @@ impl Gate {
             warn!("dropped a client answer to no request the server is waiting for");
             return Vec::new();
         };
-        self.event.method = Some(method.clone());
+        self.event.method = Some(self.audit_text(&method, MAX_NAME));
         let carries_words = matches!(
             method.as_str(),
             "sampling/createMessage" | "elicitation/create"
         );
-        let secret = carries_words
-            .then(|| serde_json::from_slice::<Value>(frame).ok())
-            .flatten()
-            .and_then(|message| self.secret_in(&message));
-        let Some(kind) = secret else {
+        let reason = if carries_words {
+            match serde_json::from_slice::<Value>(frame) {
+                Ok(message) => self.secret_in(&message).map(|kind| {
+                    format!(
+                        "the answer to the server's `{method}` request contains what looks like a secret ({kind})"
+                    )
+                }),
+                Err(_) => Some(format!(
+                    "the answer to the server's `{method}` request can't be read in full, so it can't be checked"
+                )),
+            }
+        } else {
+            None
+        };
+        let Some(reason) = reason else {
             return to_server(frame);
         };
-        let reason = format!(
-            "the answer to the server's `{method}` request contains what looks like a secret ({kind})"
-        );
         self.note_block(&reason, audit::Verdict::Block);
         if self.observe() {
             warn!(%reason, "would block (observe mode)");
             return to_server(frame);
         }
         warn!(%reason, "blocked");
+        // The gate answers the server in the client's place: recorded as a
+        // block, not as a changed answer.
+        self.event.verdict = Some(audit::Verdict::Block);
         let text = format!("Blocked by mcp-mandate: {reason}");
         vec![Action::ToServer(encode(&rpc_error(id, &text)))]
     }
@@ -378,18 +396,34 @@ impl Gate {
                 None => self.unexpected_response(frame),
             },
             Ok(Message::Request { id, method }) => {
-                let actions = if self.server_pending.len() >= MAX_PENDING {
-                    let reason = "too many of its requests are waiting for the client".to_owned();
-                    self.block_server(frame, &id, &method, reason)
+                let refusal = if self.server_pending.contains_key(&id_key(&id)) {
+                    // Reusing an id still in flight would make the gate
+                    // check the client's answer to one request as the
+                    // answer to the other.
+                    Some("a request with this id is still waiting for its answer")
+                } else if self.server_pending.len() >= MAX_PENDING {
+                    Some("too many of its requests are waiting for the client")
                 } else {
-                    self.server_request(frame, &id, &method)
+                    None
                 };
+                if let Some(reason) = refusal {
+                    // Not tracked, even when observe mode passes it on.
+                    let actions = self.block_server(frame, &id, &method, reason.to_owned());
+                    return self.record(Origin::Server, frame, actions);
+                }
+                let actions = self.server_request(frame, &id, &method);
                 if matches!(actions.as_slice(), [Action::ToClient(_)]) {
                     self.server_pending.insert(id_key(&id), method);
                 }
                 actions
             }
             Ok(Message::Notification { method }) => {
+                // The client doesn't answer a request the server cancelled.
+                if method == "notifications/cancelled"
+                    && let Some(id) = params(frame).get("requestId")
+                {
+                    self.server_pending.remove(&id_key(id));
+                }
                 if method.ends_with("/list_changed") {
                     info!(%method, "the server says a list changed; the new list will be checked against the pins");
                 }
@@ -432,18 +466,46 @@ impl Gate {
         self.event = audit::Event {
             from: Some(from),
             kind: Some(kind),
-            method: method.map(|method| clip(method, MAX_NAME)),
-            id: id.map(audit_id),
+            method: method.map(|method| self.audit_text(method, MAX_NAME)),
+            id: id.map(|id| self.audit_id(id)),
             sha256: Some(audit::sha256_hex(without_line_ending(frame))),
             ..audit::Event::default()
         };
+    }
+
+    /// `text` for the audit log: secrets redacted, then cut to `max` bytes.
+    /// In that order, so a cut can't leave the start of a secret too short
+    /// to be recognized.
+    fn audit_text(&self, text: &str, max: usize) -> String {
+        match self.secrets.redact_text(text) {
+            Some((redacted, _)) => clip(&redacted, max),
+            None => clip(text, max),
+        }
+    }
+
+    /// A request id for the audit log: a very long one is replaced by its
+    /// hash, and secrets in a string one are redacted.
+    fn audit_id(&self, id: &Value) -> Value {
+        let text = id.to_string();
+        if text.len() > MAX_ID_BYTES {
+            return Value::String(format!("sha256:{}", audit::sha256_hex(text.as_bytes())));
+        }
+        match id.as_str().and_then(|id| self.secrets.redact_text(id)) {
+            Some((redacted, _)) => Value::String(redacted),
+            None => id.clone(),
+        }
     }
 
     /// Records what happened to `frame`. A message that can't be recorded
     /// doesn't pass (in observe mode, it passes with a warning).
     fn record(&mut self, from: Origin, frame: &[u8], actions: Vec<Action>) -> Vec<Action> {
         let mut event = std::mem::take(&mut self.event);
-        let (verdict, forwarded) = judge(from, frame, &actions);
+        // Judged by where the message went, unless the gate already said
+        // what it did.
+        let (verdict, forwarded) = match event.verdict {
+            Some(verdict) => (verdict, None),
+            None => judge(from, frame, &actions),
+        };
         event.verdict = Some(verdict);
         event.forwarded_sha256 =
             forwarded.map(|bytes| audit::sha256_hex(without_line_ending(bytes)));
@@ -453,7 +515,8 @@ impl Gate {
                 .push(format!("and {} more", self.more_changes));
         }
         // Names, URIs and reasons can quote what was blocked: a secret that
-        // got a request blocked mustn't end up in the log.
+        // got a request blocked mustn't end up in the log. (They're redacted
+        // when set; this catches anything set some other way.)
         for text in event
             .item
             .iter_mut()
@@ -473,17 +536,31 @@ impl Gate {
             return actions;
         }
         error!(error = %failure, "couldn't record a decision in the audit log, so the message doesn't pass; nothing will until the log can be written");
-        self.unrecorded(from, frame, event.method.as_deref())
+        let forwarded = matches!(
+            (from, actions.as_slice()),
+            (Origin::Client, [Action::ToServer(_)]) | (Origin::Server, [Action::ToClient(_)])
+        );
+        self.unrecorded(from, frame, event.method.as_deref(), forwarded)
     }
 
     /// Fails closed for a message the audit log couldn't take: answers a
     /// request with an error, so nobody waits for it, and drops anything
-    /// else.
-    fn unrecorded(&mut self, from: Origin, frame: &[u8], method: Option<&str>) -> Vec<Action> {
+    /// else. A request that was to be `forwarded` stops waiting for its
+    /// answer; one that wasn't never started (its id may be another
+    /// request's, which still waits).
+    fn unrecorded(
+        &mut self,
+        from: Origin,
+        frame: &[u8],
+        method: Option<&str>,
+        forwarded: bool,
+    ) -> Vec<Action> {
         let text = "Blocked by mcp-mandate: the audit log can't be written, so nothing passes until it can";
         match (from, classify(frame)) {
             (Origin::Client, Ok(Message::Request { id, method })) => {
-                self.pending.remove(&id_key(&id));
+                if forwarded {
+                    self.pending.remove(&id_key(&id));
+                }
                 vec![Action::ToClient(encode(&blocked_reply(
                     &id,
                     text,
@@ -495,6 +572,10 @@ impl Gate {
                 vec![Action::ToClient(encode(&blocked_reply(&id, text, reply)))]
             }
             (Origin::Server, Ok(Message::Request { id, .. })) => {
+                // The client never sees it, so it will never answer.
+                if forwarded {
+                    self.server_pending.remove(&id_key(&id));
+                }
                 vec![Action::ToServer(encode(&rpc_error(&id, text)))]
             }
             _ => Vec::new(),
@@ -504,7 +585,7 @@ impl Gate {
     /// Notes why the current message is blocked (or, in observe mode,
     /// would be).
     fn note_block(&mut self, reason: &str, would: audit::Verdict) {
-        self.event.reason = Some(clip(reason, MAX_REASON));
+        self.event.reason = Some(self.audit_text(reason, MAX_REASON));
         if self.observe() {
             self.event.would = Some(would);
         }
@@ -517,14 +598,15 @@ impl Gate {
             self.event.would = Some(audit::Verdict::Modify);
         }
         if self.event.changes.len() < MAX_CHANGES {
-            self.event.changes.push(clip(&change, MAX_REASON));
+            let change = self.audit_text(&change, MAX_REASON);
+            self.event.changes.push(change);
         } else {
             self.more_changes += 1;
         }
     }
 
     fn drop_line(&mut self, error: &ParseError, direction: &str, frame: &[u8]) -> Vec<Action> {
-        self.event.reason = Some(clip(&error.to_string(), MAX_REASON));
+        self.event.reason = Some(self.audit_text(&error.to_string(), MAX_REASON));
         warn!(direction, reason = %error, bytes = frame.len(), "dropped a line that isn't JSON-RPC");
         Vec::new()
     }
@@ -550,15 +632,21 @@ impl Gate {
                 self.resource_request(frame, id, method)
             }
             "ping" | "logging/setLevel" => to_server(frame),
-            "completion/complete" => match self.secret_in(&params(frame)) {
-                Some(kind) => {
-                    let reason = format!(
-                        "the completion request contains what looks like a secret ({kind})"
-                    );
-                    self.block_client(frame, id, method, reason, Reply::Error)
+            "completion/complete" => {
+                let reason = match read_params(frame) {
+                    Some(params) => self.secret_in(&params).map(|kind| {
+                        format!("the completion request contains what looks like a secret ({kind})")
+                    }),
+                    None => Some(
+                        "the completion request can't be read in full, so it can't be checked"
+                            .to_owned(),
+                    ),
+                };
+                match reason {
+                    Some(reason) => self.block_client(frame, id, method, reason, Reply::Error),
+                    None => to_server(frame),
                 }
-                None => to_server(frame),
-            },
+            }
             _ if self.policy.unknown_requests == Rule::Allow => to_server(frame),
             _ => {
                 let reason = format!("`{method}` isn't a request mcp-mandate knows how to check");
@@ -568,27 +656,32 @@ impl Gate {
     }
 
     fn tool_call(&mut self, frame: &[u8], id: &Value) -> Vec<Action> {
-        let params = params(frame);
-        let Some(name) = params.get("name").and_then(Value::as_str) else {
+        let mut params = params(frame);
+        let Some(name) = params
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
             let reason = "the call doesn't name a tool".to_owned();
             return self.block_client(frame, id, "tools/call", reason, Reply::ToolError);
         };
+        // Taken out, not copied: the arguments can be most of the message.
         let arguments = params
-            .get("arguments")
-            .cloned()
+            .as_object_mut()
+            .and_then(|params| params.remove("arguments"))
             .unwrap_or_else(|| json!({}));
-        self.event.item = Some(clip(name, MAX_NAME));
+        self.event.item = Some(self.audit_text(&name, MAX_NAME));
         self.event.args_sha256 = Some(fingerprint(&arguments));
         let verdict = if self.pending.len() >= MAX_PENDING {
             Err(Refusal::from(
                 "too many requests are waiting for the server".to_owned(),
             ))
         } else {
-            self.check_tool_call(name, &arguments)
+            self.check_tool_call(&name, &arguments)
         };
         let actions = match verdict {
             Ok(()) => {
-                debug!(tool = name, "allowed a tool call");
+                debug!(tool = %name, "allowed a tool call");
                 to_server(frame)
             }
             Err(refusal) => self.block_client(frame, id, "tools/call", refusal, Reply::ToolError),
@@ -596,8 +689,7 @@ impl Gate {
         // Whatever reaches the server (in observe mode, even a call that
         // would be blocked) is tracked, so its output can taint the session.
         if forwards_to_server(&actions) {
-            self.pending
-                .insert(id_key(id), Pending::ToolCall(name.to_owned()));
+            self.pending.insert(id_key(id), Pending::ToolCall(name));
         }
         actions
     }
@@ -666,7 +758,7 @@ impl Gate {
         self.event.args_sha256 = params.get("arguments").map(fingerprint);
         let reason = match params.get("name").and_then(Value::as_str) {
             Some(name) => {
-                self.event.item = Some(clip(name, MAX_NAME));
+                self.event.item = Some(self.audit_text(name, MAX_NAME));
                 if !self.session.prompts.contains(name) {
                     self.not_verified(Kind::Prompt, name)
                 } else if let Some(kind) = params
@@ -701,7 +793,7 @@ impl Gate {
     fn resource_request(&mut self, frame: &[u8], id: &Value, method: &str) -> Vec<Action> {
         let params = params(frame);
         if let Some(uri) = params.get("uri").and_then(Value::as_str) {
-            self.event.item = Some(clip(uri, MAX_NAME));
+            self.event.item = Some(self.audit_text(uri, MAX_NAME));
         }
         let uri = params.get("uri").and_then(Value::as_str);
         // A template accepts any suffix, so a URI can carry data out.
@@ -768,11 +860,13 @@ impl Gate {
             Some(Pending::List(method)) => self.event.method = Some(method.clone()),
             Some(Pending::ToolCall(tool)) => {
                 self.event.method = Some("tools/call".to_owned());
-                self.event.item = Some(clip(tool, MAX_NAME));
+                self.event.item = Some(self.audit_text(tool, MAX_NAME));
             }
             Some(Pending::ResourceRead) => self.event.method = Some("resources/read".to_owned()),
             Some(Pending::PromptGet) => self.event.method = Some("prompts/get".to_owned()),
-            Some(Pending::Other(method)) => self.event.method = Some(method.clone()),
+            Some(Pending::Other(method)) => {
+                self.event.method = Some(self.audit_text(method, MAX_NAME));
+            }
             None => {}
         }
         let redact = self.policy.secrets.redact_responses;
@@ -791,6 +885,8 @@ impl Gate {
             warn!("dropped a server message: {reason}");
             return Vec::new();
         };
+        // (An `error` member is always an object here: classifying refuses
+        // any other, and one next to a `result`.)
         if let Some(Pending::List(method)) = &pending
             && message.get("error").is_none()
             && !expected_shape(method, &message)
@@ -861,7 +957,7 @@ impl Gate {
     fn mark_tainted(&mut self, source: String) {
         if self.session.taint.is_none() {
             warn!(%source, "the session read untrusted content: tools that can send data out are now held");
-            self.event.taint = Some(clip(&source, MAX_REASON));
+            self.event.taint = Some(self.audit_text(&source, MAX_REASON));
             if let Some(shared) = &self.shared_taint {
                 shared.set(&source);
             }
@@ -911,7 +1007,7 @@ impl Gate {
             .and_then(|info| info.get("version"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        self.event.item = Some(clip(&format!("{server} {server_version}"), MAX_NAME));
+        self.event.item = Some(self.audit_text(&format!("{server} {server_version}"), MAX_NAME));
 
         let text = match result.get("instructions") {
             None => return false,
@@ -1151,16 +1247,6 @@ fn without_line_ending(frame: &[u8]) -> &[u8] {
     frame.strip_suffix(b"\r").unwrap_or(frame)
 }
 
-/// A request id for the audit log; a very long one is replaced by its hash.
-fn audit_id(id: &Value) -> Value {
-    let text = id.to_string();
-    if text.len() <= MAX_ID_BYTES {
-        id.clone()
-    } else {
-        Value::String(format!("sha256:{}", audit::sha256_hex(text.as_bytes())))
-    }
-}
-
 /// `text`, cut to at most `max` bytes (at a character boundary), with "…"
 /// added when cut.
 fn clip(text: &str, max: usize) -> String {
@@ -1214,10 +1300,14 @@ fn to_client(frame: &[u8]) -> Vec<Action> {
 
 /// A message's `params`, or `null`.
 fn params(frame: &[u8]) -> Value {
-    serde_json::from_slice::<Value>(frame)
-        .ok()
-        .and_then(|mut message| message.get_mut("params").map(Value::take))
-        .unwrap_or(Value::Null)
+    read_params(frame).unwrap_or(Value::Null)
+}
+
+/// A message's `params` (`null` when it has none), or `None` when the
+/// message can't be read in full.
+fn read_params(frame: &[u8]) -> Option<Value> {
+    let mut message = serde_json::from_slice::<Value>(frame).ok()?;
+    Some(message.get_mut("params").map_or(Value::Null, Value::take))
 }
 
 fn id_key(id: &Value) -> String {

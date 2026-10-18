@@ -218,16 +218,36 @@
       ]
     },
     {
+      "id": "template-variable-is-a-dot-segment",
+      "kind": "attack",
+      "about": "A variable filled with just `.` or `..` (plain or percent-encoded), or two variables that make `..` together, climbs out of the folder an approved template names.",
+      "pinned": {"resource_templates": [
+        {"uriTemplate": "file:///docs/{name}", "name": "Docs"},
+        {"uriTemplate": "file:///p/{a}/{b}", "name": "Pairs"},
+        {"uriTemplate": "file:///q/{a}{b}", "name": "Joined"},
+        {"uriTemplate": "file:///base/{dir}/{+rest}", "name": "Tree"}
+      ]},
+      "steps": [
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "file:///docs/.."}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "file:///docs/%2e%2e"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "file:///p/../.aws"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "file:///q/.%2E"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 5, "method": "resources/read", "params": {"uri": "file:///base/../etc/passwd"}}, "expect": "block"}
+      ]
+    },
+    {
       "id": "template-reads-inside-it",
       "kind": "benign",
-      "about": "Reads that stay inside approved templates pass, including nested paths for `{+path}`.",
+      "about": "Reads that stay inside approved templates pass, including nested paths for `{+path}` and names that start with a dot.",
       "pinned": {"resource_templates": [
         {"uriTemplate": "file:///docs/{name}", "name": "Docs"},
         {"uriTemplate": "file:///work/{+path}", "name": "Work"}
       ]},
       "steps": [
         {"from": "client", "send": {"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "file:///docs/intro.md"}}, "expect": "forward"},
-        {"from": "client", "send": {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "file:///work/src/lib/main.rs"}}, "expect": "forward"}
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "file:///work/src/lib/main.rs"}}, "expect": "forward"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "file:///docs/.notes.md"}}, "expect": "forward"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "file:///work/src/.config/app.toml"}}, "expect": "forward"}
       ]
     }
   ]

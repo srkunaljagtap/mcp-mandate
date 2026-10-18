@@ -14,6 +14,9 @@ use crate::{Event, GENESIS, Problem, seal, sha256_hex, unseal};
 
 /// Longest line the log writes or reads back as its last entry.
 pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// How much of the end of the log is read first to find its last entry;
+/// more is read only if that entry is longer.
+const TAIL_BYTES: u64 = 8 * 1024;
 
 /// Somewhere decisions are recorded.
 pub trait Recorder: Send {
@@ -40,10 +43,13 @@ pub enum AuditError {
         path.display()
     )]
     Tail { path: PathBuf, problem: Problem },
-    #[error("the audit log {} was moved, replaced or deleted while in use", path.display())]
+    #[error(
+        "the audit log {} was moved, replaced or deleted while in use; restart mcp-mandate to use the file now at that path",
+        path.display()
+    )]
     Replaced { path: PathBuf },
     #[error(
-        "the audit log {} shrank from {expected} to {actual} bytes while in use: entries were removed",
+        "the audit log {} shrank from {expected} to {actual} bytes while in use: entries were removed; restart mcp-mandate to carry on from what's left",
         path.display()
     )]
     Shrank {
@@ -78,6 +84,8 @@ struct LogFile {
     /// The file's device and inode, to notice it being replaced.
     #[cfg(unix)]
     identity: (u64, u64),
+    /// Where the end of the file is read into, kept between catch-ups.
+    tail: Vec<u8>,
 }
 
 /// An entry as written, before its hash is added.
@@ -169,6 +177,7 @@ impl LogFile {
             seq: 0,
             prev: GENESIS.to_owned(),
             len: 0,
+            tail: Vec::new(),
         };
         log.file.lock().map_err(open_error)?;
         let caught_up = log.catch_up();
@@ -236,34 +245,49 @@ impl LogFile {
     /// Reads the last entry, to continue the chain from it.
     fn catch_up(&mut self) -> Result<(), AuditError> {
         let len = self.file_len()?;
-        let tail_error = |problem| AuditError::Tail {
-            path: self.path.clone(),
-            problem,
-        };
         if len == 0 {
             (self.seq, self.prev, self.len) = (0, GENESIS.to_owned(), 0);
             return Ok(());
         }
-        let window = len.min(MAX_LINE_BYTES as u64 + 1);
-        let mut bytes = vec![0; usize::try_from(window).unwrap_or(MAX_LINE_BYTES)];
-        (&self.file)
-            .seek(SeekFrom::Start(len - window))
-            .and_then(|_| (&self.file).read_exact(&mut bytes))
-            .map_err(|source| self.write_error(source))?;
-        let Some((b'\n', body)) = bytes.split_last() else {
-            return Err(tail_error(Problem::Incomplete));
+        let mut tail = std::mem::take(&mut self.tail);
+        let last = self.last_entry(len, &mut tail);
+        self.tail = tail;
+        let (seq, prev) = last?;
+        (self.seq, self.prev, self.len) = (seq, prev, len);
+        Ok(())
+    }
+
+    /// The number and hash of the last entry in a file `len` bytes long,
+    /// reading the end of the file into `tail`: a little first, and twice as
+    /// much each time that holds no whole line, up to the longest line.
+    fn last_entry(&self, len: u64, tail: &mut Vec<u8>) -> Result<(u64, String), AuditError> {
+        let tail_error = |problem| AuditError::Tail {
+            path: self.path.clone(),
+            problem,
         };
-        let start = match body.iter().rposition(|&byte| byte == b'\n') {
-            Some(newline) => newline + 1,
-            None if window < len => return Err(tail_error(Problem::NotAnEntry)),
-            None => 0,
+        let longest = MAX_LINE_BYTES as u64 + 1;
+        let mut window = len.min(TAIL_BYTES);
+        let start = loop {
+            tail.resize(usize::try_from(window).unwrap_or(MAX_LINE_BYTES), 0);
+            (&self.file)
+                .seek(SeekFrom::Start(len - window))
+                .and_then(|_| (&self.file).read_exact(tail.as_mut_slice()))
+                .map_err(|source| self.write_error(source))?;
+            let Some((b'\n', body)) = tail.split_last() else {
+                return Err(tail_error(Problem::Incomplete));
+            };
+            match body.iter().rposition(|&byte| byte == b'\n') {
+                Some(newline) => break newline + 1,
+                None if window == len => break 0,
+                None if window >= longest => return Err(tail_error(Problem::NotAnEntry)),
+                None => window = (window * 2).min(len).min(longest),
+            }
         };
-        let sealed = unseal(&body[start..]).map_err(tail_error)?;
+        let sealed = unseal(&tail[start..tail.len() - 1]).map_err(tail_error)?;
         let Some(seq) = sealed.fields.get("seq").and_then(serde_json::Value::as_u64) else {
             return Err(tail_error(Problem::NotAnEntry));
         };
-        (self.seq, self.prev, self.len) = (seq, sealed.hash, len);
-        Ok(())
+        Ok((seq, sealed.hash))
     }
 
     fn file_len(&self) -> Result<u64, AuditError> {
@@ -488,6 +512,10 @@ pub(crate) mod tests {
 
         let error = log.record(&message(Verdict::Allow)).unwrap_err();
         assert!(matches!(error, AuditError::Shrank { .. }), "{error}");
+        assert!(
+            log.record(&message(Verdict::Allow)).is_err(),
+            "it stays stopped"
+        );
     }
 
     #[test]
@@ -499,6 +527,48 @@ pub(crate) mod tests {
 
         let error = log.record(&message(Verdict::Allow)).unwrap_err();
         assert!(matches!(error, AuditError::Replaced { .. }), "{error}");
+
+        // A new file at the path (a rotated log, say) isn't taken up until
+        // a restart, so entries can't vanish unnoticed.
+        std::fs::write(&path, b"").unwrap();
+        assert!(log.record(&message(Verdict::Allow)).is_err());
+        let mut restarted = Log::open(&path).unwrap();
+        restarted.record(&message(Verdict::Allow)).unwrap();
+        assert_eq!(verify(&path, None).unwrap().entries, 1);
+    }
+
+    #[test]
+    fn catches_up_past_a_long_last_entry() {
+        let path = temp_dir("long-tail").join("audit.jsonl");
+        let mut a = Log::open(&path).unwrap();
+        let mut b = Log::open(&path).unwrap();
+        a.record(&message(Verdict::Allow)).unwrap();
+        // Longer than the first read of the end of the file.
+        a.record(&Event {
+            reason: Some("x".repeat(100 * 1024)),
+            ..message(Verdict::Block)
+        })
+        .unwrap();
+        b.record(&message(Verdict::Allow)).unwrap();
+
+        let entries = lines(&path);
+        assert_eq!(entries[2]["seq"], 3);
+        assert_eq!(entries[2]["prev"], entries[1]["hash"]);
+        assert_eq!(verify(&path, None).unwrap().entries, 3);
+    }
+
+    #[test]
+    fn catching_up_reads_only_the_end_of_the_log() {
+        let path = temp_dir("short-tail").join("audit.jsonl");
+        let mut a = Log::open(&path).unwrap();
+        let mut b = Log::open(&path).unwrap();
+        for _ in 0..3 {
+            a.record(&message(Verdict::Allow)).unwrap();
+            b.record(&message(Verdict::Allow)).unwrap();
+        }
+        let tail = b.file.lock().unwrap().tail.capacity();
+        assert!(tail <= TAIL_BYTES as usize, "{tail}");
+        assert_eq!(verify(&path, None).unwrap().entries, 6);
     }
 
     #[cfg(target_os = "linux")]

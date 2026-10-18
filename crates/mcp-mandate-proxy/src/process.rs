@@ -117,6 +117,17 @@ impl ServerProcess {
     }
 }
 
+impl Drop for ServerProcess {
+    /// Kills the server's whole tree if it's still running, for example
+    /// after a panic. (Only while the server itself hasn't been reaped, so
+    /// its group id can't belong to someone else yet.)
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            self.signal_tree(Stop::Force);
+        }
+    }
+}
+
 /// Puts the server in a Job Object that kills every process in it when the
 /// job closes. Without one (if Windows refuses), only the server itself
 /// can be stopped.
@@ -199,12 +210,68 @@ impl Signals {
     }
 }
 
+impl Default for Signals {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(unix)]
 async fn next(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
     match signal {
         Some(signal) => signal.recv().await,
         // Registration failed: this signal never arrives.
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use std::process::Stdio;
+
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    use super::*;
+
+    /// Whether a process with this id is running (a zombie, exited but not
+    /// yet reaped, counts as gone).
+    fn alive(pid: &str) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    #[tokio::test]
+    async fn dropping_a_running_server_stops_what_it_started() {
+        // The "server" starts a helper and reports its id.
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 300 & echo $!; sleep 300"])
+            .stdout(Stdio::piped());
+        let mut server = ServerProcess::spawn(&mut command).unwrap();
+        let stdout = server.child_mut().stdout.take().unwrap();
+        let helper = timeout(
+            Duration::from_secs(10),
+            BufReader::new(stdout).lines().next_line(),
+        )
+        .await
+        .expect("the script reported its helper")
+        .unwrap()
+        .unwrap();
+        assert!(alive(&helper), "the helper should be running");
+
+        drop(server);
+        for _ in 0..50 {
+            if !alive(&helper) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("process {helper} outlived the server it was started by");
     }
 }
 

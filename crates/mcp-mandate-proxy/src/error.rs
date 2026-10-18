@@ -36,8 +36,14 @@ pub enum ProxyError {
     Status { method: String, status: u16 },
     #[error("the MCP server's reply to `{0}` isn't a JSON-RPC message")]
     BadReply(String),
+    #[error("the MCP server's `{method}` listing goes past {limit}")]
+    TooLong { method: String, limit: String },
     #[error("couldn't get a credential for the MCP server")]
     Credential(#[from] crate::gateway::CredentialError),
+    /// A stop signal arrived; the server was stopped. Holds the exit code
+    /// that reports the signal.
+    #[error("stopped by a signal")]
+    Interrupted(i32),
 }
 
 impl From<reqwest::Error> for ProxyError {

@@ -16,7 +16,7 @@ Each file is one class of attack:
 | `exfiltration.json` | Reading untrusted content, then sending data out |
 | `secrets.json` | Secrets in what servers send, and in what clients send |
 | `arguments.json` | Shell injection, oversized and malformed arguments, denied and held tools |
-| `protocol.json` | Batches, junk, unknown methods, server requests, made-up and repeated responses |
+| `protocol.json` | Batches, junk, ambiguous messages, unknown methods, server requests, made-up and repeated responses and ids |
 
 ## Format
 
