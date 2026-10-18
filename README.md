@@ -14,14 +14,20 @@ tricked by something it read can't act with your keys.
 
 ## How it works
 
-Two parts, two speeds:
+Three parts. Scout reviews a server before you trust it, the gate checks
+every call, and the audit log records what the gate decided. Scout and the
+gate run at two speeds:
 
 | | Gate | Scout |
 |---|---|---|
 | Runs on | Every MCP call, in line | New or changed servers, offline |
 | Uses an LLM | Never | Optional, with your own API key |
 | Can decide | Allow, block, hold | Only propose rules |
-| When it fails | Closed (blocks) | Safe (no new rules) |
+| When it fails | Closed (blocks), in `enforce` mode | Safe (no new rules) |
+
+A policy starts in `observe` mode: the gate logs what it would block, hide
+or redact and lets everything through. It blocks only once the policy says
+`mode = "enforce"` (see [Modes](#whats-checked-today)).
 
 For each tool call the gate will:
 
@@ -94,6 +100,18 @@ folder that user can write. Inside the container, `listen` on
 on the same host, `-p 127.0.0.1:8443:8443`). The image has no Node.js or
 Python, so it isn't meant for `mcp-mandate run`.
 
+`mcp-mandate pin` and `scout` write their files readable only by you (see
+[Scout](#scout)). The image's user (uid 65532) isn't you, so on a Linux
+host it can't read a pins file you mount as it is. You can either:
+
+- let it read the pins files once you've checked they hold no secret
+  (`chmod a+r config/*.pins.toml`, or `setfacl -m u:65532:r` for that user
+  alone); or
+- run the container as yourself: add `--user "$(id -u):$(id -g)"` and mount
+  a folder you own at `/audit` instead of the volume
+  (`-v "$PWD/audit:/audit"`), because the volume's folder belongs to the
+  image's user.
+
 ## Quick start
 
 **0. Review the server (optional).** [Scout](#scout) looks for poisoned
@@ -112,11 +130,13 @@ mcp-mandate pin --out everything.pins.toml -- npx -y @modelcontextprotocol/serve
 
 Read the pins file before going further: everything pinned in it is trusted.
 Each entry shows the item's description (`text`) and everything else it
-showed (`details`: title, parameters, annotations). Invisible and
-direction-changing characters, and control characters other than line
-breaks and tabs, are written as escapes: `\u{…}` in `text` and `details`,
-and TOML's own `\uXXXX` in item names and URIs, which still read back as
-the names the server sent. Pin an exact package *version* (`@1.0.0` above).
+showed (`details`: title, parameters, annotations). Characters that show
+as nothing or change how the text around them shows (Unicode's
+default-ignorable and format characters, such as zero-width characters,
+direction overrides, variation selectors and "tag" characters), and
+control characters other than line breaks and tabs, are written as
+escapes: `\u{…}` in `text` and `details`, and TOML's own `\uXXXX` in item
+names and URIs, which still read back as the names the server sent. Pin an exact package *version* (`@1.0.0` above).
 Without one, or with a tag or range such as `@latest` or `@^1.0.0`, `npx`
 fetches the newest matching release on every run, so the code can change
 while its descriptions don't, and mcp-mandate warns about it.
@@ -124,15 +144,20 @@ while its descriptions don't, and mcp-mandate warns about it.
 The pins file and Scout's draft name the server by its command. Anything in
 the command that looks like a password or token is masked, and so is the
 same text in mcp-mandate's logs, including the package named in the warning
-about an unpinned version: a URL's user name, password, query and fragment,
-the value of `NAME=value`, the values of options and headers such as
-`--api-key` or `Authorization:`, and keys of known shapes. A value can have
-spaces, so it's masked up to its closing quote if it opens one, or else up
-to the next option: `--db-password=correct horse` and
-`Authorization:Bearer <token>` are masked whole, even when the token comes
-as a separate argument. In a script passed to a shell
-(`sh -c "API_KEY=… node server.js"`), that masks the words after an
-unquoted value too. A secret with no recognizable shape in a plain argument
+about an unpinned version: the user name, password, query and fragment of
+every URL, wherever it is in an argument (also in a package spec such as
+`name@git+https://user:token@host/repo.git`), the value of `NAME=value`,
+the values of options and headers such as `--api-key` or `Authorization:`,
+and keys of known shapes. A value can have spaces, so it's masked up to its
+closing quote if it opens one, or else up to the next option:
+`--db-password=correct horse` and `Authorization: Bearer <token>` are
+masked whole. When a client passes a value's words as separate arguments,
+the masking follows the value into the next arguments, stopping at an
+option, until it has one word for an option such as `--api-key` and two for
+a header such as `Authorization:` (a scheme and a token), so
+`Authorization:` `Bearer` `<token>` is masked however it's split. In a
+script passed to a shell (`sh -c "API_KEY=… node server.js"`), that masks
+the words after an unquoted value too. A secret with no recognizable shape in a plain argument
 isn't caught, so pass secrets to servers through environment variables
 instead. A remote server is named by its URL without its user name,
 password, query or fragment, so a key in the URL's path is kept.
@@ -175,6 +200,12 @@ pins = "everything.pins.toml"
 match = "echo"
 action = "allow"
 ```
+
+This policy is in `observe` mode, the default: the gate lets everything
+through and logs (with a warning each time it starts) what it would have
+blocked, hidden or redacted. Try it on real traffic, read the log, and
+once it blocks only what you expect, add `mode = "enforce"` at the top.
+Until then nothing is protected.
 
 **3. Run the server behind the gate:**
 
@@ -221,10 +252,15 @@ mcp-mandate audit verify policy.audit.jsonl
   path segment and `{+path}` several. No variable (alone, next to another,
   next to a dot, or after literal text such as `?path=`) can make a `.` or
   `..` segment, plain or percent-encoded, that the template's own text
-  doesn't have. No variable can hold a space or a control character
-  unencoded, because URL parsers drop or trim those (`.<tab>.` would be
-  read as `..`); percent-encode them (`%20`). Other template operators
-  match nothing.
+  doesn't have, and no variable can hold a `.` or `..` between query
+  delimiters (`&`, `;`, `=`): `?path=&path=../secret.txt` is refused,
+  because a query parser reads it as a second `path`. No variable can hold
+  a space or another whitespace or control character unencoded, ASCII or
+  not (a tab, a no-break space, NEL), because URL parsers drop or trim
+  some of those (`.<tab>.` would be read as `..`), and so do servers that
+  trim text; percent-encode them (`%20`). A read refused for one of these
+  reasons says so and names the template it otherwise fits. Other template
+  operators match nothing.
 - **Policy.** Each tool is allowed, held or denied (default: denied). When
   several rules match, the most restrictive wins. Denied tools are hidden
   from the model. A rule's `match` is a glob on the whole tool name (`*`,
@@ -250,10 +286,14 @@ mcp-mandate audit verify policy.audit.jsonl
 - **Messages the gate can't check reliably are dropped:** batches, repeated
   keys, a request without a real id, a message that is both a request and a
   response, a method name over 256 bytes, and a message that would take
-  more memory to check than 1,000,000 numbers do (about 64 MB). Small
-  objects, arrays and strings take more memory each, so a message of small
-  objects is refused at roughly 60,000 to 75,000 of them; a long text or a
-  base64 image counts as one value.
+  more memory to check than 1,000,000 numbers do (about 64 MB). Objects
+  cost far more than numbers, so the limit comes sooner the more objects a
+  message holds: at about 75,000 objects of one member, 40,000 of five, or
+  20,000 of fifteen. A long text or a base64 image counts as one value. A
+  message too large to check that is a request, or the answer to a request
+  that's waiting, is answered with an error saying so instead (a tool call
+  as a tool error the model can read), so nobody waits for an answer that
+  won't come.
 - **Taint.** Once a tool that reads untrusted content answers (a web
   fetch, an inbox, anything a stranger could have written), a resource is
   read, or a prompt is fetched (only a prompt's listing is pinned, not the
@@ -272,19 +312,34 @@ mcp-mandate audit verify policy.audit.jsonl
 - **Taint is shared across an agent's servers.** Reading a web page through
   one server holds sending email through another. Every `mcp-mandate run`
   started by the same agent process shares one taint for as long as that
-  process runs. The taint is kept in a file only you can read: in
-  `$XDG_RUNTIME_DIR/mcp-mandate` or `~/.local/state/mcp-mandate` on Linux
-  and macOS (failing both, a folder in the temporary folder), and in
-  `%LOCALAPPDATA%\mcp-mandate\taint` on Windows. Each server takes the
-  first of these it can use, so all of an agent's servers must see the
-  same `XDG_RUNTIME_DIR`; mcp-mandate warns when it has to fall back to a
-  later folder, because servers using another folder don't share with it.
-  While a server that has seen the taint runs, it checks the file every
-  minute: it puts the file back if something removed it (a cleaner of
-  temporary files, say) and touches it so it doesn't look old. If the file
-  can't be written when a server is tainted (a full disk, say), that server
-  logs a warning and keeps retrying every minute; until a write succeeds,
-  the agent's other servers aren't held. When
+  process runs. After upgrading from 0.1.0, restart the agent (your MCP
+  client): on Linux, 0.1.0 named an agent's taint file differently (unless
+  `MCP_MANDATE_AGENT` names the agent), so a server still running 0.1.0
+  and one started after the upgrade don't share taint. The taint is kept in
+  a file only you can read: in `$XDG_RUNTIME_DIR/mcp-mandate` or
+  `~/.local/state/mcp-mandate` on Linux and macOS (failing both, a folder
+  in the temporary folder), and in `%LOCALAPPDATA%\mcp-mandate\taint` on
+  Windows. Before every write, mcp-mandate checks again that the folder is
+  yours and closed to others (making it again if something removed it),
+  and it never writes through a link, so another user can't redirect the
+  file, even in the temporary folder. Each server takes the first of these
+  folders it can use, so all of an agent's servers must see the same
+  `XDG_RUNTIME_DIR`; mcp-mandate warns when it has to fall back to a later
+  folder, because servers using another folder don't share with it. While
+  a server that has seen the taint runs, it checks the file every minute,
+  and at most once a second while messages pass through it: it puts the
+  file back if something removed it (a cleaner of temporary files, say)
+  and touches it so it doesn't look old. If the file can't be written when
+  an answer taints a server's session (a full disk, say), that answer
+  doesn't reach the client: the request gets an error saying the taint
+  couldn't be shared with the agent's other servers, and the audit log
+  records it. A sampling request from the server is refused the same way.
+  Observe mode only warns. The server itself stays tainted and keeps
+  retrying, with warnings; once a write succeeds, answers that taint it
+  pass again. If the folder itself is removed while the agent runs and
+  can't be made again (`$XDG_RUNTIME_DIR` is removed when you log out,
+  even if the agent goes on running in `tmux` or `screen`), the agent's
+  servers that haven't seen the taint yet are no longer held. When
   mcp-mandate is started through a shell or wrapper, set
   `MCP_MANDATE_AGENT` to the same name in each server's configuration so
   they're still counted as one agent. A named agent's taint lasts while any
@@ -316,13 +371,20 @@ mcp-mandate audit verify policy.audit.jsonl
 - **Audit log.** Every message that crosses the gate is recorded with what
   the gate did and why, in a hash chain that shows any later edit. See
   [The audit log](#the-audit-log).
-- **Modes.** `enforce` (the default) blocks; `observe` logs what would be
-  blocked, hidden or redacted and lets it through, for trying a policy on
-  real traffic. Messages the gate can't read reliably are dropped in
-  `observe` mode too: anything that isn't JSON-RPC 2.0, and the repeated
-  keys, requests without a real id, messages that are both a request and a
-  response, long method names and oversized messages listed above. Only
-  batches pass. A request dropped this way gets no answer.
+- **Modes.** `observe` (the default) logs what would be blocked, hidden or
+  redacted and lets it through, for trying a policy on real traffic;
+  mcp-mandate warns every time it starts a server in `observe` mode.
+  `enforce` blocks, and a policy must say `mode = "enforce"` to get it.
+  What the gate blocks, hides, holds, redacts or drops (all of the above)
+  it does only in `enforce` mode; the HTTPS gateway's token checks and
+  limits apply in both. In `observe` mode, messages the gate can't read
+  reliably pass through unchanged too, each with a "would drop" warning
+  and an audit entry saying what `enforce` mode would have done: anything
+  that isn't JSON-RPC 2.0, batches, and the repeated keys, requests
+  without a real id, messages that are both a request and a response, long
+  method names and oversized messages listed above. In `enforce` mode
+  they're dropped, and a request dropped this way gets no answer (unless
+  it's too large to check: see above).
 
 A blocked tool call comes back to the agent as a tool error that says why
 (for example, "Blocked by mcp-mandate: tool `x` changed since it was
@@ -367,19 +429,21 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
 - **The server never sees your token.** The gateway removes it and signs in
   with its own credential for that one server: a secret from an environment
   variable or file (never the config file itself), or short-lived OAuth
-  client-credential tokens. Only the headers MCP needs are passed on, and
-  redirects aren't followed, so a server can't bounce the credential
-  elsewhere. A server that echoes the credential back gets it redacted, in
-  replies and event streams alike: the whole header value, the token after
-  its scheme, the client secret, and every client-credential token that may
-  still be valid: until the expiry the token endpoint gave (`expires_in`),
-  or for a day when it gave none, the 16 newest at most.
+  client-credential tokens. A credential sent in a header must be ASCII.
+  Only the headers MCP needs are passed on, and redirects aren't followed,
+  so a server can't bounce the credential elsewhere. A server that echoes
+  the credential back gets it redacted, in replies and event streams alike:
+  the whole header value, the token after its scheme, the client secret,
+  and every client-credential token that may still be valid: until the
+  expiry the token endpoint gave (`expires_in`), or for a day when it gave
+  none, the 16 newest at most. An event's id isn't a message, so the gate
+  doesn't check it: an id holding the credential, or anything else the
+  policy takes for a secret, is dropped.
 - **Sessions** belong to the caller who opened them, and each has its own
   gate: its own taint, its own audit session. The server's session id is
   never shown to the client. Sessions unused for 30 minutes close, unless
-  a request is still in flight: a long call isn't cut off, however quiet
-  its stream. Closing
-  a session also ends its event streams and the server's session.
+  a request is still in flight. Closing a session also ends its event
+  streams and the server's session.
 - **Every message**, including streamed (SSE) ones, goes through the gate
   exactly as with `mcp-mandate run`. Each session's audit log entries name
   the caller (`sub`) and their OAuth client.
@@ -397,12 +461,18 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   notifications, passed on (these never count as requests, so a client can
   always answer or cancel what's in flight), 4 event streams, and 8 of the
   gate's refusals of the server's own requests being sent at once (a server
-  sending more requests waits until one is taken). An event stream ends
-  when the token it was opened with expires; clients reconnect with a fresh
-  one. The
-  connection cap is shared by everyone who can reach the port, so put a
-  public gateway behind a proxy that limits connections and requests per
-  client.
+  sending more requests waits until one is taken). Across all callers,
+  messages are read and checked as many at a time as the machine has CPUs;
+  the rest wait their turn. Nothing outlives the token it came with: an
+  event stream ends when the token it was opened with expires, and a
+  request still waiting for its answer when the token it was sent with
+  expires is given up on (its event stream ends, or the client gets
+  `504`); clients carry on with a fresh token. A reply or event stream
+  from the server that sends nothing for 5 minutes is ended too, so a call
+  that runs longer needs the server to send progress notifications or
+  keep-alive comments meanwhile. The connection cap is shared by everyone
+  who can reach the port, so put a public gateway behind a proxy that
+  limits connections and requests per client.
 
 ## Scout
 
@@ -460,12 +530,20 @@ Scout exits 0 whenever it ran; the findings are in the report.
 `scout` and `pin` start the server to see what it offers, so it runs with
 your permissions. For a server you don't trust yet, run them in a container
 or sandbox. Neither replaces an existing file unless you pass `--force`.
-On Linux and macOS only you can write to the files they write. Others can
-read them (they hold no secrets), so a gateway running as another user,
-such as the container image's, can load them. A server that lists more
-than 10,000 tools, prompts, resources or resource templates, spreads a list
-over more than 100 pages, or sends a reply holding more than 1,000,000
-values is an error rather than recorded in part. A server that doesn't list
+On Linux and macOS, only you can read or write the files they write. Both
+name the server by its command, so a secret in it that masking misses (see
+[Quick start](#quick-start)) stays private. To use them with the container
+image, see [Install](#install). The listing is an error rather than
+recorded in part if a server:
+
+- lists more than 10,000 tools, prompts, resources or resource templates;
+- spreads a list over more than 100 pages;
+- sends a reply too large for the gate to check (see [What's checked
+  today](#whats-checked-today)); or
+- has lists that together would take more than about 256 MB of memory.
+
+A reply the gate would drop for another reason (it isn't JSON-RPC 2.0, or
+it repeats a key) doesn't count as an answer. A server that doesn't list
 its resource templates is recorded as having none, with a warning, and the
 gate hides any it has.
 
@@ -492,16 +570,23 @@ jq -c 'select(.verdict == "block") | {time, item, reason}' policy.audit.jsonl
 
 - **Where:** next to the policy, named after it (`policy.toml` →
   `policy.audit.jsonl`), or wherever `[audit] path` says. Several sessions
-  can share one log. On Linux and macOS it's created readable only by you.
-  If your policies are in git, add `*.audit.jsonl` to `.gitignore`.
+  can share one log. On Linux and macOS it's created readable only by you,
+  and never opened through a symlink. If your policies are in git, add
+  `*.audit.jsonl` to `.gitignore`.
 - **If it can't be written** (a full disk, say, or another process holding
   its lock for more than 2 seconds), nothing passes: requests are answered
   with an error saying the audit log can't be written, until it can be
-  again. A gate that finds its log truncated, deleted or replaced (on
-  Windows, see below) stops writing to it until it's restarted, even once
-  a new file appears at the path, so entries can't disappear unnoticed. A
-  log that can't be opened stops `mcp-mandate run` from starting. Observe
-  mode only warns.
+  again. Once one write has waited 2 seconds for the lock, the ones after
+  it fail at once until a write gets it, so sessions sharing the log don't
+  each wait in turn. A gate stops writing to its log until it's restarted
+  if it finds the log deleted, replaced by another file (it compares the
+  file's device and inode, or on Windows its volume serial number and file
+  index), or cut short before the last entry the gate wrote or read, even
+  if the log has grown back past that point since. It stays stopped even
+  once a new file appears at the path, so entries can't disappear
+  unnoticed. In `observe` mode, all of this only warns. A log that can't be
+  opened, or whose last line is damaged, stops `mcp-mandate run` from
+  starting, in either mode.
 - **Rotating it:** stop everything that writes to the log, run
   `mcp-mandate audit verify` on it and save the head hash it prints, move
   it away, then start again. A new log begins at the same path. Logs
@@ -511,17 +596,12 @@ jq -c 'select(.verdict == "block") | {time, item, reason}' policy.audit.jsonl
   the chain, and `mcp-mandate audit verify` names the first broken line.
 - **A damaged log stops the gate.** If the last line is cut off (a crash, or
   another process appending to the file), every gate sharing the log stops
-  passing messages until it's repaired. That's the fail-closed design, but
-  it also means anything that can write the log can stop your servers.
+  passing messages until it's repaired (in `observe` mode, it warns), and
+  none can start. That's the fail-closed design, but it also means anything
+  that can write the log can stop your servers.
   Each session's first entry records the hash of the policy exactly as
   the gate read it (`policy_sha256`), so a policy changed behind your back
   shows up there.
-- **On Windows**, mcp-mandate checks only that the log's path still exists,
-  so two cases aren't noticed: a log renamed away and replaced by a new
-  file (entries go on to the renamed file), and a log deleted and recreated
-  between two entries (entries go on to the deleted file and are lost). On
-  Linux and macOS a replaced file is noticed, and the log is never opened
-  through a symlink.
 
 A chain can't show entries cut off its end, or a log rewritten from
 scratch with fresh hashes. To catch those, save the head hash that

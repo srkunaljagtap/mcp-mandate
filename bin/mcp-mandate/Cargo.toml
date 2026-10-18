@@ -1,6 +1,6 @@
 [package]
 name = "mcp-mandate"
-description = "Scout reviews MCP servers, an audit log proves every decision, and a gate checks every call between AI agents and their MCP tools"
+description = "Scout reviews MCP servers before you trust them, a hash-chained audit log records every decision, and a security gate checks every call between AI agents and their MCP tools"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
