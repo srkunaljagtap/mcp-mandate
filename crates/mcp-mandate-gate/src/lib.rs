@@ -13,12 +13,15 @@
 //!   server makes (sampling, elicitation) follow the policy.
 //! - Taint: once a tool that reads untrusted content (or a resource) has
 //!   answered, the session is tainted and tools that can send data out are
-//!   held for the rest of the session.
+//!   held for the rest of the session, in every session of the same agent.
+//!   An answer whose taint can't be shared with those doesn't pass.
 //! - Secrets: redacted from everything the server sends (keys included),
 //!   and blocked in what the client sends: tool and prompt arguments and
 //!   resource URIs.
 //! - Protocol: a response must answer a request the client is still
-//!   waiting for, and a message the gate can't read in full doesn't pass.
+//!   waiting for, and a message the gate can't read in full doesn't pass
+//!   (one too large to check that is a request, or the answer to one, is
+//!   answered with an error, so nobody waits for it).
 //!
 //! - Audit: every message gets an entry (what it was, what the gate did and
 //!   why, and hashes, never content). A message whose entry can't be
@@ -32,6 +35,7 @@ mod template;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use mcp_mandate_audit::{self as audit, MessageKind, Origin, Recorder};
 use mcp_mandate_pin::{Kind, Pins, Verdict, fingerprint};
@@ -41,7 +45,7 @@ use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
 use crate::jsonrpc::{Message, ParseError, classify};
-use crate::template::Template;
+use crate::template::{Misfit, Template};
 
 /// JSON-RPC error code for requests the gate blocks (from the range
 /// JSON-RPC leaves to implementations).
@@ -96,12 +100,19 @@ impl From<String> for Refusal {
 /// server normally has its own gate).
 pub trait SharedTaint: Send + Sync {
     /// What tainted the agent's sessions, if anything has. A tainted gate
-    /// asks before every message, and sets it again if it finds nothing,
-    /// so a record that went missing comes back.
+    /// asks while messages pass (at most once a second), and sets it again
+    /// if it finds nothing, so a record that went missing comes back.
     fn get(&self) -> Option<String>;
-    /// Records that `source` tainted them.
-    fn set(&self, source: &str);
+    /// Records that `source` tainted them. Returns whether it could: if
+    /// not, the gate doesn't pass the answer that tainted its session
+    /// (except in observe mode), since the other sessions wouldn't hold
+    /// their tools.
+    fn set(&self, source: &str) -> bool;
 }
+
+/// How often, at most, a tainted gate checks that its taint is still where
+/// the agent's other gates read it.
+const TAINT_CHECK: Duration = Duration::from_secs(1);
 
 /// One session's gate.
 pub struct Gate {
@@ -114,6 +125,10 @@ pub struct Gate {
     server_pending: HashMap<String, String>,
     session: Session,
     shared_taint: Option<Arc<dyn SharedTaint>>,
+    /// Whether the agent's other sessions were told this one is tainted.
+    taint_shared: bool,
+    /// When this gate last checked that they still can see it.
+    taint_checked: Option<Instant>,
     audit: Box<dyn Recorder>,
     /// The audit entry for the message being checked.
     event: audit::Event,
@@ -203,12 +218,32 @@ impl Session {
         self.changed.insert((kind, name.to_owned()));
     }
 
-    fn resource_allowed(&self, uri: &str) -> bool {
-        self.resources.contains(uri)
-            || self
-                .templates
-                .values()
-                .any(|template| template.matches(uri))
+    /// Whether `uri` names an approved resource or fits an approved
+    /// template. If it has a template's shape but still doesn't fit, says
+    /// why, so the model can write it again rather than give up.
+    fn resource_allowed(&self, uri: &str) -> Result<(), Option<String>> {
+        if self.resources.contains(uri) {
+            return Ok(());
+        }
+        let mut closest: Option<(&String, Misfit)> = None;
+        for (name, template) in &self.templates {
+            match template.check(uri) {
+                Ok(()) => return Ok(()),
+                Err(Misfit::Shape) => {}
+                // The first template by name, so the answer is the same
+                // every time.
+                Err(misfit) if closest.is_none_or(|(first, _)| name < first) => {
+                    closest = Some((name, misfit));
+                }
+                Err(_) => {}
+            }
+        }
+        Err(closest.map(|(name, misfit)| {
+            format!(
+                "resource URI `{uri}` fits template `{name}`, but {}",
+                misfit.describe()
+            )
+        }))
     }
 }
 
@@ -243,6 +278,8 @@ impl Gate {
             server_pending: HashMap::new(),
             session: Session::default(),
             shared_taint: None,
+            taint_shared: false,
+            taint_checked: None,
             audit,
             event: audit::Event::default(),
             more_changes: 0,
@@ -334,7 +371,7 @@ impl Gate {
             Ok(Message::Response { id, .. }) => self.client_response(frame, &id),
             Ok(Message::Batch { len }) => self.batch(len, Action::ToServer(frame.to_vec())),
             Err(ParseError::Empty) => return Vec::new(),
-            Err(error) => self.drop_line(&error, "client→server", frame),
+            Err(error) => self.unreadable(&error, Origin::Client, frame),
         };
         self.record(Origin::Client, frame, actions)
     }
@@ -435,7 +472,7 @@ impl Gate {
             }
             Ok(Message::Batch { len }) => self.batch(len, Action::ToClient(frame.to_vec())),
             Err(ParseError::Empty) => return Vec::new(),
-            Err(error) => self.drop_line(&error, "server→client", frame),
+            Err(error) => self.unreadable(&error, Origin::Server, frame),
         };
         self.record(Origin::Server, frame, actions)
     }
@@ -596,9 +633,10 @@ impl Gate {
     }
 
     /// Notes a change to the current message (in observe mode, one that
-    /// would have been made).
+    /// would have been made, unless it would have been blocked or dropped
+    /// instead).
     fn note_change(&mut self, change: String) {
-        if self.observe() {
+        if self.observe() && self.event.would.is_none() {
             self.event.would = Some(audit::Verdict::Modify);
         }
         if self.event.changes.len() < MAX_CHANGES {
@@ -609,10 +647,86 @@ impl Gate {
         }
     }
 
-    fn drop_line(&mut self, error: &ParseError, direction: &str, frame: &[u8]) -> Vec<Action> {
-        self.event.reason = Some(self.audit_text(&error.to_string(), MAX_REASON));
-        warn!(direction, reason = %error, bytes = frame.len(), "dropped a line that isn't JSON-RPC");
-        Vec::new()
+    /// A message the gate can't read reliably. It's dropped, except that a
+    /// request too large to check, or an answer to one, is answered with an
+    /// error so nobody waits for it. In observe mode, it's passed on
+    /// unchanged.
+    fn unreadable(&mut self, error: &ParseError, from: Origin, frame: &[u8]) -> Vec<Action> {
+        let answer = match error {
+            ParseError::TooManyValues => self.too_large(from, frame),
+            _ => Vec::new(),
+        };
+        let would = if answer.is_empty() {
+            audit::Verdict::Drop
+        } else {
+            audit::Verdict::Block
+        };
+        self.note_block(&error.to_string(), would);
+        let direction = match from {
+            Origin::Client => "client→server",
+            Origin::Server => "server→client",
+        };
+        if self.observe() {
+            warn!(direction, reason = %error, bytes = frame.len(), "would drop a line that isn't JSON-RPC (observe mode)");
+            return match from {
+                Origin::Client => to_server(frame),
+                Origin::Server => to_client(frame),
+            };
+        }
+        if answer.is_empty() {
+            warn!(direction, reason = %error, bytes = frame.len(), "dropped a line that isn't JSON-RPC");
+        } else {
+            warn!(direction, reason = %error, bytes = frame.len(), "answered a message too large to check with an error");
+            // Answered in the sender's place: recorded as a block, not as
+            // a changed message.
+            self.event.verdict = Some(audit::Verdict::Block);
+        }
+        answer
+    }
+
+    /// The error that answers a message too large to check, if it's a
+    /// request or the answer to one, as its top-level members say (read
+    /// alone, they cost next to nothing). Such an answer stops being
+    /// waited for.
+    fn too_large(&mut self, from: Origin, frame: &[u8]) -> Vec<Action> {
+        let Some(head) = jsonrpc::head(frame) else {
+            return Vec::new();
+        };
+        let (id, method) = match &head {
+            Message::Request { id, method } => (id, Some(method)),
+            Message::Response { id, .. } => (id, None),
+            _ => return Vec::new(),
+        };
+        self.event.id = Some(self.audit_id(id));
+        if let Some(method) = method {
+            self.event.method = Some(self.audit_text(method, MAX_NAME));
+        }
+        let text = "Blocked by mcp-mandate: the message is too large for mcp-mandate to check";
+        match (from, method) {
+            (Origin::Client, Some(method)) => {
+                vec![Action::ToClient(encode(&blocked_reply(
+                    id,
+                    text,
+                    reply_for(method),
+                )))]
+            }
+            (Origin::Server, Some(_)) => vec![Action::ToServer(encode(&rpc_error(id, text)))],
+            (Origin::Server, None) => match self.pending.remove(&id_key(id)) {
+                Some(pending) => {
+                    let reply = match pending {
+                        Pending::ToolCall(_) => Reply::ToolError,
+                        _ => Reply::Error,
+                    };
+                    let text = "Blocked by mcp-mandate: the server's answer is too large for mcp-mandate to check";
+                    vec![Action::ToClient(encode(&blocked_reply(id, text, reply)))]
+                }
+                None => Vec::new(),
+            },
+            (Origin::Client, None) => match self.server_pending.remove(&id_key(id)) {
+                Some(_) => vec![Action::ToServer(encode(&rpc_error(id, text)))],
+                None => Vec::new(),
+            },
+        }
     }
 
     fn client_request(&mut self, frame: &[u8], id: &Value, method: &str) -> Vec<Action> {
@@ -807,11 +921,13 @@ impl Gate {
                 let reason = format!("the resource URI contains what looks like a secret ({kind})");
                 self.block_client(frame, id, method, reason, Reply::Error)
             }
-            (Some(uri), None) if self.session.resource_allowed(uri) => to_server(frame),
-            (Some(uri), None) => {
-                let reason = self.not_verified(Kind::Resource, uri);
-                self.block_client(frame, id, method, reason, Reply::Error)
-            }
+            (Some(uri), None) => match self.session.resource_allowed(uri) {
+                Ok(()) => to_server(frame),
+                Err(misfit) => {
+                    let reason = misfit.unwrap_or_else(|| self.not_verified(Kind::Resource, uri));
+                    self.block_client(frame, id, method, reason, Reply::Error)
+                }
+            },
             (None, _) => {
                 let reason = "the request doesn't name a resource".to_owned();
                 self.block_client(frame, id, method, reason, Reply::Error)
@@ -907,6 +1023,43 @@ impl Gate {
             warn!("dropped: {reason}");
             return Vec::new();
         }
+        let reply = match &pending {
+            Some(Pending::ToolCall(_)) => Reply::ToolError,
+            _ => Reply::Error,
+        };
+        let taint = match &pending {
+            Some(Pending::ToolCall(tool)) => {
+                // A tool that's no longer approved counts as untrusted.
+                let reads_untrusted = self
+                    .session
+                    .tools
+                    .get(tool)
+                    .is_none_or(|info| info.traits.reads_untrusted);
+                reads_untrusted.then(|| format!("the output of tool `{tool}`"))
+            }
+            Some(Pending::ResourceRead) => self
+                .policy
+                .taint
+                .resources_are_untrusted
+                .then(|| "a resource from the server".to_owned()),
+            Some(Pending::PromptGet) => self
+                .policy
+                .taint
+                .prompts_are_untrusted
+                .then(|| "a prompt from the server".to_owned()),
+            _ => None,
+        };
+        if let Some(source) = taint
+            && !self.mark_tainted(source.clone())
+            && let Some(reason) = self.unshared_taint(&source)
+        {
+            // The client is answered in the server's place: recorded as a
+            // block, not as a changed answer.
+            self.event.verdict = Some(audit::Verdict::Block);
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            let text = format!("Blocked by mcp-mandate: {reason}, so the answer is withheld");
+            return vec![Action::ToClient(encode(&blocked_reply(&id, &text, reply)))];
+        }
         let mut modified = match pending {
             Some(Pending::List(method)) => match method.as_str() {
                 "initialize" => self.check_initialize(&mut message),
@@ -918,31 +1071,7 @@ impl Gate {
                 }
                 _ => false,
             },
-            Some(Pending::ToolCall(tool)) => {
-                // A tool that's no longer approved counts as untrusted.
-                let reads_untrusted = self
-                    .session
-                    .tools
-                    .get(&tool)
-                    .is_none_or(|info| info.traits.reads_untrusted);
-                if reads_untrusted {
-                    self.mark_tainted(format!("the output of tool `{tool}`"));
-                }
-                false
-            }
-            Some(Pending::ResourceRead) => {
-                if self.policy.taint.resources_are_untrusted {
-                    self.mark_tainted("a resource from the server".to_owned());
-                }
-                false
-            }
-            Some(Pending::PromptGet) => {
-                if self.policy.taint.prompts_are_untrusted {
-                    self.mark_tainted("a prompt from the server".to_owned());
-                }
-                false
-            }
-            Some(Pending::Other(_)) | None => false,
+            _ => false,
         };
         if redact {
             modified |= self.redact(&mut message);
@@ -958,26 +1087,64 @@ impl Gate {
 
     /// Puts this session's taint back where the agent's other gates read
     /// it, if something removed it meanwhile (a cleaner of temporary files,
-    /// say): they read only that, and this session stays tainted.
-    fn keep_taint_shared(&self) {
-        if let (Some(source), Some(shared)) = (&self.session.taint, &self.shared_taint)
-            && shared.get().is_none()
+    /// say): they read only that, and this session stays tainted. Checked
+    /// at most once every [`TAINT_CHECK`], since reading it can mean
+    /// reading a file.
+    fn keep_taint_shared(&mut self) {
+        let (Some(source), Some(shared)) = (&self.session.taint, &self.shared_taint) else {
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .taint_checked
+            .is_some_and(|checked| now.duration_since(checked) < TAINT_CHECK)
         {
-            shared.set(source);
+            return;
+        }
+        self.taint_checked = Some(now);
+        if shared.get().is_none() {
+            self.taint_shared = shared.set(source);
+            if !self.taint_shared {
+                warn!(
+                    "couldn't put this session's taint back where the agent's other servers read it"
+                );
+            }
         }
     }
 
     /// Taints the session (once; it stays tainted), and every other session
-    /// of the same agent.
-    fn mark_tainted(&mut self, source: String) {
+    /// of the same agent. Returns false when those couldn't be told (until
+    /// they are, an answer that taints the session doesn't pass).
+    fn mark_tainted(&mut self, source: String) -> bool {
         if self.session.taint.is_none() {
             warn!(%source, "the session read untrusted content: tools that can send data out are now held");
             self.event.taint = Some(self.audit_text(&source, MAX_REASON));
-            if let Some(shared) = &self.shared_taint {
-                shared.set(&source);
-            }
             self.session.taint = Some(source);
         }
+        match (&self.session.taint, &self.shared_taint) {
+            (Some(source), Some(shared)) if !self.taint_shared => {
+                self.taint_shared = shared.set(source);
+                self.taint_shared
+            }
+            _ => true,
+        }
+    }
+
+    /// For a server message whose taint couldn't be shared with the agent's
+    /// other sessions: those wouldn't hold their tools, so it doesn't pass.
+    /// Returns why, or `None` in observe mode, where it passes with a
+    /// warning.
+    fn unshared_taint(&mut self, source: &str) -> Option<String> {
+        let reason = format!(
+            "{source} tainted this session, but the taint couldn't be shared with the agent's other servers"
+        );
+        self.note_block(&reason, audit::Verdict::Block);
+        if self.observe() {
+            warn!(%reason, "would withhold the server's message (observe mode)");
+            return None;
+        }
+        error!(%reason, "withheld the server's message");
+        Some(reason)
     }
 
     /// Redacts secrets anywhere in `message` (in observe mode, only logs
@@ -1137,8 +1304,13 @@ impl Gate {
             Rule::Allow => {
                 // A sampling request puts the server's text in front of the
                 // model, like a tool's output does.
-                if method == "sampling/createMessage" {
-                    self.mark_tainted("the server's `sampling/createMessage` request".to_owned());
+                let source = "the server's `sampling/createMessage` request";
+                if method == "sampling/createMessage"
+                    && !self.mark_tainted(source.to_owned())
+                    && let Some(reason) = self.unshared_taint(source)
+                {
+                    let text = format!("Blocked by mcp-mandate: {reason}");
+                    return vec![Action::ToServer(encode(&rpc_error(id, &text)))];
                 }
                 // Checked like a response: secrets are redacted.
                 self.server_response(frame, None)
