@@ -154,9 +154,15 @@ impl SharedTaint for AgentTaint {
         }
     }
 
-    fn set(&self, source: &str) {
+    fn set(&self, source: &str) -> bool {
         self.saw(source);
-        self.write(source);
+        match write_record(&self.path, source) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "couldn't share the taint with the agent's other servers");
+                false
+            }
+        }
     }
 }
 
@@ -599,6 +605,25 @@ mod tests {
         assert_eq!(second.get(), None);
         first.set("the output of tool `fetch`");
         assert_eq!(second.get().as_deref(), Some("the output of tool `fetch`"));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_record_that_cant_be_written_is_reported() {
+        let folder = folder("unwritable");
+        let written = AgentTaint::at(folder.join("taint-test"));
+        assert!(written.set("the output of tool `fetch`"));
+        drop(written);
+
+        // A file where the record's folder should be: neither writing the
+        // record nor making the folder again can work.
+        let blocked = folder.join("blocked");
+        fs::write(&blocked, "").unwrap();
+        let taint = AgentTaint::at(blocked.join("taint-test"));
+        assert!(!taint.set("the output of tool `fetch`"));
+        // This server still counts as tainted.
+        assert!(taint.get().is_some());
+        drop(taint);
         let _ = fs::remove_dir_all(&folder);
     }
 

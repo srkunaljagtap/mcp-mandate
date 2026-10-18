@@ -310,11 +310,14 @@ impl SharedTaint for CallerTaint {
         }
     }
 
-    fn set(&self, source: &str) {
-        if let Ok(mut map) = self.taints.map.lock() {
-            map.entry(self.caller.clone())
-                .or_insert_with(|| source.to_owned());
-        }
+    fn set(&self, source: &str) -> bool {
+        // A poisoned lock: the caller's other sessions can't be told.
+        let Ok(mut map) = self.taints.map.lock() else {
+            return false;
+        };
+        map.entry(self.caller.clone())
+            .or_insert_with(|| source.to_owned());
+        true
     }
 }
 

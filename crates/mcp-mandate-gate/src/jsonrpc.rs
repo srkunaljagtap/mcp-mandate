@@ -136,6 +136,22 @@ pub fn classify(frame: &[u8]) -> Result<Message, ParseError> {
     }
 }
 
+/// What a message says it is, read from its top-level members alone and
+/// checked as [`classify`] checks them, without reading the rest (`params`,
+/// the body of `result`) into memory, and without the limit on what the
+/// whole message may cost. Only for answering a message too large to check
+/// (a request gets an error rather than no answer): it doesn't look for
+/// repeated keys below the top level. `None` for a batch, or when even
+/// that can't be read.
+pub fn head(frame: &[u8]) -> Option<Message> {
+    let body = trim_json_whitespace(frame);
+    if body.first() == Some(&b'[') {
+        return None;
+    }
+    let envelope: Envelope<'_> = serde_json::from_slice(body).ok()?;
+    envelope.into_message().ok()
+}
+
 /// `frame` without the whitespace JSON allows around a value. Only that:
 /// anything else (a form feed, say) makes a full parse of the message fail,
 /// so classifying it must fail too.
@@ -171,7 +187,9 @@ struct Envelope<'a> {
     #[serde(borrow)]
     jsonrpc: Cow<'a, str>,
     /// `None` when there's no `id` member; `Some(Value::Null)` for `"id": null`.
-    #[serde(default, deserialize_with = "present")]
+    /// An array or object (never a valid id) fails to parse rather than
+    /// being read into memory.
+    #[serde(default, deserialize_with = "scalar")]
     id: Option<Value>,
     #[serde(default, borrow)]
     method: Option<Cow<'a, str>>,
@@ -268,6 +286,46 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
     T::deserialize(deserializer).map(Some)
+}
+
+/// Like [`present`], for a member that must be a string, a number, a
+/// boolean or `null`.
+fn scalar<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    deserializer.deserialize_any(Scalar).map(Some)
+}
+
+struct Scalar;
+
+impl Visitor<'_> for Scalar {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a string, a number, a boolean or null")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
 }
 
 /// An `error` member, which must be an object. What it holds is skipped
@@ -575,6 +633,33 @@ mod tests {
             r#"{{"jsonrpc":"2.0","id":1,"result":{{"structuredContent":{{"rows":[{rows}]}}}}}}"#
         );
         assert!(classify(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn the_head_of_a_message_too_large_to_check_can_still_be_read() {
+        let call = call_with("0", MAX_VALUES);
+        assert!(matches!(
+            classify(call.as_bytes()),
+            Err(ParseError::TooManyValues)
+        ));
+        assert_eq!(
+            head(call.as_bytes()),
+            Some(Message::Request {
+                id: json!(1),
+                method: "tools/call".to_owned()
+            })
+        );
+        // Never by reading a large id into memory, and never for a
+        // message classifying would refuse anyway.
+        let values = vec!["0"; MAX_VALUES].join(",");
+        for text in [
+            format!(r#"{{"jsonrpc":"2.0","id":[{values}],"method":"ping"}}"#),
+            format!(r#"{{"jsonrpc":"2.0","id":1,"id":2,"result":[{values}]}}"#),
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"ping","result":[{values}]}}"#),
+            format!(r#"[{{"jsonrpc":"2.0","id":1,"result":[{values}]}}]"#),
+        ] {
+            assert_eq!(head(text.as_bytes()), None, "{}", &text[..40]);
+        }
     }
 
     #[test]

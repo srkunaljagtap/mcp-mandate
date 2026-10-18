@@ -118,8 +118,9 @@ impl SharedTaint for AgentTaint {
         self.0.lock().unwrap().clone()
     }
 
-    fn set(&self, source: &str) {
+    fn set(&self, source: &str) -> bool {
         *self.0.lock().unwrap() = Some(source.to_owned());
+        true
     }
 }
 

@@ -5,14 +5,16 @@
 //! - `{var}` matches one path segment's worth of text: no `/`, `?` or `#`,
 //!   even percent-encoded.
 //! - `{+var}` may span segments, but no `?` or `#`.
-//! - No variable holds a space or a control character: expanding a
-//!   template encodes them, and URL parsers drop or trim some of them
-//!   (`.\t.` becomes `..`) before they resolve the path.
+//! - No variable holds whitespace or a control character unencoded, ASCII
+//!   or not: expanding a template encodes them, and URL parsers drop or
+//!   trim some of them (`.\t.` becomes `..`) before they resolve the path,
+//!   as do servers that trim text (`..` and a no-break space).
 //! - Whatever the variables hold, the URI can't have a `.` or `..` segment
 //!   (before or after percent-decoding) that the template's own text
 //!   doesn't have: not in one variable (`{+path}` as `../x`, wherever it
-//!   sits), from two side by side (`{a}{b}` as `.` and `.`), or from a
-//!   variable next to a dot (`.{a}` as `.`).
+//!   sits, or as `&path=../x` after `?path=`, which a query parser reads
+//!   as a second `path`), from two side by side (`{a}{b}` as `.` and `.`),
+//!   or from a variable next to a dot (`.{a}` as `.`).
 //! - A template without variables matches only itself.
 //! - Any other expression (`{#x}`, `{.x}`, `{/x}`, `{;x}`, `{?x}`, `{&x}`)
 //!   matches nothing: the gate can't tell what it would reach, so it fails
@@ -31,6 +33,42 @@ enum Variable {
 type Dots = [[usize; 2]; 2];
 
 const NO_DOTS: Dots = [[0; 2]; 2];
+
+/// What separates the segments of a path (`\` counts too: some servers
+/// read it as `/`).
+const PATH: &[char] = &['/', '\\'];
+/// What separates the pieces of one variable's value: a path's
+/// separators, and a query's (`&`, `;`, `=`), since a server can read a
+/// variable that follows `?name=` with a query parser.
+const PIECES: &[char] = &['/', '\\', '&', ';', '='];
+
+/// Why a URI doesn't fit a template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Misfit {
+    /// It doesn't have the template's shape.
+    Shape,
+    /// It has the shape, but a variable holds whitespace or a control
+    /// character unencoded.
+    Unencoded,
+    /// It has the shape, but would make a `.` or `..` segment the
+    /// template's own text doesn't have.
+    DotSegment,
+}
+
+impl Misfit {
+    /// What's wrong, for someone who wrote a URI with the template's shape.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Shape => "it doesn't have the template's shape",
+            Self::Unencoded => {
+                "a variable holds a space or another whitespace or control character unencoded (percent-encode it: a space is `%20`)"
+            }
+            Self::DotSegment => {
+                "a variable makes a `.` or `..` segment, which could reach outside the template"
+            }
+        }
+    }
+}
 
 /// An approved resource template.
 pub(crate) struct Template {
@@ -73,7 +111,7 @@ impl Template {
         literal.push_str(rest);
         Self {
             pattern: Regex::new(&source).ok().map(|regex| (regex, variables)),
-            dots: dot_segments(&literal),
+            dots: dot_segments(&literal, PATH),
         }
     }
 
@@ -85,43 +123,69 @@ impl Template {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn matches(&self, uri: &str) -> bool {
+        self.check(uri).is_ok()
+    }
+
+    /// Whether `uri` fits the template, and if not, why.
+    pub(crate) fn check(&self, uri: &str) -> Result<(), Misfit> {
         let Some((regex, variables)) = &self.pattern else {
-            return false;
+            return Err(Misfit::Shape);
         };
         let Some(captures) = regex.captures(uri) else {
-            return false;
+            return Err(Misfit::Shape);
         };
-        let each_fits = variables.iter().enumerate().all(|(index, variable)| {
-            let raw = captures.get(index + 1).map_or("", |value| value.as_str());
+        let values: Vec<&str> = (1..=variables.len())
+            .map(|group| captures.get(group).map_or("", |value| value.as_str()))
+            .collect();
+        for (variable, raw) in variables.iter().zip(&values) {
             let decoded = percent_decode(raw);
             let fits = match variable {
                 Variable::Simple => !decoded.contains(['/', '\\', '?', '#']),
                 Variable::Reserved => !decoded.contains(['?', '#']),
             };
-            // A dot segment of its own counts wherever the variable sits,
-            // after literal text too (`?path={+path}` as `../x`).
-            fits && !raw.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
-                && dot_segments(raw) == NO_DOTS
-        });
+            if !fits {
+                return Err(Misfit::Shape);
+            }
+        }
+        if values
+            .iter()
+            .any(|raw| raw.chars().any(|c| c.is_control() || c.is_whitespace()))
+        {
+            return Err(Misfit::Unencoded);
+        }
+        // A dot segment of its own counts wherever the variable sits, after
+        // literal text too (`?path={+path}` as `../x`), and so does a dot
+        // piece between query delimiters (`?path={+path}` as `&path=..`).
+        if values
+            .iter()
+            .any(|raw| dot_segments(raw, PIECES) != NO_DOTS)
+        {
+            return Err(Misfit::DotSegment);
+        }
         // Counted over the whole URI too: two variables, or a variable and
         // a literal dot, can make a segment neither makes alone.
-        let found = dot_segments(uri);
-        each_fits
-            && found
-                .iter()
-                .flatten()
-                .zip(self.dots.iter().flatten())
-                .all(|(found, allowed)| found <= allowed)
+        let found = dot_segments(uri, PATH);
+        let within = found
+            .iter()
+            .flatten()
+            .zip(self.dots.iter().flatten())
+            .all(|(found, allowed)| found <= allowed);
+        if within {
+            Ok(())
+        } else {
+            Err(Misfit::DotSegment)
+        }
     }
 }
 
-/// How many `.` and `..` segments `text` has, as written and
-/// percent-decoded (`\` counts as a separator too).
-fn dot_segments(text: &str) -> Dots {
+/// How many `.` and `..` segments `text` has, split at `separators`, as
+/// written and percent-decoded.
+fn dot_segments(text: &str, separators: &[char]) -> Dots {
     let count = |text: &str| {
         let mut dots = [0; 2];
-        for segment in text.split(['/', '\\']) {
+        for segment in text.split(separators) {
             match segment {
                 "." => dots[0] += 1,
                 ".." => dots[1] += 1,
@@ -242,17 +306,33 @@ mod tests {
             ("docs://page-{+p}", "docs://page-../x"),
             ("res://get?name={name}", "res://get?name=.."),
             ("res://get?name={name}", "res://get?name=%2e"),
+            // A query parser reads a second `path` (or `name`), and some
+            // keep the last one or drop the empty first.
+            (
+                "res://files/read?path={+path}",
+                "res://files/read?path=&path=../secret.txt",
+            ),
+            ("res://get?name={name}", "res://get?name=x&name=.."),
+            ("res://get?name={name}", "res://get?name=x;name=.."),
+            ("res://get?name={name}", "res://get?name=x%26name%3D.."),
         ] {
-            assert!(!Template::parse(template).matches(uri), "{template} {uri}");
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::DotSegment),
+                "{template} {uri}"
+            );
         }
         let query = Template::parse("res://files/read?path={+path}");
         assert!(query.matches("res://files/read?path=notes/today.md"));
+        assert!(query.matches("res://files/read?path=a&b=c.d"));
     }
 
     #[test]
     fn no_variable_holds_a_space_or_a_control_character() {
         // URL parsers remove tabs and line breaks, and trim spaces and
-        // control characters at either end, before resolving dot segments.
+        // control characters at either end, before resolving dot segments;
+        // a server that trims text (Python's `strip`) trims Unicode
+        // whitespace and controls too.
         for (template, uri) in [
             (
                 "file:///home/u/project/{+path}",
@@ -266,9 +346,14 @@ mod tests {
             ("file:///docs/{name}", "file:///docs/\x00.."),
             ("file:///docs/{name}", "file:///docs/..\x7f"),
             ("{+url}", " file:///etc/passwd"),
+            ("file:///docs/{name}", "file:///docs/..\u{85}"),
+            ("file:///docs/{name}", "file:///docs/..\u{a0}"),
+            ("file:///docs/{name}", "file:///docs/\u{3000}.."),
+            ("notes://{title}", "notes://Meeting notes"),
         ] {
-            assert!(
-                !Template::parse(template).matches(uri),
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::Unencoded),
                 "{template} {uri:?}"
             );
         }
