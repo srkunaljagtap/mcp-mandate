@@ -663,6 +663,39 @@ mod tests {
     }
 
     #[test]
+    fn an_array_or_object_id_is_refused_at_its_first_byte() {
+        // Each is cut off before it ends, so reading it through would run
+        // out of input: a type error, raised where it starts, shows it was
+        // refused unread.
+        let values = vec!["0"; 10_000].join(",");
+        for text in [
+            "[".to_owned(),
+            "{".to_owned(),
+            format!("[{values}"),
+            format!(r#"{{"a":[{values}"#),
+        ] {
+            let error = scalar(&mut serde_json::Deserializer::from_str(&text)).unwrap_err();
+            assert_eq!(
+                error.classify(),
+                serde_json::error::Category::Data,
+                "{error}"
+            );
+            assert!(error.column() < 10, "{error}");
+        }
+        // The same within a message, as `classify` and `head` read it.
+        let text = format!(r#"{{"jsonrpc":"2.0","method":"ping","id":[{values}"#);
+        let error = serde_json::from_str::<Envelope<'_>>(&text)
+            .err()
+            .expect("an array id is refused");
+        assert_eq!(
+            error.classify(),
+            serde_json::error::Category::Data,
+            "{error}"
+        );
+        assert!(error.column() < 50, "{error}");
+    }
+
+    #[test]
     fn displays_messages_for_logs() {
         assert_eq!(
             parse(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#).to_string(),
