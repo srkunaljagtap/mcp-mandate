@@ -204,8 +204,9 @@ action = "allow"
 This policy is in `observe` mode, the default: the gate lets everything
 through and logs (with a warning each time it starts) what it would have
 blocked, hidden or redacted. Try it on real traffic, read the log, and
-once it blocks only what you expect, add `mode = "enforce"` at the top.
-Until then nothing is protected.
+once it blocks only what you expect, set `mode = "enforce"` at the top
+(the example policy and Scout's drafts already have a `mode` line to
+change). Until then nothing is protected.
 
 **3. Run the server behind the gate:**
 
@@ -377,7 +378,7 @@ mcp-mandate audit verify policy.audit.jsonl
   `enforce` blocks, and a policy must say `mode = "enforce"` to get it.
   What the gate blocks, hides, holds, redacts or drops (all of the above)
   it does only in `enforce` mode; the HTTPS gateway's token checks and
-  limits apply in both. In `observe` mode, messages the gate can't read
+  limits, and its redaction of its own credential, apply in both. In `observe` mode, messages the gate can't read
   reliably pass through unchanged too, each with a "would drop" warning
   and an audit entry saying what `enforce` mode would have done: anything
   that isn't JSON-RPC 2.0, batches, and the repeated keys, requests
@@ -432,11 +433,12 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   client-credential tokens. A credential sent in a header must be ASCII.
   Only the headers MCP needs are passed on, and redirects aren't followed,
   so a server can't bounce the credential elsewhere. A server that echoes
-  the credential back gets it redacted, in replies and event streams alike:
-  the whole header value, the token after its scheme, the client secret,
-  and every client-credential token that may still be valid: until the
-  expiry the token endpoint gave (`expires_in`), or for a day when it gave
-  none, the 16 newest at most. An event's id isn't a message, so the gate
+  the credential back gets it redacted, in either mode, in replies and
+  event streams alike (a message the gate can't read that holds it is
+  dropped): the whole header value, the token after its scheme, the client
+  secret, and every client-credential token that may still be valid: until
+  the expiry the token endpoint gave (`expires_in`), or for a day when it
+  gave none, the 16 newest at most. An event's id isn't a message, so the gate
   doesn't check it: an id holding the credential, or anything else the
   policy takes for a secret, is dropped.
 - **Sessions** belong to the caller who opened them, and each has its own
