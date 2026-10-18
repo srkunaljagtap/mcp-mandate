@@ -254,14 +254,19 @@ impl Upstream {
     }
 }
 
-/// A credential header's value, and the token after its scheme (`Bearer`,
-/// `token`, `SSWS`, in any case): a server may echo either. (Read as text
-/// even if it isn't ASCII, rather than not at all.)
+/// A credential header's value, as sent and without the whitespace around
+/// it (as a server reads it), and the token after its scheme (`Bearer`,
+/// `token`, `SSWS`, in any case): a server may echo any of them. (Read as
+/// text even if it isn't ASCII, rather than not at all.)
 fn credential_forms(value: &HeaderValue) -> Vec<String> {
     let value = String::from_utf8_lossy(value.as_bytes());
     let value = value.as_ref();
     let mut forms = vec![value.to_owned()];
-    if let Some((scheme, token)) = value.split_once(' ')
+    let trimmed = value.trim();
+    if trimmed != value && !trimmed.is_empty() {
+        forms.push(trimmed.to_owned());
+    }
+    if let Some((scheme, token)) = trimmed.split_once(' ')
         && !scheme.is_empty()
         && scheme
             .bytes()
@@ -512,6 +517,21 @@ mod tests {
         assert_eq!(
             credential_forms(&not_ascii),
             ["Token pässwort-1234", "pässwort-1234"]
+        );
+    }
+
+    #[test]
+    fn a_credential_is_listed_without_the_whitespace_around_it_too() {
+        // A server strips it from a header's value, and may echo the rest.
+        let forms = |value: &str| credential_forms(&HeaderValue::from_str(value).unwrap());
+        assert_eq!(forms("opaque-1234 "), ["opaque-1234 ", "opaque-1234"]);
+        assert_eq!(
+            forms(" SSWS opaque-1234"),
+            [" SSWS opaque-1234", "SSWS opaque-1234", "opaque-1234"]
+        );
+        assert_eq!(
+            forms("Bearer opaque-1234 "),
+            ["Bearer opaque-1234 ", "Bearer opaque-1234", "opaque-1234"]
         );
     }
 

@@ -643,6 +643,10 @@ async fn refuses_missing_and_bad_tokens_before_anything_reaches_the_server() {
             world.token("alice", json!({"exp": now() - 3600})),
         ),
         (
+            "expired, within the leeway for clock differences",
+            world.token("alice", json!({"exp": now() - 5})),
+        ),
+        (
             "not yet valid",
             world.token("alice", json!({"nbf": now() + 3600})),
         ),
@@ -1485,4 +1489,131 @@ async fn a_token_whose_expiry_has_a_fraction_is_accepted() {
     let world = world().await;
     let token = world.token("alice", json!({"exp": now() as f64 + 600.5}));
     world.initialize("alpha", &token).await;
+}
+
+fn is_invalid_token(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .and_then(|challenge| challenge.to_str().ok())
+        .is_some_and(|challenge| challenge.contains("invalid_token"))
+}
+
+#[tokio::test]
+async fn a_token_just_past_its_expiry_is_refused_so_the_client_renews_it() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let session = world.initialize("alpha", &token).await;
+    // Expired a few seconds ago: within the leeway for clock differences,
+    // but with nothing left to last.
+    let expired = world.token("alice", json!({"exp": now() - 5}));
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let listed = world
+        .post("alpha", Some(&expired), Some(&session), list)
+        .await;
+    assert_eq!(listed.status(), 401);
+    assert!(is_invalid_token(&listed));
+    let stream = world
+        .client
+        .get(world.url("alpha"))
+        .bearer_auth(&expired)
+        .header(header::ACCEPT, "text/event-stream")
+        .header("mcp-session-id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), 401);
+    assert!(is_invalid_token(&stream));
+    assert!(
+        world
+            .seen()
+            .iter()
+            .all(|seen| seen.method != "tools/list" && seen.method != "GET"),
+        "neither reached the server: {:?}",
+        world.seen()
+    );
+}
+
+impl World {
+    /// Posts `body` to `server` on a connection of its own: its first few
+    /// bytes, then the rest once `meanwhile` is done. Returns the whole
+    /// response as text.
+    async fn post_slowly(
+        &self,
+        server: &str,
+        token: &str,
+        session: &str,
+        body: &Value,
+        meanwhile: impl Future<Output = ()>,
+    ) -> String {
+        let body = body.to_string();
+        let head = format!(
+            "POST /servers/{server}/mcp HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMcp-Session-Id: {session}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (start, rest) = body.as_bytes().split_at(10);
+        let mut connection = TcpStream::connect(self.gateway.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        connection.write_all(head.as_bytes()).await.unwrap();
+        connection.write_all(start).await.unwrap();
+        meanwhile.await;
+        connection.write_all(rest).await.unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), connection.read_to_end(&mut answer))
+            .await
+            .expect("answered")
+            .unwrap();
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+}
+
+#[tokio::test]
+async fn a_request_whose_token_expires_before_its_check_is_refused_unchecked() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let session = world.initialize("alpha", &token).await;
+    let short_lived = world.token("alice", json!({"exp": now() + 2}));
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    // Its token checks out, but its body arrives only once it has expired.
+    let wait = tokio::time::sleep(Duration::from_secs(3));
+    let answer = world
+        .post_slowly("alpha", &short_lived, &session, &list, wait)
+        .await;
+    assert!(answer.starts_with("HTTP/1.1 401"), "{answer}");
+    assert!(answer.contains("invalid_token"), "{answer}");
+    assert!(
+        !world.seen().iter().any(|seen| seen.method == "tools/list"),
+        "it never reached the server"
+    );
+}
+
+#[tokio::test]
+async fn a_request_whose_session_ends_while_it_waits_is_told_the_session_ended() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let session = world.initialize("alpha", &token).await;
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    // The session ends while the request's body is still arriving.
+    let end = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ended = world
+            .client
+            .delete(world.url("alpha"))
+            .bearer_auth(&token)
+            .header("mcp-session-id", &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ended.status(), 204);
+    };
+    let answer = world
+        .post_slowly("alpha", &token, &session, &list, end)
+        .await;
+    assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+    assert!(answer.contains("the session ended"), "{answer}");
+    assert!(
+        !world.seen().iter().any(|seen| seen.method == "tools/list"),
+        "it never reached the server"
+    );
 }

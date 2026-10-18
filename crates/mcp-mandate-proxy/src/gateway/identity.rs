@@ -2,7 +2,7 @@
 //! identity provider) against the provider's published signing keys.
 //! No valid token, no entry.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use jsonwebtoken::jwk::{Jwk, JwkSet, PublicKeyUse};
 use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, Validation, decode, decode_header};
@@ -19,7 +19,9 @@ const KEYS_TTL: Duration = Duration::from_secs(3600);
 /// Fewest seconds between fetches, however many unknown keys arrive, so
 /// junk tokens can't make the gateway hammer the provider.
 const REFETCH_EVERY: Duration = Duration::from_secs(60);
-/// Clock difference tolerated between the provider and the gateway.
+/// Clock difference tolerated between the provider and the gateway, for
+/// when a token starts to be valid. Its expiry gets none: nothing a token
+/// brings outlives it by the gateway's clock.
 const LEEWAY_SECONDS: u64 = 60;
 const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// Oldest signing keys still used while they can't be refreshed.
@@ -63,6 +65,19 @@ pub struct Caller {
     pub expires: u64,
 }
 
+impl Caller {
+    /// How long until the token expires, by the gateway's clock: zero once
+    /// it has. `None` if that's too far off to represent.
+    pub fn time_left(&self) -> Option<Duration> {
+        let expires = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(self.expires))?;
+        Some(
+            expires
+                .duration_since(SystemTime::now())
+                .unwrap_or(Duration::ZERO),
+        )
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
     #[error("couldn't fetch {url}")]
@@ -87,6 +102,8 @@ pub enum TokenError {
     Algorithm(Algorithm),
     #[error("no signing key of the provider matches the token")]
     UnknownKey,
+    #[error("the token has expired")]
+    Expired,
     #[error("{0}")]
     Rejected(jsonwebtoken::errors::Error),
 }
@@ -166,11 +183,18 @@ impl Identity {
         validation.set_audience(&[self.config.audience.as_str(), server_url]);
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         let data = decode::<Claims>(token, &key, &validation).map_err(TokenError::Rejected)?;
-        Ok(Caller {
+        let caller = Caller {
             subject: data.claims.sub,
             client: data.claims.azp.or(data.claims.client_id),
             expires: data.claims.exp,
-        })
+        };
+        // The leeway above applies to the expiry too, so a token past its
+        // expiry by the gateway's clock is refused here: the client renews
+        // it, rather than being let in with no time left.
+        if caller.time_left().is_some_and(|left| left.is_zero()) {
+            return Err(TokenError::Expired);
+        }
+        Ok(caller)
     }
 
     /// The provider's key for a token, fetching the keys again (at most
@@ -367,6 +391,25 @@ mod tests {
         );
         assert_eq!(expiry(serde_json::json!(-1)), None);
         assert_eq!(expiry(serde_json::json!("1760000000")), None);
+    }
+
+    #[test]
+    fn a_token_has_no_time_left_once_its_expiry_has_passed() {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expiring = |expires: u64| Caller {
+            subject: "alice".to_owned(),
+            client: None,
+            expires,
+        };
+        // Past its expiry, however recently: within the leeway or not.
+        assert_eq!(expiring(now - 5).time_left(), Some(Duration::ZERO));
+        assert_eq!(expiring(now - 3600).time_left(), Some(Duration::ZERO));
+        let left = expiring(now + 600).time_left().unwrap();
+        assert!(left > Duration::from_secs(590) && left <= Duration::from_secs(600));
+        assert_eq!(expiring(u64::MAX).time_left(), None, "too far off");
     }
 
     #[test]

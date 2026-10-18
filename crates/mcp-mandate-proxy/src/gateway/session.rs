@@ -115,8 +115,8 @@ impl Session {
     /// Runs `check` with the session's gate, on a thread where blocking is
     /// fine, once it's its [turn](turn): a check takes CPU time and memory,
     /// and writes the audit log, which may wait for a lock. `None` once the
-    /// session is closed, or if a check panicked: the session is then
-    /// unusable.
+    /// session is [closed](Self::is_closed), or if a check panicked: the
+    /// session is then unusable.
     pub async fn check<T: Send + 'static>(
         &self,
         check: impl FnOnce(&mut Gate) -> T + Send + 'static,
@@ -152,7 +152,12 @@ impl Session {
     }
 
     fn unusable(&self) -> bool {
-        *self.closed.borrow() || self.broken.load(Ordering::SeqCst)
+        self.is_closed() || self.broken.load(Ordering::SeqCst)
+    }
+
+    /// Whether the session is closed.
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
     }
 
     /// Closes the session: nothing passes through it from now on, and its
@@ -454,7 +459,9 @@ mod tests {
             let session = Arc::clone(&session);
             async move { session.closed().await }
         });
+        assert!(!session.is_closed());
         assert!(session.close());
+        assert!(session.is_closed());
         assert!(!session.close(), "closed already");
         session.record_end().await;
         assert_eq!(ends.load(Ordering::SeqCst), 1);
@@ -495,6 +502,7 @@ mod tests {
         let session = session("alice");
         assert_eq!(session.check(|_| panic!("a bug")).await, None::<()>);
         assert_eq!(session.check(|gate| gate.taint()).await, None);
+        assert!(!session.is_closed(), "broken, which isn't closed");
     }
 
     #[tokio::test]
