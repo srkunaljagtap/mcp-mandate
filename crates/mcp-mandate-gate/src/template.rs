@@ -5,11 +5,14 @@
 //! - `{var}` matches one path segment's worth of text: no `/`, `?` or `#`,
 //!   even percent-encoded.
 //! - `{+var}` may span segments, but no `?` or `#`.
-//! - No variable holds whitespace, a control character or a character
-//!   that shows as nothing (a zero-width space, U+FEFF) unencoded, ASCII
-//!   or not: expanding a template encodes them, and URL parsers drop or
-//!   trim some of them (`.\t.` becomes `..`) before they resolve the path,
-//!   as do servers that trim text (`..` and a no-break space).
+//! - No variable holds whitespace, a control character or U+FEFF
+//!   unencoded, ASCII or not: expanding a template encodes them, and URL
+//!   parsers drop or trim some of them (`.\t.` becomes `..`) before they
+//!   resolve the path, as do servers that trim text (`..` and a no-break
+//!   space, or U+FEFF, which JavaScript's `trim` takes off). Other
+//!   characters that show as nothing (a zero-width joiner, a variation
+//!   selector) belong to ordinary names and emoji, so they may appear; the
+//!   rules below trim them off a segment's ends before they look at it.
 //! - Whatever the variables hold, the URI can't have a `.` or `..` segment
 //!   (before or after percent-decoding, and with those characters trimmed
 //!   off its ends, so `%20..` counts) that the template's own text doesn't
@@ -17,13 +20,22 @@
 //!   as `&path=../x` after `?path=`, which a query parser reads as a
 //!   second `path`), from two side by side (`{a}{b}` as `.` and `.`), or
 //!   from a variable next to a dot (`.{a}` as `.`).
-//! - No variable starts somewhere of its own: at `/` or `\` (before or
-//!   after percent-decoding and trimming), or at a drive (`C:`), at its
-//!   start or after a query delimiter (`&path=/etc/passwd`). A server that
-//!   joins it to a folder would read that instead. Nor can a variable make
-//!   an empty segment (`//`) in the URI's path that the template's own
-//!   text doesn't have. A variable right after `scheme://` is exempt from
-//!   this rule: it names the whole location already.
+//! - No variable starts somewhere of its own (before or after
+//!   percent-decoding and trimming): at `/` or `\`, at its start or after a
+//!   query delimiter (`&path=/etc/passwd`), or at a drive (`C:`), at the
+//!   start of any of its segments (`docs/C:/Windows`, which a server that
+//!   joins segment by segment reads as a drive). A server that joins it to
+//!   a folder would read that instead. Nor can the variables make an empty
+//!   segment (`//`) in the URI's path, or a segment at a drive, that the
+//!   template's own text doesn't have (`{a}:{b}` as `C` and `x`).
+//! - Where a variable sits can widen that. Right after `file://` it names
+//!   the whole location (`file:///etc/passwd`), so none of it applies.
+//!   Right after `file:///` the template names the whole filesystem, so the
+//!   variable may start at a drive (`file:///C:/Users`). Right after a host
+//!   (`https://{host}{+path}`, `https://api.example.com{+path}`) it may
+//!   start with the path's own `/`, but not with a second one or a drive
+//!   after it. Any other scheme gets no such leeway: a server may serve
+//!   `docs://{+path}` from a folder, so `docs:///etc/passwd` is refused.
 //! - `\` separates segments in all of these, as `/` does: some servers
 //!   read it that way.
 //! - A template without variables matches only itself.
@@ -40,6 +52,39 @@ use regex::Regex;
 enum Variable {
     Simple,
     Reserved,
+}
+
+/// Where a variable sits in its template, which decides where its text
+/// may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Within the place the template names: not at `/`, `\` or a drive.
+    Inside,
+    /// Right after `file://`, where it names the whole location
+    /// (`file:///etc/passwd`): anywhere.
+    Location,
+    /// Right after `file:///`, where the template names the whole
+    /// filesystem: at a drive too (`file:///C:/Users`).
+    Drive,
+    /// Right after a host (`https://{host}{+path}`): at the path's own
+    /// first `/` too.
+    Path,
+}
+
+impl Place {
+    /// Where a variable sits, from the template's text before it (earlier
+    /// expressions as `{}`).
+    fn after(before: &str) -> Self {
+        if before.eq_ignore_ascii_case("file://") {
+            Self::Location
+        } else if before.eq_ignore_ascii_case("file:///") {
+            Self::Drive
+        } else if ends_at_host(before) {
+            Self::Path
+        } else {
+            Self::Inside
+        }
+    }
 }
 
 /// How many `.` and how many `..` segments a text has, as written and
@@ -65,13 +110,14 @@ pub(crate) enum Misfit {
     /// It doesn't have the template's shape.
     Shape,
     /// It has the shape, but a variable holds whitespace, a control
-    /// character or a character that shows as nothing unencoded.
+    /// character or U+FEFF unencoded.
     Unencoded,
     /// It has the shape, but would make a `.` or `..` segment the
     /// template's own text doesn't have.
     DotSegment,
-    /// It has the shape, but a variable starts at `/`, `\` or a drive, or
-    /// makes an empty segment the template's own text doesn't have.
+    /// It has the shape, but a variable starts at `/`, `\` or a drive
+    /// where its place doesn't allow it, or the URI has an empty segment
+    /// or one at a drive that the template's own text doesn't have.
     Root,
 }
 
@@ -81,13 +127,13 @@ impl Misfit {
         match self {
             Self::Shape => "it doesn't have the template's shape",
             Self::Unencoded => {
-                "a variable holds a space or another whitespace, control or invisible character unencoded (percent-encode it: a space is `%20`)"
+                "a variable holds a space or another whitespace or control character, or U+FEFF, unencoded (percent-encode it: a space is `%20`)"
             }
             Self::DotSegment => {
                 "a variable makes a `.` or `..` segment, which could reach outside the template"
             }
             Self::Root => {
-                "a variable starts with `/`, `\\` or a drive such as `C:`, or makes an empty `//` segment, which could reach outside the template"
+                "a variable starts with `/` or `\\`, or makes a segment that starts with a drive such as `C:` or an empty `//` segment, which could reach outside the template"
             }
         }
     }
@@ -96,7 +142,7 @@ impl Misfit {
 /// An approved resource template.
 pub(crate) struct Template {
     /// `None` when the template uses an expression this doesn't support.
-    pattern: Option<(Regex, Vec<Variable>)>,
+    pattern: Option<(Regex, Vec<(Variable, Place)>)>,
     /// The `.` and `..` segments of the template's own text (its
     /// expressions left out): a matching URI may have those and no more.
     dots: Dots,
@@ -104,23 +150,24 @@ pub(crate) struct Template {
     /// written and percent-decoded: a matching URI's path may have those
     /// and no more.
     empty: [usize; 2],
-    /// Whether the first variable comes right after `scheme://`, where it
-    /// names the whole location: it may start with `/` there, or make an
-    /// empty segment.
-    locates: bool,
+    /// The segments of the template's own text that start at a drive, as
+    /// written and percent-decoded: a matching URI may have those and no
+    /// more.
+    drives: [usize; 2],
 }
 
 impl Template {
     pub(crate) fn parse(template: &str) -> Self {
         let mut source = String::from("^");
         // The template's text, each expression replaced by `{}`, which
-        // can't be part of a dot segment.
+        // can't be part of a dot segment or start a drive.
         let mut literal = String::new();
         let mut variables = Vec::new();
         let mut rest = template;
         while let Some(open) = rest.find('{') {
             source.push_str(&regex::escape(&rest[..open]));
             literal.push_str(&rest[..open]);
+            let place = Place::after(&literal);
             literal.push_str("{}");
             let Some(close) = rest[open..].find('}') else {
                 return Self::unsupported();
@@ -134,18 +181,17 @@ impl Template {
                 _ => return Self::unsupported(),
             };
             source.push_str(group);
-            variables.push(variable);
+            variables.push((variable, place));
             rest = &rest[open + close + 1..];
         }
         source.push_str(&regex::escape(rest));
         source.push('$');
         literal.push_str(rest);
-        let before_first = template.find('{').map(|open| &template[..open]);
         Self {
             pattern: Regex::new(&source).ok().map(|regex| (regex, variables)),
             dots: dot_segments(&literal, PATH),
             empty: empty_segments(&literal),
-            locates: before_first.is_some_and(is_scheme_and_slashes),
+            drives: drives(&literal),
         }
     }
 
@@ -155,7 +201,7 @@ impl Template {
             pattern: None,
             dots: NO_DOTS,
             empty: [0; 2],
-            locates: false,
+            drives: [0; 2],
         }
     }
 
@@ -175,7 +221,7 @@ impl Template {
         let values: Vec<&str> = (1..=variables.len())
             .map(|group| captures.get(group).map_or("", |value| value.as_str()))
             .collect();
-        for (variable, raw) in variables.iter().zip(&values) {
+        for ((variable, _), raw) in variables.iter().zip(&values) {
             let decoded = percent_decode(raw);
             let fits = match variable {
                 Variable::Simple => !decoded.contains(['/', '\\', '?', '#']),
@@ -185,7 +231,7 @@ impl Template {
                 return Err(Misfit::Shape);
             }
         }
-        if values.iter().any(|raw| raw.chars().any(trimmable)) {
+        if values.iter().any(|raw| raw.chars().any(dropped)) {
             return Err(Misfit::Unencoded);
         }
         // A dot segment of its own counts wherever the variable sits, after
@@ -199,43 +245,47 @@ impl Template {
         }
         // Counted over the whole URI too: two variables, or a variable and
         // a literal dot, can make a segment neither makes alone.
-        let found = dot_segments(uri, PATH);
-        let within = found
-            .iter()
-            .flatten()
-            .zip(self.dots.iter().flatten())
-            .all(|(found, allowed)| found <= allowed);
-        if !within {
+        if !at_most(
+            dot_segments(uri, PATH).as_flattened(),
+            self.dots.as_flattened(),
+        ) {
             return Err(Misfit::DotSegment);
         }
         // A variable that starts at a root replaces the folder a server
         // joins it to (`/etc/passwd`, `C:/Users`), and so does a second
-        // parameter after a query delimiter (`?path=x&path=/etc/passwd`).
-        if values
+        // parameter after a query delimiter (`?path=x&path=/etc/passwd`)
+        // or a segment at a drive (`docs/C:/Windows`).
+        if variables
             .iter()
-            .skip(usize::from(self.locates))
-            .any(|raw| rooted(raw) || rooted(&percent_decode(raw)))
+            .zip(&values)
+            .any(|((_, place), raw)| rooted(raw, *place))
         {
             return Err(Misfit::Root);
         }
-        // An empty segment is counted over the whole URI, like dot
-        // segments: a variable can make one at its edge (`{+a}/x` as
-        // `dir/`) or by being empty (`{a}/x` as nothing). A variable that
-        // names the whole location is left out.
-        let first = captures.get(1).filter(|_| self.locates);
-        let counted = match first {
-            Some(first) => Cow::Owned(format!(
+        // Empty segments and drives are counted over the whole URI, like
+        // dot segments: a variable can make an empty one at its edge
+        // (`{+a}/x` as `dir/`) or by being empty (`{a}/x` as nothing), and
+        // a drive next to the template's text (`{a}:{b}` as `C` and `x`).
+        // Only the first variable can sit right after `file://` or
+        // `file:///`.
+        let counted = match (variables.first(), captures.get(1)) {
+            // It names the whole location: left out.
+            (Some((_, Place::Location)), Some(first)) => Cow::Owned(format!(
                 "{}{{}}{}",
                 &uri[..first.start()],
                 &uri[first.end()..]
             )),
-            None => Cow::Borrowed(uri),
+            // It may start at a drive: `{}` in front keeps that drive from
+            // counting.
+            (Some((_, Place::Drive)), Some(first)) => Cow::Owned(format!(
+                "{}{{}}{}",
+                &uri[..first.start()],
+                &uri[first.start()..]
+            )),
+            _ => Cow::Borrowed(uri),
         };
-        let found = empty_segments(&counted);
-        if found
-            .iter()
-            .zip(&self.empty)
-            .all(|(found, allowed)| found <= allowed)
+        if at_most(&empty_segments(&counted), &self.empty)
+            && at_most(&drives(&counted), &self.drives)
         {
             Ok(())
         } else {
@@ -244,11 +294,26 @@ impl Template {
     }
 }
 
-/// Whether a server may trim `c` off the ends of a value: whitespace, a
-/// control character, or a character that shows as nothing (U+FEFF, which
-/// JavaScript's `trim` removes, among them).
+/// Whether each count in `found` is at most the one in `allowed`.
+fn at_most(found: &[usize], allowed: &[usize]) -> bool {
+    found
+        .iter()
+        .zip(allowed)
+        .all(|(found, allowed)| found <= allowed)
+}
+
+/// Whether URL parsers drop `c` or trim it off a value's ends, or servers
+/// that trim text do: whitespace, a control character, or U+FEFF (which
+/// JavaScript's `trim` takes off).
+fn dropped(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || c == '\u{feff}'
+}
+
+/// Whether a server may trim `c` off the ends of a value: what URL parsers
+/// drop, or any other character that shows as nothing (some trim a
+/// zero-width space too).
 fn trimmable(c: char) -> bool {
-    c.is_whitespace() || c.is_control() || is_hidden(c)
+    dropped(c) || is_hidden(c)
 }
 
 /// How many `.` and `..` segments `text` has, split at `separators`, as
@@ -287,28 +352,64 @@ fn empty_segments(text: &str) -> [usize; 2] {
     [count(path), count(&percent_decode(path))]
 }
 
-/// Whether `text`, or a piece of it after a query delimiter, starts at a
-/// root of its own once what a server may trim is taken off: `/` or `\`
-/// (`\\server\share` too), or a drive (`C:`).
-fn rooted(text: &str) -> bool {
-    text.split(QUERY).any(|piece| {
-        let mut chars = piece.trim_start_matches(trimmable).chars();
-        match (chars.next(), chars.next()) {
-            (Some('/' | '\\'), _) => true,
-            (Some(letter), Some(':')) => letter.is_ascii_alphabetic(),
-            _ => false,
-        }
-    })
+/// How many segments of `text` start at a drive once what a server may
+/// trim is taken off their start, as written and percent-decoded.
+fn drives(text: &str) -> [usize; 2] {
+    let count = |text: &str| {
+        text.split(PATH)
+            .filter(|segment| is_drive(segment.trim_start_matches(trimmable)))
+            .count()
+    };
+    [count(text), count(&percent_decode(text))]
 }
 
-/// Whether `text` is a URI scheme followed by `://` (`file://`).
-fn is_scheme_and_slashes(text: &str) -> bool {
-    let Some(scheme) = text.strip_suffix("://") else {
+/// Whether a variable's text, as written or percent-decoded, starts
+/// somewhere of its own that its place doesn't allow.
+fn rooted(raw: &str, place: Place) -> bool {
+    let (raw, drive) = match place {
+        Place::Inside => (raw, false),
+        Place::Location => return false,
+        Place::Drive => (raw, true),
+        // The path's own first `/`; a second one, or a drive after it,
+        // still counts.
+        Place::Path => (raw.strip_prefix('/').unwrap_or(raw), false),
+    };
+    starts_at_root(raw, drive) || starts_at_root(&percent_decode(raw), drive)
+}
+
+/// Whether `text` starts at a root of its own once what a server may trim
+/// is taken off: at `/` or `\` (`\\server\share` too), at its start or
+/// after a query delimiter, or at a drive (`C:`), at the start of any of
+/// its pieces, since a server that joins a path segment by segment reads
+/// `docs/C:/Windows` as `C:Windows`. With `drive`, its first piece may be a
+/// drive.
+fn starts_at_root(text: &str, drive: bool) -> bool {
+    text.split(QUERY)
+        .any(|piece| piece.trim_start_matches(trimmable).starts_with(PATH))
+        || text
+            .split(PIECES)
+            .skip(usize::from(drive))
+            .any(|piece| is_drive(piece.trim_start_matches(trimmable)))
+}
+
+/// Whether `text` starts at a drive: an ASCII letter, then `:`.
+fn is_drive(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next() == Some(':')
+}
+
+/// Whether `text` is a URI scheme, `://` and a host, with no path yet
+/// (`https://api.example.com`, or `https://{}` when a variable is the
+/// host).
+fn ends_at_host(text: &str) -> bool {
+    let Some((scheme, host)) = text.split_once("://") else {
         return false;
     };
     let mut chars = scheme.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && !host.is_empty()
+        && !host.contains(['/', '\\', '?', '#'])
 }
 
 /// `%XX` sequences decoded (lossily); anything else kept as is.
@@ -449,8 +550,7 @@ mod tests {
         // whitespace and controls too, and JavaScript's `trim` trims U+FEFF.
         for (template, uri) in [
             ("file:///docs/{name}", "file:///docs/\u{feff}.."),
-            ("file:///docs/{name}", "file:///docs/..\u{200b}"),
-            ("file:///docs/{name}", "file:///docs/a\u{2060}b"),
+            ("file:///docs/{name}", "file:///docs/a\u{feff}b"),
             (
                 "file:///home/u/project/{+path}",
                 "file:///home/u/project/.\t./.ssh/id_rsa",
@@ -480,6 +580,19 @@ mod tests {
         assert!(docs.matches("file:///docs/My%20Notes.md"));
         let spaced = Template::parse("file:///My Docs/{name}");
         assert!(spaced.matches("file:///My Docs/notes.md"));
+        // Other characters that show as nothing belong to ordinary names,
+        // and no URL parser drops them: a red heart with the variation
+        // selector most emoji are written with, a ZWJ sequence (woman and
+        // laptop), a Persian word with a zero-width non-joiner, a word
+        // joiner.
+        for uri in [
+            "file:///docs/\u{2764}\u{fe0f}.md",
+            "file:///docs/\u{1f469}\u{200d}\u{1f4bb}.md",
+            "file:///docs/\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}.md",
+            "file:///docs/a\u{2060}b",
+        ] {
+            assert!(docs.matches(uri), "{uri:?}");
+        }
     }
 
     #[test]
@@ -505,6 +618,14 @@ mod tests {
             ),
             ("file:///docs/{name}", "file:///docs/%00.."),
             ("file:///docs/{name}", "file:///docs/.%E2%80%8B"),
+            // A character that shows as nothing is trimmed too, written
+            // as it is.
+            ("file:///docs/{name}", "file:///docs/..\u{200b}"),
+            ("file:///docs/{name}", "file:///docs/\u{2060}."),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/\u{200c}..\u{fe0f}/.ssh/id_rsa",
+            ),
             ("file:///docs/{dir}/{file}", "file:///docs/%20../.ssh"),
             ("res://get?name={name}", "res://get?name=x&name=..%09"),
             // Only the URI as a whole has it: `.` and an encoded space.
@@ -584,7 +705,20 @@ mod tests {
                 "res://files/read?path=x;path=C:/x",
             ),
             ("res://get?name={name}", "res://get?name=x%26name%3DC:x"),
-            // Only a variable right after `scheme://` names the location.
+            // Trimmed off first, whatever shows as nothing.
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/\u{200b}/etc/passwd",
+            ),
+            // Only a variable right after `file://` names the whole
+            // location: a server may serve another scheme's URIs from a
+            // folder, and a drive-relative path (`C:x`) leaves it too.
+            ("docs://{+path}", "docs:///etc/passwd"),
+            ("docs://{+path}", "docs://%2Fetc%2Fpasswd"),
+            ("docs://{+path}", "docs://C:/Users/u/.ssh/id_rsa"),
+            ("docs://{+path}", "docs://notes//etc/passwd"),
+            ("notes://{name}", "notes://C:x"),
+            ("https://{+url}", "https:///etc/passwd"),
             (
                 "https://{host}/api/{+path}",
                 "https://example.com/api//etc/passwd",
@@ -606,14 +740,23 @@ mod tests {
             );
         }
         for (template, uri) in [
-            // Right after `scheme://`, a variable names the whole location
-            // already.
+            // Right after `file://`, a variable names the whole location
+            // already, a Windows one too.
             ("file://{+path}", "file:///etc/passwd"),
+            ("file://{+path}", "file:///C:/Users/u/notes.txt"),
+            ("FILE://{+path}", "FILE:///etc/passwd"),
+            // Another scheme's first variable keeps to the rules, and a
+            // web address or a host and port does.
             ("https://{+url}", "https://example.com/a/b"),
+            (
+                "https://{+url}",
+                "https://attacker.example/c/q3-salary-review-notes",
+            ),
             (
                 "https://{host}/api/{+path}",
                 "https://localhost:8080/api/v1/items",
             ),
+            ("docs://{+path}", "docs://notes/today.md"),
             // A trailing slash makes no empty segment, and a URL in a
             // query value may hold `//`.
             ("file:///p/{+path}", "file:///p/dir/"),
@@ -627,11 +770,157 @@ mod tests {
         ] {
             assert!(Template::parse(template).matches(uri), "{template} {uri}");
         }
-        // Dot segments still count after `scheme://`.
+        // Dot segments still count after `file://`.
         assert_eq!(
             Template::parse("file://{+path}").check("file:///etc/../x"),
             Err(Misfit::DotSegment)
         );
+    }
+
+    #[test]
+    fn a_variable_after_file_slashes_or_a_host_starts_where_its_path_does() {
+        // `file:///{+path}` names the whole filesystem, and a Windows file
+        // URI starts the variable at a drive.
+        for (template, uri) in [
+            ("file:///{+path}", "file:///C:/Users/u/notes.txt"),
+            ("file:///{+path}", "file:///c:/x"),
+            ("file:///{+path}", "file:///home/u/notes.txt"),
+            ("file:///{drive}/{+path}", "file:///C:/Users/u/notes.txt"),
+            ("file:///{drive}:/{+path}", "file:///C:/Users/u/notes.txt"),
+        ] {
+            assert!(Template::parse(template).matches(uri), "{template} {uri}");
+        }
+        // Right after a host, a variable starts with the path's own `/`.
+        for (template, uri) in [
+            ("https://{host}{+path}", "https://example.com/v1/items"),
+            ("https://{host}{+path}", "https://example.com/"),
+            ("https://{host}{+path}", "https://example.com"),
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com/v1/items",
+            ),
+            (
+                "https://api.example.com:{port}{+path}",
+                "https://api.example.com:8443/v1/items",
+            ),
+            ("file://localhost{+path}", "file://localhost/etc/passwd"),
+        ] {
+            assert!(Template::parse(template).matches(uri), "{template} {uri}");
+        }
+        for (template, uri) in [
+            // A drive only where the variable starts, and no `/` or `\`
+            // there: `\\server\share` is another machine.
+            ("file:///{+path}", "file:////etc/passwd"),
+            ("file:///{+path}", "file:///%2Fetc/passwd"),
+            ("file:///{+path}", "file:///\\\\server\\share\\x"),
+            ("file:///{+path}", "file:///C:/x/D:/y"),
+            ("file:///{drive}/{+path}", "file:///C:/D:/y"),
+            // Only after `file:///`.
+            ("docs:///{+path}", "docs:///C:/x"),
+            ("file:///docs/{+path}", "file:///docs/C:/x"),
+            // One `/` after a host, with no root after it.
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com//etc/passwd",
+            ),
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com/\\etc\\passwd",
+            ),
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com/C:/x",
+            ),
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com/%2Fetc/passwd",
+            ),
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com/%20/etc/passwd",
+            ),
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com%2Fetc/passwd",
+            ),
+            ("https://{host}{+path}", "https://example.com//etc/passwd"),
+            ("https://{host}{+path}", "https:///etc/passwd"),
+        ] {
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::Root),
+                "{template} {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_segment_of_a_variable_starts_at_a_drive() {
+        // A Windows server that joins a path segment by segment reads a
+        // segment at a drive as that drive: `docs/C:/Windows` as
+        // `C:Windows`, outside the folder.
+        for (template, uri) in [
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/docs/C:/Windows/win.ini",
+            ),
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/docs/c:%5CWindows%5Cwin.ini",
+            ),
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/docs\\C:\\Windows",
+            ),
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/docs%2FC:%2FWindows",
+            ),
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/docs/%43:/Windows",
+            ),
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/docs/%20C:/Windows",
+            ),
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/docs/\u{200b}C:/Windows",
+            ),
+            (
+                "res://files/read?path={+path}",
+                "res://files/read?path=docs/C:/x",
+            ),
+            // Nor can a variable make one next to the template's own text.
+            ("file:///p/{a}:{b}", "file:///p/C:x"),
+            ("file:///p/{a}%3A{b}", "file:///p/C%3Ax"),
+        ] {
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::Root),
+                "{template} {uri}"
+            );
+        }
+        // The template's own drive is fine, and so is a colon that makes
+        // none.
+        for (template, uri) in [
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/docs/readme.md",
+            ),
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/docs/notes:v2.md",
+            ),
+            (
+                "file:///D:/project/{+path}",
+                "file:///D:/project/logs/12:30.txt",
+            ),
+            ("file:///p/{a}:{b}", "file:///p/ab:x"),
+        ] {
+            assert!(Template::parse(template).matches(uri), "{template} {uri}");
+        }
     }
 
     #[test]
