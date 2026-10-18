@@ -157,9 +157,16 @@ fn dump_tool() -> Value {
 /// - `wait` never answers;
 /// - `linger` answers on a stream that stays open a second longer;
 /// - `slow` answers after two seconds;
-/// - `drone` never answers, on a stream of keep-alives that never ends.
+/// - `drone` never answers, on a stream of keep-alives that never ends;
+/// - `ask` never answers, on a stream that asks the client for its roots
+///   (request `r1`, whose answer it takes at once), then sends only
+///   keep-alives;
+/// - `forget` answers `404`, as a server that forgot the session does,
+///   once two calls of it are waiting: one at once, the other 300 ms later.
 fn gamma_tools() -> Vec<Value> {
-    ["flood", "burst", "wait", "linger", "slow", "drone"]
+    [
+        "flood", "burst", "wait", "linger", "slow", "drone", "ask", "forget",
+    ]
         .iter()
         .map(|name| {
             json!({"name": name, "description": "Does what it's told", "inputSchema": {"type": "object"},
@@ -178,6 +185,8 @@ struct Fake {
     thief: String,
     streams: Arc<AtomicUsize>,
     holding: Arc<AtomicUsize>,
+    /// Where calls of `forget` wait for each other.
+    forgetting: Arc<tokio::sync::Barrier>,
 }
 
 /// Counts something while it exists.
@@ -237,6 +246,7 @@ async fn mcp_server() -> (String, Fake, Recorder) {
         thief,
         streams: Arc::default(),
         holding: Arc::default(),
+        forgetting: Arc::new(tokio::sync::Barrier::new(2)),
     };
     let (listener, url) = listen().await;
     let app =
@@ -338,6 +348,7 @@ async fn serve_mcp(
             tokio::time::sleep(Duration::from_millis(200)).await;
             StatusCode::ACCEPTED.into_response()
         }
+        "(response)" if gamma && id == "r1" => StatusCode::ACCEPTED.into_response(),
         "(response)" if gamma => hold(&fake.holding).await,
         "tools/call" if gamma && tool == "wait" => hold(&fake.holding).await,
         "tools/call" if gamma && (tool == "flood" || tool == "burst") => {
@@ -370,6 +381,16 @@ async fn serve_mcp(
             .into_response()
         }
         "tools/call" if gamma && tool == "drone" => pinging(&fake, None),
+        "tools/call" if gamma && tool == "ask" => {
+            let request = json!({"jsonrpc": "2.0", "id": "r1", "method": "roots/list"});
+            pinging(&fake, Some(format!("event: message\ndata: {request}\n\n")))
+        }
+        "tools/call" if gamma && tool == "forget" => {
+            if !fake.forgetting.wait().await.is_leader() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            StatusCode::NOT_FOUND.into_response()
+        }
         "tools/call" if message["params"]["name"] == "whoami" => {
             let auth = headers
                 .get(header::AUTHORIZATION)
@@ -1430,7 +1451,7 @@ async fn listing_ends_even_when_the_server_never_confirms_the_end_of_its_session
     let listed = tokio::time::timeout(Duration::from_secs(30), inventory(&config.servers["gamma"]))
         .await
         .expect("the listing ended");
-    assert_eq!(listed.unwrap().tools.len(), 11);
+    assert_eq!(listed.unwrap().tools.len(), 13);
     assert_eq!(world.deletes(), 1);
 }
 
@@ -1616,4 +1637,143 @@ async fn a_request_whose_session_ends_while_it_waits_is_told_the_session_ended()
         !world.seen().iter().any(|seen| seen.method == "tools/list"),
         "it never reached the server"
     );
+}
+
+#[tokio::test]
+async fn every_request_in_flight_when_the_server_forgets_the_session_is_told_it_ended() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let session = world.initialize("gamma", &token).await;
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    world
+        .post("gamma", Some(&token), Some(&session), list.clone())
+        .await;
+    // Both calls reach the server, which has forgotten the session: it
+    // answers one with 404 at once, and the other once the first has
+    // closed the session here.
+    let forget = |id: u64| {
+        world.post(
+            "gamma",
+            Some(&token),
+            Some(&session),
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "forget", "arguments": {}}}),
+        )
+    };
+    let both = async { tokio::join!(forget(2), forget(3)) };
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), both)
+        .await
+        .expect("both were answered");
+    for answered in [first, second] {
+        assert_eq!(answered.status(), 404);
+        let text = answered.text().await.unwrap();
+        assert!(text.contains("ended the session"), "{text}");
+    }
+    // The client starts over.
+    assert_eq!(
+        world
+            .post("gamma", Some(&token), Some(&session), list)
+            .await
+            .status(),
+        404
+    );
+    world.initialize("gamma", &token).await;
+}
+
+impl World {
+    /// Takes the lock on `server`'s audit log, as another process writing
+    /// to it does: the gateway's writes wait for it (for up to 2 seconds).
+    fn hold_log(&self, server: &str) -> std::fs::File {
+        let log = self.dir.join(format!("{server}.policy.audit.jsonl"));
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(log)
+            .unwrap();
+        held.lock().unwrap();
+        held
+    }
+}
+
+#[tokio::test]
+async fn a_request_whose_session_ends_while_it_is_checked_isnt_sent() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let session = world.initialize("alpha", &token).await;
+    // The request's check can't finish until the audit log is free, and
+    // the session ends meanwhile.
+    let held = world.hold_log("alpha");
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let listed = world.post("alpha", Some(&token), Some(&session), list);
+    let end = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ending = world
+            .client
+            .delete(world.url("alpha"))
+            .bearer_auth(&token)
+            .header("mcp-session-id", &session)
+            .send();
+        let free = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            held.unlock().unwrap();
+        };
+        let (ended, ()) = tokio::join!(ending, free);
+        assert_eq!(ended.unwrap().status(), 204);
+    };
+    let (listed, ()) = tokio::join!(listed, end);
+    assert_eq!(listed.status(), 404);
+    let text = listed.text().await.unwrap();
+    assert!(text.contains("the session ended"), "{text}");
+    assert!(
+        !world.seen().iter().any(|seen| seen.method == "tools/list"),
+        "it never reached the server"
+    );
+}
+
+/// Waits until just after the clock's next whole second, so a token that
+/// expires at the second after has nearly a second left.
+async fn just_after_a_whole_second() {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let fraction = Duration::from_nanos(u64::from(since_epoch.subsec_nanos()));
+    tokio::time::sleep(Duration::from_secs(1) - fraction + Duration::from_millis(20)).await;
+}
+
+#[tokio::test]
+async fn an_answer_whose_token_expires_while_it_is_checked_still_reaches_the_server() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let session = world.initialize("gamma", &token).await;
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    world
+        .post("gamma", Some(&token), Some(&session), list)
+        .await;
+    // While answering a call, the server asks the client for its roots.
+    let ask = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "ask", "arguments": {}}});
+    let mut asking = world.post("gamma", Some(&token), Some(&session), ask).await;
+    let asked: Value = serde_json::from_str(&first_message(&mut asking).await).unwrap();
+    assert_eq!(asked["method"], "roots/list", "{asked}");
+    // The client answers with a token that has under a second left. The
+    // answer's check can't finish until the audit log is free, by when the
+    // token has expired.
+    just_after_a_whole_second().await;
+    let short_lived = world.token("alice", json!({"exp": now() + 1}));
+    let held = world.hold_log("gamma");
+    let answer = json!({"jsonrpc": "2.0", "id": asked["id"], "result": {"roots": []}});
+    let answered = world.post("gamma", Some(&short_lived), Some(&session), answer);
+    let free = async {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        held.unlock().unwrap();
+    };
+    let (answered, ()) = tokio::join!(answered, free);
+    // It passed the gate, which no longer expects an answer to `r1`: a
+    // retry would be dropped, so it's sent on rather than refused.
+    assert_eq!(answered.status(), 202);
+    assert!(
+        world.seen().iter().any(|seen| seen.method == "(response)"),
+        "it reached the server"
+    );
+    drop(asking);
 }

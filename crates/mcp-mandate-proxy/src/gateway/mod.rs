@@ -68,7 +68,8 @@ const IDLE_SESSION: Duration = Duration::from_secs(30 * 60);
 /// How long listing a server's inventory may take.
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a server gets to take the gate's answer to one of its
-/// requests, and to end a session.
+/// requests (and at least as long for a client's answer or notification),
+/// and to end a session.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often an event stream to a client gets a keep-alive comment: writing
@@ -567,14 +568,31 @@ async fn post_message(
     };
     // ...one whose token expired while it was checked isn't sent, and one
     // still waiting for its answer when the token expires is given up on.
-    if passed(deadline) {
-        abandon(&session, request_id.as_ref()).await;
-        return expired_token(&app, &name);
-    }
+    // The client's answers and notifications aren't requests: nothing waits
+    // on them, and the gate has taken them in (an answer it passed is no
+    // longer awaited, so a retry would be dropped). Once passed, they're
+    // sent, and the server gets at least as long to take one as the gate's
+    // own answers.
+    let deadline = if request {
+        if passed(deadline) {
+            abandon(&session, request_id.as_ref()).await;
+            return expired_token(&app, &name);
+        }
+        deadline
+    } else {
+        deadline.map(|deadline| deadline.max(Instant::now() + ANSWER_TIMEOUT))
+    };
 
     let protocol = protocol_version(&headers);
     let upstream = &app.upstreams[&name];
+    // Nothing more passes through a session that closed while this was
+    // checked. Its id is read first: a session the server forgot is closed
+    // before its id is cleared, so a message that finds no id here finds
+    // the session closed too, rather than going to the server without one.
     let upstream_id = session.upstream_id();
+    if session.is_closed() {
+        return session_ended();
+    }
     let sent = upstream.post(forward, upstream_id.as_deref(), protocol.as_ref());
     let response = match within(deadline, sent).await {
         Some(Ok(response)) => response,
@@ -588,6 +606,16 @@ async fn post_message(
             return token_expired();
         }
     };
+    if response.status() == reqwest::StatusCode::NOT_FOUND && upstream_id.is_some() {
+        // The server forgot the session: the client must start over. That
+        // goes for every message sent with the session's id, not only the
+        // first to hear of it. Closed before its id is cleared (see above);
+        // the id goes so the server isn't asked to end a session it no
+        // longer has.
+        close_session(&app, &session);
+        session.set_upstream_id(None);
+        return (StatusCode::NOT_FOUND, "the MCP server ended the session").into_response();
+    }
     if opening.is_some() {
         let upstream_id = response
             .headers()
@@ -646,6 +674,18 @@ fn passed(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| deadline <= Instant::now())
 }
 
+/// The answer to a message whose session closed while it waited (the
+/// server forgot the session, the client ended it, or the gateway is
+/// stopping): `404`, as for any session that's gone, so the client starts
+/// over.
+fn session_ended() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "the session ended; send initialize first",
+    )
+        .into_response()
+}
+
 fn token_expired() -> Response {
     (
         StatusCode::GATEWAY_TIMEOUT,
@@ -671,18 +711,12 @@ async fn gate_check<T: Send + 'static>(
         .await
 }
 
-/// The answer to a request whose check didn't run. Its session closed
-/// while it waited (the server forgot the session, the client ended it, or
-/// the gateway is stopping): that's `404`, as for any session that's gone,
-/// so the client starts over. Otherwise a check panicked, and the session,
-/// now unusable, closes.
+/// The answer to a request whose check didn't run: its session
+/// [ended](session_ended) while it waited, or a check panicked, and the
+/// session, now unusable, closes.
 fn check_failed(app: &Arc<App>, session: &Arc<Session>) -> Response {
     if session.is_closed() {
-        return (
-            StatusCode::NOT_FOUND,
-            "the session ended; send initialize first",
-        )
-            .into_response();
+        return session_ended();
     }
     close_session(app, session);
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -741,13 +775,6 @@ async fn relay(
     if status == reqwest::StatusCode::ACCEPTED {
         // An answer to a request may still come, on the server's stream.
         return accepted(Some(&session.id));
-    }
-    if status == reqwest::StatusCode::NOT_FOUND && session.upstream_id().is_some() {
-        // The server forgot the session (so there's none to end there): the
-        // client must start over.
-        session.set_upstream_id(None);
-        close_session(&app, &session);
-        return (StatusCode::NOT_FOUND, "the MCP server ended the session").into_response();
     }
     if !status.is_success() {
         warn!(server = %session.server, %status, "the MCP server answered with an error status");
