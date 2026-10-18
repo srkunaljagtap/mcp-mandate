@@ -45,9 +45,7 @@ other personal data.
 
 **Prebuilt binaries** for Linux (x86_64 and arm64, glibc 2.35 or newer),
 macOS (Intel and Apple silicon) and Windows (x86_64) are on the
-[releases page](../../releases). In the commands below, `OWNER` stands for
-the GitHub account or organization that hosts mcp-mandate (the first part
-of this repository's address); replace it before running them.
+[releases page](https://github.com/srkunaljagtap/mcp-mandate/releases).
 Each release lists SHA-256 checksums in `SHA256SUMS`, and each archive has
 a signed build attestation. Checked as below, the attestation proves the
 archive was built by this repository's release workflow
@@ -58,8 +56,8 @@ on any branch, would pass.
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
 gh attestation verify mcp-mandate-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
-  --repo OWNER/mcp-mandate \
-  --signer-workflow OWNER/mcp-mandate/.github/workflows/release.yml \
+  --repo srkunaljagtap/mcp-mandate \
+  --signer-workflow srkunaljagtap/mcp-mandate/.github/workflows/release.yml \
   --source-ref refs/tags/v0.1.0 --deny-self-hosted-runners
 ```
 
@@ -72,7 +70,7 @@ use mcp-mandate under WSL instead.
 **From source**, with [rustup](https://rustup.rs):
 
 ```sh
-cargo install --locked --git https://github.com/OWNER/mcp-mandate --tag v0.1.0 mcp-mandate
+cargo install --locked --git https://github.com/srkunaljagtap/mcp-mandate --tag v0.1.0 mcp-mandate
 ```
 
 **Container image** (linux/amd64), for the [HTTPS gateway](#the-https-gateway):
@@ -80,10 +78,10 @@ cargo install --locked --git https://github.com/OWNER/mcp-mandate --tag v0.1.0 m
 ```sh
 docker run --rm -p 8443:8443 \
   -v "$PWD/config:/config:ro" -v mcp-mandate-audit:/audit \
-  ghcr.io/OWNER/mcp-mandate:0.1.0 gate --config /config/gateway.toml
-gh attestation verify oci://ghcr.io/OWNER/mcp-mandate:0.1.0 \
-  --repo OWNER/mcp-mandate \
-  --signer-workflow OWNER/mcp-mandate/.github/workflows/release.yml \
+  ghcr.io/srkunaljagtap/mcp-mandate:0.1.0 gate --config /config/gateway.toml
+gh attestation verify oci://ghcr.io/srkunaljagtap/mcp-mandate:0.1.0 \
+  --repo srkunaljagtap/mcp-mandate \
+  --signer-workflow srkunaljagtap/mcp-mandate/.github/workflows/release.yml \
   --source-ref refs/tags/v0.1.0 --deny-self-hosted-runners
 ```
 
@@ -128,7 +126,7 @@ recognizable shape in a plain argument isn't caught, so pass secrets to
 servers through environment variables instead. A remote server is named by
 its URL without its query, so a key in the URL's path is kept.
 
-**2. Write a policy.** Start from [policies/example.toml](policies/example.toml).
+**2. Write a policy.** Start from [policies/example.toml](https://github.com/srkunaljagtap/mcp-mandate/blob/main/policies/example.toml).
 Keep the policy and pins files where neither the agent nor a server can
 write to them: whoever can edit them decides what the gate allows. A
 folder such as `~/.config/mcp-mandate/` works, as long as your agent's own
@@ -287,7 +285,7 @@ mcp-mandate gate --config gateway.toml
 ```
 
 Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
-[policies/gateway.example.toml](policies/gateway.example.toml).
+[policies/gateway.example.toml](https://github.com/srkunaljagtap/mcp-mandate/blob/main/policies/gateway.example.toml).
 
 - **Who's calling.** Every request needs a bearer token from your OIDC
   identity provider. The gateway checks:
@@ -460,7 +458,7 @@ mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
 
 ## How it's tested
 
-- **Attack corpus.** [corpus/](corpus/) holds attacks as plain JSON that
+- **Attack corpus.** [corpus/](https://github.com/srkunaljagtap/mcp-mandate/tree/main/corpus) holds attacks as plain JSON that
   any MCP security tool can replay: poisoned and changed tools, exfiltration
   after untrusted reads, secrets in both directions, shell injection, and
   protocol abuse. Every pull request runs all of them through the gate.
@@ -474,7 +472,7 @@ mcp-mandate audit verify policy.audit.jsonl --anchor <saved head>
   framing, event streams, policy, pins and audit log files) on every pull
   request. They also check that a secret planted anywhere in a server's
   message never reaches the client. Coverage-guided fuzzing
-  ([fuzz/](fuzz/), cargo-fuzz) runs each parser weekly.
+  ([fuzz/](https://github.com/srkunaljagtap/mcp-mandate/tree/main/fuzz), cargo-fuzz) runs each parser weekly.
 - **Latency.** CI fails if the gate adds more than 5 ms per message at the
   median, measured with every check on and the audit log being written.
   Typically it adds about 30 µs.
@@ -567,13 +565,13 @@ cargo deny check        # licenses, advisories, sources (cargo install cargo-den
 
 ## Contributing and security
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Please report vulnerabilities
-privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
+See [CONTRIBUTING.md](https://github.com/srkunaljagtap/mcp-mandate/blob/main/CONTRIBUTING.md). Please report vulnerabilities
+privately as described in [SECURITY.md](https://github.com/srkunaljagtap/mcp-mandate/blob/main/SECURITY.md), never in a public issue.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](https://github.com/srkunaljagtap/mcp-mandate/blob/main/LICENSE-APACHE) or
+[MIT license](https://github.com/srkunaljagtap/mcp-mandate/blob/main/LICENSE-MIT) at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in this project by you, as defined in the Apache-2.0
