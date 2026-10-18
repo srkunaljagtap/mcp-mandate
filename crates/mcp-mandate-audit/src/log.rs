@@ -264,6 +264,9 @@ impl LogFile {
             return Err(stop.error(&self.path));
         }
         let len = self.file_len()?;
+        // The last entry seen is looked for even when the length hasn't
+        // changed: entries of one shape all have the same length, so a log
+        // cut short and written to again can end up exactly as long.
         let stop = if self.replaced() {
             Some(Stop::Replaced)
         } else if len < self.len {
@@ -271,7 +274,7 @@ impl LogFile {
                 expected: self.len,
                 actual: len,
             })
-        } else if len > self.len && !self.last_seen_in_place()? {
+        } else if !self.last_seen_in_place()? {
             Some(Stop::Rewritten)
         } else {
             None
@@ -327,9 +330,11 @@ impl LogFile {
     }
 
     /// Whether the entry this log last wrote or caught up to still ends
-    /// where it did. Call with the file longer than that: a log cut short
-    /// and then written past that point again (by another process carrying
-    /// on from what was left) is longer, but no longer holds it.
+    /// where it did, unchanged (its line still matches its hash). Call with
+    /// the file at least that long: a log cut short and then written up to
+    /// that point or past it again (by another process carrying on from
+    /// what was left), or edited in place, is as long or longer, but no
+    /// longer holds it.
     fn last_seen_in_place(&mut self) -> Result<bool, AuditError> {
         if self.len == 0 {
             return Ok(true);
@@ -686,6 +691,52 @@ pub(crate) mod tests {
             "it stays stopped"
         );
         assert_eq!(verify(&path, None).unwrap().entries, 4);
+    }
+
+    #[test]
+    fn notices_entries_removed_once_the_log_grows_back_to_the_same_length() {
+        let path = temp_dir("same-length").join("audit.jsonl");
+        let mut log = Log::open(&path).unwrap();
+        log.record(&message(Verdict::Allow)).unwrap();
+        log.record(&message(Verdict::Block)).unwrap();
+        let seen = std::fs::metadata(&path).unwrap().len();
+        let first_line = std::fs::read_to_string(&path).unwrap().find('\n').unwrap() + 1;
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(first_line as u64)
+            .unwrap();
+        // Another gate carries on from what's left with an entry of the
+        // same shape, which leaves the log exactly as long as `log` saw it.
+        let mut other = Log::open(&path).unwrap();
+        other.record(&message(Verdict::Block)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), seen);
+
+        let error = log.record(&message(Verdict::Allow)).unwrap_err();
+        assert!(matches!(error, AuditError::Rewritten { .. }), "{error}");
+        assert!(
+            log.record(&message(Verdict::Allow)).is_err(),
+            "it stays stopped"
+        );
+        assert_eq!(verify(&path, None).unwrap().entries, 2);
+    }
+
+    #[test]
+    fn notices_the_last_entry_being_edited_in_place() {
+        let path = temp_dir("edited").join("audit.jsonl");
+        let mut log = Log::open(&path).unwrap();
+        log.record(&message(Verdict::Allow)).unwrap();
+        log.record(&message(Verdict::Block)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let verdict = text.rfind(r#""block""#).unwrap() + 1;
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(verdict as u64)).unwrap();
+        file.write_all(b"allow").unwrap();
+        drop(file);
+
+        let error = log.record(&message(Verdict::Allow)).unwrap_err();
+        assert!(matches!(error, AuditError::Rewritten { .. }), "{error}");
     }
 
     #[test]

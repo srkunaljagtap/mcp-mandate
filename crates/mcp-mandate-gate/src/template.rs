@@ -5,21 +5,35 @@
 //! - `{var}` matches one path segment's worth of text: no `/`, `?` or `#`,
 //!   even percent-encoded.
 //! - `{+var}` may span segments, but no `?` or `#`.
-//! - No variable holds whitespace or a control character unencoded, ASCII
+//! - No variable holds whitespace, a control character or a character
+//!   that shows as nothing (a zero-width space, U+FEFF) unencoded, ASCII
 //!   or not: expanding a template encodes them, and URL parsers drop or
 //!   trim some of them (`.\t.` becomes `..`) before they resolve the path,
 //!   as do servers that trim text (`..` and a no-break space).
 //! - Whatever the variables hold, the URI can't have a `.` or `..` segment
-//!   (before or after percent-decoding) that the template's own text
-//!   doesn't have: not in one variable (`{+path}` as `../x`, wherever it
-//!   sits, or as `&path=../x` after `?path=`, which a query parser reads
-//!   as a second `path`), from two side by side (`{a}{b}` as `.` and `.`),
-//!   or from a variable next to a dot (`.{a}` as `.`).
+//!   (before or after percent-decoding, and with those characters trimmed
+//!   off its ends, so `%20..` counts) that the template's own text doesn't
+//!   have: not in one variable (`{+path}` as `../x`, wherever it sits, or
+//!   as `&path=../x` after `?path=`, which a query parser reads as a
+//!   second `path`), from two side by side (`{a}{b}` as `.` and `.`), or
+//!   from a variable next to a dot (`.{a}` as `.`).
+//! - No variable starts somewhere of its own: at `/` or `\` (before or
+//!   after percent-decoding and trimming), or at a drive (`C:`), at its
+//!   start or after a query delimiter (`&path=/etc/passwd`). A server that
+//!   joins it to a folder would read that instead. Nor can a variable make
+//!   an empty segment (`//`) in the URI's path that the template's own
+//!   text doesn't have. A variable right after `scheme://` is exempt from
+//!   this rule: it names the whole location already.
+//! - `\` separates segments in all of these, as `/` does: some servers
+//!   read it that way.
 //! - A template without variables matches only itself.
 //! - Any other expression (`{#x}`, `{.x}`, `{/x}`, `{;x}`, `{?x}`, `{&x}`)
 //!   matches nothing: the gate can't tell what it would reach, so it fails
 //!   closed.
 
+use std::borrow::Cow;
+
+use mcp_mandate_pin::is_hidden;
 use regex::Regex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,18 +55,24 @@ const PATH: &[char] = &['/', '\\'];
 /// separators, and a query's (`&`, `;`, `=`), since a server can read a
 /// variable that follows `?name=` with a query parser.
 const PIECES: &[char] = &['/', '\\', '&', ';', '='];
+/// What separates a query's parameters, and a parameter's name from its
+/// value.
+const QUERY: &[char] = &['&', ';', '='];
 
 /// Why a URI doesn't fit a template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Misfit {
     /// It doesn't have the template's shape.
     Shape,
-    /// It has the shape, but a variable holds whitespace or a control
-    /// character unencoded.
+    /// It has the shape, but a variable holds whitespace, a control
+    /// character or a character that shows as nothing unencoded.
     Unencoded,
     /// It has the shape, but would make a `.` or `..` segment the
     /// template's own text doesn't have.
     DotSegment,
+    /// It has the shape, but a variable starts at `/`, `\` or a drive, or
+    /// makes an empty segment the template's own text doesn't have.
+    Root,
 }
 
 impl Misfit {
@@ -61,10 +81,13 @@ impl Misfit {
         match self {
             Self::Shape => "it doesn't have the template's shape",
             Self::Unencoded => {
-                "a variable holds a space or another whitespace or control character unencoded (percent-encode it: a space is `%20`)"
+                "a variable holds a space or another whitespace, control or invisible character unencoded (percent-encode it: a space is `%20`)"
             }
             Self::DotSegment => {
                 "a variable makes a `.` or `..` segment, which could reach outside the template"
+            }
+            Self::Root => {
+                "a variable starts with `/`, `\\` or a drive such as `C:`, or makes an empty `//` segment, which could reach outside the template"
             }
         }
     }
@@ -77,6 +100,14 @@ pub(crate) struct Template {
     /// The `.` and `..` segments of the template's own text (its
     /// expressions left out): a matching URI may have those and no more.
     dots: Dots,
+    /// The empty segments in the path of the template's own text, as
+    /// written and percent-decoded: a matching URI's path may have those
+    /// and no more.
+    empty: [usize; 2],
+    /// Whether the first variable comes right after `scheme://`, where it
+    /// names the whole location: it may start with `/` there, or make an
+    /// empty segment.
+    locates: bool,
 }
 
 impl Template {
@@ -109,9 +140,12 @@ impl Template {
         source.push_str(&regex::escape(rest));
         source.push('$');
         literal.push_str(rest);
+        let before_first = template.find('{').map(|open| &template[..open]);
         Self {
             pattern: Regex::new(&source).ok().map(|regex| (regex, variables)),
             dots: dot_segments(&literal, PATH),
+            empty: empty_segments(&literal),
+            locates: before_first.is_some_and(is_scheme_and_slashes),
         }
     }
 
@@ -120,6 +154,8 @@ impl Template {
         Self {
             pattern: None,
             dots: NO_DOTS,
+            empty: [0; 2],
+            locates: false,
         }
     }
 
@@ -149,10 +185,7 @@ impl Template {
                 return Err(Misfit::Shape);
             }
         }
-        if values
-            .iter()
-            .any(|raw| raw.chars().any(|c| c.is_control() || c.is_whitespace()))
-        {
+        if values.iter().any(|raw| raw.chars().any(trimmable)) {
             return Err(Misfit::Unencoded);
         }
         // A dot segment of its own counts wherever the variable sits, after
@@ -172,21 +205,60 @@ impl Template {
             .flatten()
             .zip(self.dots.iter().flatten())
             .all(|(found, allowed)| found <= allowed);
-        if within {
+        if !within {
+            return Err(Misfit::DotSegment);
+        }
+        // A variable that starts at a root replaces the folder a server
+        // joins it to (`/etc/passwd`, `C:/Users`), and so does a second
+        // parameter after a query delimiter (`?path=x&path=/etc/passwd`).
+        if values
+            .iter()
+            .skip(usize::from(self.locates))
+            .any(|raw| rooted(raw) || rooted(&percent_decode(raw)))
+        {
+            return Err(Misfit::Root);
+        }
+        // An empty segment is counted over the whole URI, like dot
+        // segments: a variable can make one at its edge (`{+a}/x` as
+        // `dir/`) or by being empty (`{a}/x` as nothing). A variable that
+        // names the whole location is left out.
+        let first = captures.get(1).filter(|_| self.locates);
+        let counted = match first {
+            Some(first) => Cow::Owned(format!(
+                "{}{{}}{}",
+                &uri[..first.start()],
+                &uri[first.end()..]
+            )),
+            None => Cow::Borrowed(uri),
+        };
+        let found = empty_segments(&counted);
+        if found
+            .iter()
+            .zip(&self.empty)
+            .all(|(found, allowed)| found <= allowed)
+        {
             Ok(())
         } else {
-            Err(Misfit::DotSegment)
+            Err(Misfit::Root)
         }
     }
 }
 
+/// Whether a server may trim `c` off the ends of a value: whitespace, a
+/// control character, or a character that shows as nothing (U+FEFF, which
+/// JavaScript's `trim` removes, among them).
+fn trimmable(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || is_hidden(c)
+}
+
 /// How many `.` and `..` segments `text` has, split at `separators`, as
-/// written and percent-decoded.
+/// written and percent-decoded, each with what a server may trim taken off
+/// its ends (` ..` counts as `..`).
 fn dot_segments(text: &str, separators: &[char]) -> Dots {
     let count = |text: &str| {
         let mut dots = [0; 2];
         for segment in text.split(separators) {
-            match segment {
+            match segment.trim_matches(trimmable) {
                 "." => dots[0] += 1,
                 ".." => dots[1] += 1,
                 _ => {}
@@ -195,6 +267,48 @@ fn dot_segments(text: &str, separators: &[char]) -> Dots {
         dots
     };
     [count(text), count(&percent_decode(text))]
+}
+
+/// How many empty segments (between two separators, and empty once what a
+/// server may trim is taken off) the path of `text` has, before any `?` or
+/// `#`, as written and percent-decoded. A query value may hold `//` (a URL,
+/// say): only its start matters there, which [`rooted`] checks.
+fn empty_segments(text: &str) -> [usize; 2] {
+    let path = text.split(['?', '#']).next().unwrap_or_default();
+    let count = |path: &str| {
+        let mut segments = path.split(PATH);
+        // The first and last have a separator on one side only.
+        segments.next_back();
+        segments
+            .skip(1)
+            .filter(|segment| segment.trim_matches(trimmable).is_empty())
+            .count()
+    };
+    [count(path), count(&percent_decode(path))]
+}
+
+/// Whether `text`, or a piece of it after a query delimiter, starts at a
+/// root of its own once what a server may trim is taken off: `/` or `\`
+/// (`\\server\share` too), or a drive (`C:`).
+fn rooted(text: &str) -> bool {
+    text.split(QUERY).any(|piece| {
+        let mut chars = piece.trim_start_matches(trimmable).chars();
+        match (chars.next(), chars.next()) {
+            (Some('/' | '\\'), _) => true,
+            (Some(letter), Some(':')) => letter.is_ascii_alphabetic(),
+            _ => false,
+        }
+    })
+}
+
+/// Whether `text` is a URI scheme followed by `://` (`file://`).
+fn is_scheme_and_slashes(text: &str) -> bool {
+    let Some(scheme) = text.strip_suffix("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// `%XX` sequences decoded (lossily); anything else kept as is.
@@ -332,8 +446,11 @@ mod tests {
         // URL parsers remove tabs and line breaks, and trim spaces and
         // control characters at either end, before resolving dot segments;
         // a server that trims text (Python's `strip`) trims Unicode
-        // whitespace and controls too.
+        // whitespace and controls too, and JavaScript's `trim` trims U+FEFF.
         for (template, uri) in [
+            ("file:///docs/{name}", "file:///docs/\u{feff}.."),
+            ("file:///docs/{name}", "file:///docs/..\u{200b}"),
+            ("file:///docs/{name}", "file:///docs/a\u{2060}b"),
             (
                 "file:///home/u/project/{+path}",
                 "file:///home/u/project/.\t./.ssh/id_rsa",
@@ -363,6 +480,158 @@ mod tests {
         assert!(docs.matches("file:///docs/My%20Notes.md"));
         let spaced = Template::parse("file:///My Docs/{name}");
         assert!(spaced.matches("file:///My Docs/notes.md"));
+    }
+
+    #[test]
+    fn a_piece_that_is_a_dot_segment_once_trimmed_counts_as_one() {
+        // A server that decodes a variable and then trims it reads each of
+        // these as `..`.
+        for (template, uri) in [
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/%20../.ssh/id_rsa",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/..%C2%A0/.ssh/id_rsa",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/%E3%80%80../.ssh/id_rsa",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/%EF%BB%BF../.ssh/id_rsa",
+            ),
+            ("file:///docs/{name}", "file:///docs/%00.."),
+            ("file:///docs/{name}", "file:///docs/.%E2%80%8B"),
+            ("file:///docs/{dir}/{file}", "file:///docs/%20../.ssh"),
+            ("res://get?name={name}", "res://get?name=x&name=..%09"),
+            // Only the URI as a whole has it: `.` and an encoded space.
+            ("file:///p/.{a}", "file:///p/.%20"),
+            // `\` separates segments too, as written or encoded.
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/a%5C..%5Cb",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/a\\%2e%2e\\b",
+            ),
+        ] {
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::DotSegment),
+                "{template} {uri}"
+            );
+        }
+        // Inside a name, an encoded space is an ordinary character.
+        let docs = Template::parse("file:///docs/{name}");
+        assert!(docs.matches("file:///docs/..%20notes.md"));
+        assert!(docs.matches("file:///docs/My%20Notes.md"));
+    }
+
+    #[test]
+    fn no_variable_starts_somewhere_of_its_own() {
+        // Joined to the folder a server serves, an absolute path or a
+        // drive replaces it: Python's `os.path.join`, Rust's `Path::join`
+        // and Node's `path.resolve` all return the second path.
+        for (template, uri) in [
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project//etc/passwd",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/%2Fetc%2Fpasswd",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/%20/etc/passwd",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/C:/Users/u/.ssh/id_rsa",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/c:%5CUsers%5Cu",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/%43:/x",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/\\\\server\\share\\x",
+            ),
+            (
+                "file:///home/u/project/{+path}",
+                "file:///home/u/project/%5C%5Cserver%5Cshare",
+            ),
+            ("docs://pages/{id}", "docs://pages/C:secret"),
+            (
+                "res://files/read?path={+path}",
+                "res://files/read?path=/etc/passwd",
+            ),
+            // A second parameter, to a query parser.
+            (
+                "res://files/read?path={+path}",
+                "res://files/read?path=notes&path=/etc/passwd",
+            ),
+            (
+                "res://files/read?path={+path}",
+                "res://files/read?path=x;path=C:/x",
+            ),
+            ("res://get?name={name}", "res://get?name=x%26name%3DC:x"),
+            // Only a variable right after `scheme://` names the location.
+            (
+                "https://{host}/api/{+path}",
+                "https://example.com/api//etc/passwd",
+            ),
+            // Nor can a variable make an empty segment the template's own
+            // text doesn't have, by being empty or at its edges.
+            ("file:///base/{dir}/{+rest}", "file:///base//etc/passwd"),
+            ("file:///p/{+a}/x", "file:///p/dir//x"),
+            ("file:///p/{+a}/x", "file:///p/dir%2F/x"),
+            ("file:///p/{+path}", "file:///p/a//b"),
+            ("file:///p/{+path}", "file:///p/a%2F%2Fb"),
+            ("file:///p/{+path}", "file:///p/a/%20/b"),
+            ("file:///p/{+path}", "file:///p/a\\/b"),
+        ] {
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::Root),
+                "{template} {uri}"
+            );
+        }
+        for (template, uri) in [
+            // Right after `scheme://`, a variable names the whole location
+            // already.
+            ("file://{+path}", "file:///etc/passwd"),
+            ("https://{+url}", "https://example.com/a/b"),
+            (
+                "https://{host}/api/{+path}",
+                "https://localhost:8080/api/v1/items",
+            ),
+            // A trailing slash makes no empty segment, and a URL in a
+            // query value may hold `//`.
+            ("file:///p/{+path}", "file:///p/dir/"),
+            ("docs://pages/{id}", "docs://pages/"),
+            (
+                "res://fetch?url={+url}",
+                "res://fetch?url=https://example.com/a//b",
+            ),
+            // A colon after more than one letter isn't a drive.
+            ("file:///docs/{name}", "file:///docs/notes:v2.md"),
+        ] {
+            assert!(Template::parse(template).matches(uri), "{template} {uri}");
+        }
+        // Dot segments still count after `scheme://`.
+        assert_eq!(
+            Template::parse("file://{+path}").check("file:///etc/../x"),
+            Err(Misfit::DotSegment)
+        );
     }
 
     #[test]
