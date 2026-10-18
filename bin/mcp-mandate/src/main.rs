@@ -27,7 +27,7 @@ use tracing_subscriber::fmt::format::Writer;
 #[command(
     name = "mcp-mandate",
     version,
-    about = "A security gate between AI agents and their MCP tools"
+    about = "Scout reviews MCP servers before you trust them, a hash-chained audit log records every decision, and a security gate checks every call between AI agents and their MCP tools"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -496,12 +496,12 @@ fn write_output(out: &Path, text: &str, force: bool) -> std::io::Result<()> {
     let create = |path: &Path| {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        // Writable only by you, whatever the umask: whoever can edit a pins
-        // file approves what's in it. Still readable by others (they hold
-        // no secrets), so a gateway running as another user, such as the
-        // container image's, can load them.
+        // Readable and writable only by you, like the audit log, whatever
+        // the umask: whoever can edit a pins file approves what's in it, and
+        // both files name the server by its command, masked only where a
+        // secret in it has a recognizable shape.
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(path)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()
@@ -937,6 +937,20 @@ mod tests {
     }
 
     #[test]
+    fn the_help_describes_scout_the_audit_log_and_the_gate_in_order() {
+        let about = Cli::command().get_about().unwrap().to_string();
+        let at = |part: &str| {
+            about
+                .find(part)
+                .unwrap_or_else(|| panic!("{part}: {about}"))
+        };
+        assert!(
+            at("Scout") < at("audit log") && at("audit log") < at("gate"),
+            "{about}"
+        );
+    }
+
+    #[test]
     fn run_takes_a_policy_and_the_server_command_after_double_dash() {
         let cli = Cli::try_parse_from([
             "mcp-mandate",
@@ -1141,12 +1155,12 @@ mod tests {
             // A file created as usual gets 0o666 less the umask.
             std::fs::write(dir.join("usual"), "").unwrap();
             let umasked = mode_of(&dir.join("usual"));
-            // Only you can write it whatever the umask, a replaced file
-            // included, but others can read it unless the umask says not.
+            // Only you can read or write it whatever the umask, a replaced
+            // file included.
             write_output(&dir.join("new.toml"), "one", false).unwrap();
             for path in [out.clone(), dir.join("new.toml")] {
                 let mode = mode_of(&path);
-                assert_eq!(mode, 0o644 & umasked, "{mode:o}, umask leaves {umasked:o}");
+                assert_eq!(mode, 0o600 & umasked, "{mode:o}, umask leaves {umasked:o}");
             }
 
             let target = dir.join("elsewhere");
