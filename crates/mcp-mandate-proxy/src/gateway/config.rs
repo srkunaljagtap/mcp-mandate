@@ -476,7 +476,9 @@ fn check_server(
     })
 }
 
-/// Reads a secret from exactly one of an environment variable or a file.
+/// Reads a secret from exactly one of an environment variable or a file,
+/// without the whitespace around it: a server reads a header's value
+/// without it, and could echo the secret in that form.
 fn read_secret(
     server: &str,
     what: &str,
@@ -485,11 +487,14 @@ fn read_secret(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Secret, ConfigError> {
     let value = match (variable, file) {
-        (Some(variable), None) => env(&variable).ok_or_else(|| {
-            ConfigError::Invalid(format!(
-                "server `{server}`: the environment variable {variable} (its {what}) isn't set"
-            ))
-        })?,
+        (Some(variable), None) => env(&variable)
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "server `{server}`: the environment variable {variable} (its {what}) isn't set"
+                ))
+            })?
+            .trim()
+            .to_owned(),
         (None, Some(path)) => std::fs::read_to_string(&path)
             .map_err(|source| ConfigError::SecretFile {
                 server: server.to_owned(),
@@ -682,5 +687,36 @@ auth = { type = "bearer", token_env = "TOKEN" }
         assert!(error(&hmac).contains("never are"));
         let bad_name = config(top).replace("[servers.github]", "[servers.\"Git Hub\"]");
         assert!(error(&bad_name).contains("server name"));
+    }
+
+    #[test]
+    fn a_secret_from_the_environment_is_trimmed_like_one_from_a_file() {
+        let top = "listen = \"127.0.0.1:8080\"\npublic_url = \"http://localhost:8080\"";
+        let with_env = |text: &str, value: &'static str| {
+            let file: ConfigFile = toml::from_str(text).unwrap();
+            GatewayConfig::check(
+                file,
+                &dir(),
+                &|name| (name == "TOKEN").then(|| value.to_owned()),
+                Pinned::Load,
+            )
+        };
+        let header = |config: &GatewayConfig| {
+            let Auth::Header { value, .. } = &config.servers["github"].auth else {
+                panic!("expected a header credential");
+            };
+            value.expose().to_owned()
+        };
+        // A .env line may leave spaces around it.
+        let bearer = with_env(&config(top), " s3cret \t").unwrap();
+        assert_eq!(header(&bearer), "Bearer s3cret");
+        let custom = config(top).replace(
+            "{ type = \"bearer\", token_env = \"TOKEN\" }",
+            "{ type = \"header\", name = \"x-api-key\", value_env = \"TOKEN\" }",
+        );
+        let custom = with_env(&custom, "s3cret ").unwrap();
+        assert_eq!(header(&custom), "s3cret");
+        let blank = with_env(&config(top), "  ").unwrap_err().to_string();
+        assert!(blank.contains("empty"), "{blank}");
     }
 }

@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -270,10 +270,7 @@ async fn admit(app: &App, name: &str, headers: &HeaderMap) -> Result<Caller, Res
             return Err((StatusCode::FORBIDDEN, "this origin isn't allowed").into_response());
         }
     }
-    let metadata = format!(
-        "{}/.well-known/oauth-protected-resource/servers/{name}/mcp",
-        app.config.public_url
-    );
+    let metadata = metadata_url(app, name);
     let Some(token) = bearer(headers) else {
         return Err(unauthorized(&metadata, false));
     };
@@ -298,6 +295,25 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     let (scheme, token) = value.split_once(' ')?;
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+/// Where the OAuth protected-resource metadata for server `name` is.
+fn metadata_url(app: &App, name: &str) -> String {
+    format!(
+        "{}/.well-known/oauth-protected-resource/servers/{name}/mcp",
+        app.config.public_url
+    )
+}
+
+/// The answer to a request whose token expired before the request was
+/// checked or sent: the same as to a token expired on arrival, so the
+/// client gets a fresh one.
+fn expired_token(app: &App, name: &str) -> Response {
+    info!(
+        server = name,
+        "refused a request: its token expired before it was sent"
+    );
+    unauthorized(&metadata_url(app, name), true)
 }
 
 fn unauthorized(metadata: &str, invalid: bool) -> Response {
@@ -529,10 +545,15 @@ async fn post_message(
         }
     };
 
+    // Nothing outlives the token it came with: a request whose token
+    // expired while its body arrived or it waited its turn isn't checked...
+    let deadline = token_deadline(&caller);
+    if passed(deadline) {
+        return expired_token(&app, &name);
+    }
     let Some(actions) = gate_check(&app, &session, move |gate| gate.from_client(&body)).await
     else {
-        close_session(&app, &session);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return check_failed(&app, &session);
     };
     let (answers, forward) = split(actions);
     let Some(forward) = forward.into_iter().next() else {
@@ -544,11 +565,14 @@ async fn post_message(
             None => accepted(id),
         };
     };
+    // ...one whose token expired while it was checked isn't sent, and one
+    // still waiting for its answer when the token expires is given up on.
+    if passed(deadline) {
+        abandon(&session, request_id.as_ref()).await;
+        return expired_token(&app, &name);
+    }
 
     let protocol = protocol_version(&headers);
-    // Nothing outlives the token it came with: a request still waiting for
-    // its answer when the token expires is given up on.
-    let deadline = token_deadline(&caller);
     let upstream = &app.upstreams[&name];
     let upstream_id = session.upstream_id();
     let sent = upstream.post(forward, upstream_id.as_deref(), protocol.as_ref());
@@ -604,12 +628,22 @@ async fn read_message(body: Bytes) -> Option<Result<Message, ParseError>> {
 }
 
 /// Runs `work` until `deadline`, if there is one: `None` if the deadline
-/// comes first.
+/// comes first. Work whose deadline has passed already isn't started: a
+/// timeout runs its work once before it looks at the time, which could
+/// send a request that's then given up on.
 async fn within<T>(deadline: Option<Instant>, work: impl Future<Output = T>) -> Option<T> {
+    if passed(deadline) {
+        return None;
+    }
     match deadline {
         Some(deadline) => tokio::time::timeout_at(deadline, work).await.ok(),
         None => Some(work.await),
     }
+}
+
+/// Whether `deadline`, if there is one, has passed.
+fn passed(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| deadline <= Instant::now())
 }
 
 fn token_expired() -> Response {
@@ -635,6 +669,23 @@ async fn gate_check<T: Send + 'static>(
             check(gate)
         })
         .await
+}
+
+/// The answer to a request whose check didn't run. Its session closed
+/// while it waited (the server forgot the session, the client ended it, or
+/// the gateway is stopping): that's `404`, as for any session that's gone,
+/// so the client starts over. Otherwise a check panicked, and the session,
+/// now unusable, closes.
+fn check_failed(app: &Arc<App>, session: &Arc<Session>) -> Response {
+    if session.is_closed() {
+        return (
+            StatusCode::NOT_FOUND,
+            "the session ended; send initialize first",
+        )
+            .into_response();
+    }
+    close_session(app, session);
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 /// Whether `text`, which the gate doesn't see, holds a secret: any form of
@@ -730,8 +781,7 @@ async fn relay(
     };
     let Some(actions) = gate_check(&app, &session, move |gate| gate.from_server(&body)).await
     else {
-        close_session(&app, &session);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return check_failed(&app, &session);
     };
     let (answers, to_server) = split(actions);
     for message in to_server {
@@ -926,33 +976,41 @@ async fn open_stream(
     let Some(slot) = session.open_stream() else {
         return too_many("this session already has its most server streams open");
     };
+    // It lasts no longer than the token it was opened with: a caller whose
+    // token has expired, or who was disabled, stops getting messages. Nor
+    // is it opened at the server once that token has expired.
+    let deadline = token_deadline(&caller);
+    if passed(deadline) {
+        return expired_token(&app, &name);
+    }
     let protocol = protocol_version(&headers);
     let upstream = &app.upstreams[&name];
-    let request = match upstream
-        .request(
-            reqwest::Method::GET,
-            "text/event-stream",
-            session.upstream_id().as_deref(),
-            protocol.as_ref(),
-        )
-        .await
-    {
-        Ok(request) => request,
-        Err(failure) => {
+    let upstream_id = session.upstream_id();
+    let request = upstream.request(
+        reqwest::Method::GET,
+        "text/event-stream",
+        upstream_id.as_deref(),
+        protocol.as_ref(),
+    );
+    let request = match within(deadline, request).await {
+        Some(Ok(request)) => request,
+        Some(Err(failure)) => {
             warn!(server = name, error = %describe(&failure), "couldn't get a credential for the MCP server");
             return StatusCode::BAD_GATEWAY.into_response();
         }
+        None => return token_expired(),
     };
     let request = match headers.get("last-event-id").filter(|id| id.len() <= 256) {
         Some(id) => request.header("last-event-id", id.clone()),
         None => request,
     };
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(failure) => {
+    let response = match within(deadline, request.send()).await {
+        Some(Ok(response)) => response,
+        Some(Err(failure)) => {
             warn!(server = name, error = %failure.without_url(), "couldn't reach the MCP server");
             return StatusCode::BAD_GATEWAY.into_response();
         }
+        None => return token_expired(),
     };
     if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -960,19 +1018,13 @@ async fn open_stream(
     if !response.status().is_success() || !is_event_stream(response.headers()) {
         return StatusCode::BAD_GATEWAY.into_response();
     }
-    // It lasts no longer than the token it was opened with: a caller whose
-    // token has expired, or who was disabled, stops getting messages.
-    let deadline = token_deadline(&caller);
     stream(app, session, response, protocol, None, Some(slot), deadline)
 }
 
 /// When `caller`'s token expires, as an instant; `None` if it's too far
 /// off to represent.
 fn token_deadline(caller: &Caller) -> Option<Instant> {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    Instant::now().checked_add(Duration::from_secs(caller.expires.saturating_sub(now)))
+    Instant::now().checked_add(caller.time_left()?)
 }
 
 /// Ends a session (`DELETE`).
@@ -1265,6 +1317,8 @@ impl HttpRpc<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     #[tokio::test(start_paused = true)]
@@ -1318,8 +1372,25 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn work_past_its_deadline_is_given_up_on() {
         let soon = Some(Instant::now() + Duration::from_secs(1));
-        assert_eq!(within(soon, std::future::pending::<()>()).await, None);
         assert_eq!(within(soon, async { 7 }).await, Some(7));
+        assert_eq!(within(soon, std::future::pending::<()>()).await, None);
         assert_eq!(within(None, async { 7 }).await, Some(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_whose_deadline_has_passed_isnt_started() {
+        let started = Arc::new(AtomicBool::new(false));
+        let work = {
+            let started = Arc::clone(&started);
+            async move {
+                started.store(true, Ordering::SeqCst);
+                7
+            }
+        };
+        assert_eq!(within(Some(Instant::now()), work).await, None);
+        assert!(!started.load(Ordering::SeqCst), "it was started");
+        assert!(passed(Some(Instant::now())));
+        assert!(!passed(Some(Instant::now() + Duration::from_secs(1))));
+        assert!(!passed(None));
     }
 }
