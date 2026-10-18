@@ -29,6 +29,10 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The current user, to warn about a policy another user owns.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 mcp-mandate-pin.workspace = true
 serde_json.workspace = true

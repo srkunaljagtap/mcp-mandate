@@ -531,6 +531,39 @@ mod tests {
     fn catches_hidden_characters() {
         let found = checks(tool("t", "Echoes\u{200B} the input\u{E0049}\u{E0047}"));
         assert_eq!(found, [("hidden-characters", Severity::High)]);
+        // Every default-ignorable and format character the pins file
+        // escapes counts, not only the best known ones.
+        for hidden in [
+            '\u{180B}',
+            '\u{2065}',
+            '\u{FFF0}',
+            '\u{FFF9}',
+            '\u{1D173}',
+            '\u{E0080}',
+            '\u{E01F0}',
+            '\u{0600}',
+            '\u{13430}',
+        ] {
+            let found = checks(tool("t", &format!("Echoes{hidden} the input")));
+            assert_eq!(
+                found,
+                [("hidden-characters", Severity::High)],
+                "U+{:04X}",
+                u32::from(hidden)
+            );
+        }
+    }
+
+    #[test]
+    fn denies_a_read_only_local_tool_that_hides_text() {
+        let mut quiet = tool("quiet", "Reads a note.\u{1D173}\u{1D174}");
+        quiet["annotations"] = json!({"readOnlyHint": true, "openWorldHint": false});
+        let inventory = Inventory {
+            tools: vec![quiet],
+            ..Inventory::default()
+        };
+        let plans = crate::plan_tools(&inventory, &scan(&inventory));
+        assert_eq!(plans[0].proposal, crate::draft::Proposal::Deny);
     }
 
     #[test]

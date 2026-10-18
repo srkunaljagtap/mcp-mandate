@@ -227,7 +227,7 @@ fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error
     info!(policy = %path.display(), mode = mode_name(policy.mode), "loaded policy");
     if policy.mode == Mode::Observe {
         warn!(
-            "observe mode: decisions are logged, but nothing is blocked or hidden; add mode = \"enforce\" to the policy to enforce it"
+            "observe mode: decisions are logged, but nothing is blocked or hidden; set mode = \"enforce\" in the policy to enforce it"
         );
     }
     let mut log = Log::open(&policy.audit_log)?;
@@ -254,9 +254,9 @@ fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error
 
 /// Warns when a file that configures the gate sits where the agent or a
 /// server could rewrite it: inside the folder the server runs in (the
-/// agent's own file tools reach it without passing the gate), or writable by
-/// other users, or in a folder they can write to. Whoever can edit these
-/// files decides what the gate allows.
+/// agent's own file tools reach it without passing the gate), or owned or
+/// writable by other users, or in a folder they own or can write to.
+/// Whoever can edit these files decides what the gate allows.
 fn warn_if_exposed(what: &str, path: &Path) {
     let Ok(full) = std::fs::canonicalize(path) else {
         return; // loading it reports the problem
@@ -273,23 +273,65 @@ fn warn_if_exposed(what: &str, path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let exposed = |metadata: &std::fs::Metadata| {
-            writable_by_others(metadata.mode(), metadata.uid(), metadata.gid())
+        let me = nix::unistd::geteuid().as_raw();
+        let exposure_of = |path: &Path| {
+            let metadata = std::fs::metadata(path).ok()?;
+            exposure(metadata.mode(), metadata.uid(), metadata.gid(), me)
         };
-        if std::fs::metadata(&full).is_ok_and(|metadata| exposed(&metadata)) {
-            warn!(file = %path.display(), "the {what} is writable by other users");
+        match exposure_of(&full) {
+            Some(Exposure::Owner) => warn!(
+                file = %path.display(),
+                "the {what} belongs to another user, who can change it"
+            ),
+            Some(Exposure::Writers) => warn!(
+                file = %path.display(),
+                "the {what} is writable by other users"
+            ),
+            None => {}
         }
-        // Whoever can write to a folder can replace the files in it, unless
-        // it has the sticky bit (as /tmp does).
-        if let Some(folder) = full.parent()
-            && std::fs::metadata(folder)
-                .is_ok_and(|metadata| exposed(&metadata) && metadata.mode() & 0o1000 == 0)
-        {
-            warn!(
+        // Whoever can write to a folder can replace the files in it.
+        match full.parent().and_then(exposure_of) {
+            Some(Exposure::Owner) => warn!(
+                file = %path.display(),
+                "the {what}'s folder belongs to another user, who can replace the file"
+            ),
+            Some(Exposure::Writers) => warn!(
                 file = %path.display(),
                 "the {what}'s folder is writable by other users, who can replace the file"
-            );
+            ),
+            None => {}
         }
+    }
+}
+
+/// What lets users other than the current one and root change a file or
+/// folder, if anything.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exposure {
+    /// Another user owns it, so they can change it whatever its mode says
+    /// and, if it's a folder, replace the files in it.
+    Owner,
+    /// Its mode lets other users write to it.
+    Writers,
+}
+
+/// What lets users other than `me` (the current user) and root change a
+/// file or folder with this mode, owner and group, if anything. Others who
+/// can write to a folder with the sticky bit (as /tmp has) can add files to
+/// it, but not replace yours, so that doesn't count.
+#[cfg(unix)]
+fn exposure(mode: u32, uid: u32, gid: u32, me: u32) -> Option<Exposure> {
+    const FILE_TYPE: u32 = 0o170000;
+    const FOLDER: u32 = 0o040000;
+    const STICKY: u32 = 0o1000;
+    let sticky_folder = mode & FILE_TYPE == FOLDER && mode & STICKY != 0;
+    if uid != me && uid != 0 {
+        Some(Exposure::Owner)
+    } else if writable_by_others(mode, uid, gid) && !sticky_folder {
+        Some(Exposure::Writers)
+    } else {
+        None
     }
 }
 
@@ -1054,6 +1096,28 @@ mod tests {
         // Anyone, whatever the group.
         assert!(writable_by_others(0o100646, 1000, 1000));
         assert!(!writable_by_others(0o40755, 1000, 100));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_users_file_or_folder_is_exposed_whatever_its_mode() {
+        let me = 1000;
+        // Another user can change what they own, and replace what's in a
+        // folder they own, sticky bit or not.
+        assert_eq!(exposure(0o100600, 1001, 1001, me), Some(Exposure::Owner));
+        assert_eq!(exposure(0o40755, 1001, 1001, me), Some(Exposure::Owner));
+        assert_eq!(exposure(0o41777, 1001, 1001, me), Some(Exposure::Owner));
+        // A user can change their own file when root runs mcp-mandate.
+        assert_eq!(exposure(0o100644, 1000, 1000, 0), Some(Exposure::Owner));
+        // Yours and root's are exposed only when others can write to them.
+        assert_eq!(exposure(0o100644, me, me, me), None);
+        assert_eq!(exposure(0o40755, 0, 0, me), None);
+        assert_eq!(exposure(0o100666, 0, 0, me), Some(Exposure::Writers));
+        assert_eq!(exposure(0o40777, me, me, me), Some(Exposure::Writers));
+        // Others can add files to /tmp, but not replace yours.
+        assert_eq!(exposure(0o41777, 0, 0, me), None);
+        // The sticky bit means nothing on a file.
+        assert_eq!(exposure(0o101666, me, me, me), Some(Exposure::Writers));
     }
 
     #[test]
