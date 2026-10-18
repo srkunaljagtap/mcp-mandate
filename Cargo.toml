@@ -9,7 +9,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/OWNER/mcp-mandate"
+repository = "https://github.com/srkunaljagtap/mcp-mandate"
 
 # Dependency versions are declared once here; crates opt in with
 # `name.workspace = true`.
