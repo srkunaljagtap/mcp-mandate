@@ -16,7 +16,8 @@
 //! keeps the record in place meanwhile: it puts it back if something
 //! removes it, and touches it now and then so cleaners of old files leave
 //! it alone. Each of a named agent's servers touches the lock file the same
-//! way, so it isn't removed while they hold it.
+//! way, so it isn't removed while they hold it, and makes and locks it again
+//! if it's removed anyway.
 //!
 //! The file lives in a folder only this user can use, checked again before
 //! every write, and is never written through a link. If that can't be set
@@ -27,7 +28,7 @@ use std::fs::{self, File, FileTimes, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
@@ -69,11 +70,13 @@ pub struct AgentTaint {
     /// for a named agent, the lock file from the start).
     check: Duration,
     /// Keeps the record in place once the taint has been seen, and a named
-    /// agent's lock file from looking old. Declared before `running` so it
-    /// stops before this server counts as stopped.
+    /// agent's lock file in place and from looking old. Declared before
+    /// `running` so it stops before this server counts as stopped.
     keeper: OnceLock<Keeper>,
-    /// For a named agent: the shared lock that shows this server is running.
-    running: Option<Arc<File>>,
+    /// For a named agent: the lock file this server holds a shared lock on
+    /// to show it's running. Replaced if that file is removed (see
+    /// [`keep_lock`]).
+    running: Option<Arc<Mutex<File>>>,
 }
 
 impl AgentTaint {
@@ -113,10 +116,10 @@ impl AgentTaint {
     }
 
     /// One of a named agent's servers, whose record is at `path`: marked as
-    /// running for its life, and keeping that mark from looking old (its
-    /// lock file is checked every `check`).
+    /// running for its life, and keeping that mark in place and from
+    /// looking old (its lock file is checked every `check`).
     fn join(path: PathBuf, check: Duration) -> Self {
-        let running = join_named(&path).map(Arc::new);
+        let running = join_named(&path).map(|lock| Arc::new(Mutex::new(lock)));
         let taint = Self {
             running,
             check,
@@ -165,11 +168,12 @@ impl AgentTaint {
         }
     }
 
-    /// Touches this server's lock file if it looks old: done whenever the
-    /// record is checked, besides by the keeper (which warns if it can't).
+    /// Touches this server's lock file if it looks old, and locks it again
+    /// if it's been removed: done whenever the record is checked, besides
+    /// by the keeper (which warns if it can't).
     fn keep_running(&self) {
         if let Some(lock) = &self.running {
-            let _ = keep_lock(lock);
+            let _ = keep_lock(&self.path, lock);
         }
     }
 }
@@ -228,11 +232,12 @@ impl SharedTaint for AgentTaint {
     }
 }
 
-/// A thread that, until dropped, keeps a named agent's lock file from
-/// looking old and, once the taint has been seen, keeps its record in
-/// place: it puts the record back if it's gone, and touches either once
-/// it's been untouched for [`TOUCH`]. So a record that couldn't be written
-/// at first (a full disk, say) is written as soon as it can be.
+/// A thread that, until dropped, keeps a named agent's lock file and, once
+/// the taint has been seen, its record in place: it puts either back if
+/// it's gone, and touches either once it's been untouched for [`TOUCH`].
+/// So a record that couldn't be written at first (a full disk, say) is
+/// written as soon as it can be. The lock file is seen to first, so a
+/// server started meanwhile doesn't clear the record put back.
 struct Keeper {
     stop: mpsc::Sender<()>,
     thread: Option<JoinHandle<()>>,
@@ -242,7 +247,7 @@ impl Keeper {
     fn start(
         path: PathBuf,
         seen: Arc<OnceLock<String>>,
-        lock: Option<Arc<File>>,
+        lock: Option<Arc<Mutex<File>>>,
         check: Duration,
     ) -> std::io::Result<Self> {
         let (stop, stopped) = mpsc::channel();
@@ -253,7 +258,7 @@ impl Keeper {
                 while stopped.recv_timeout(check) == Err(mpsc::RecvTimeoutError::Timeout) {
                     if let Some(lock) = &lock {
                         report(
-                            keep_lock(lock),
+                            keep_lock(&path, lock),
                             &mut lock_failing,
                             "couldn't keep this server marked as running; a later server of the agent may clear its taint",
                         );
@@ -312,14 +317,53 @@ fn keep_record(path: &Path, source: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Touches a named agent's lock file, through the handle this server holds
-/// it by, if it's been untouched for [`TOUCH`]. Otherwise a cleaner of old
-/// files could remove it while the agent runs, and the next server, finding
-/// it unlocked, would clear the agent's taint.
-fn keep_lock(lock: &File) -> std::io::Result<()> {
+/// Keeps the lock file next to a named agent's `record` showing this server
+/// is running. It's touched, through the handle this server holds it by, if
+/// it's been untouched for [`TOUCH`]: otherwise a cleaner of old files could
+/// remove it while the agent runs, and the next server, finding it unlocked,
+/// would clear the agent's taint. If it's removed anyway, it's made and
+/// locked again (see [`follow_lock`]).
+fn keep_lock(record: &Path, lock: &Mutex<File>) -> std::io::Result<()> {
+    // A panic while it was held can't have left the file half replaced.
+    let mut lock = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    follow_lock(record, &mut lock)?;
     if untouched(lock.metadata()?.modified()?) {
-        touch(lock)?;
+        touch(&lock)?;
     }
+    Ok(())
+}
+
+/// Makes sure `lock` is the file a server starting now finds next to
+/// `record`. A lock on a file no longer there shows no later server that
+/// this one runs: if it's been removed (with its folder, say, as a runtime
+/// folder is at logout) or replaced, the folder and the file are made again
+/// as needed, and the file there is locked instead.
+#[cfg(unix)]
+fn follow_lock(record: &Path, lock: &mut File) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let held = lock.metadata()?;
+    // Links aren't followed: one in the lock file's place isn't it.
+    match fs::symlink_metadata(record.with_extension("lock")) {
+        Ok(found) if found.dev() == held.dev() && found.ino() == held.ino() => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(folder) = record.parent() {
+        make_private(folder).map_err(std::io::Error::other)?;
+    }
+    let found = open_lock(record)?;
+    found.lock_shared()?;
+    *lock = found;
+    info!("the agent's lock file was removed; this server is marked as running again");
+    Ok(())
+}
+
+/// On Windows the lock file's folder, under `LOCALAPPDATA`, isn't emptied
+/// at logout or by a cleaner of old files, so the lock file is left as it is.
+#[cfg(not(unix))]
+fn follow_lock(_: &Path, _: &mut File) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -994,6 +1038,63 @@ mod tests {
         age(&lock);
         std::thread::sleep(Duration::from_millis(100));
         assert!(!recent(&lock));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// Whether a running server holds the lock file at `path`.
+    #[cfg(unix)]
+    fn locked(path: &Path) -> bool {
+        File::open(path).is_ok_and(|file| matches!(file.try_lock(), Err(TryLockError::WouldBlock)))
+    }
+
+    /// A lock file removed while the agent runs, alone or with its folder
+    /// (as a runtime folder is at logout, made again at the next login), is
+    /// made and locked again, so a server started afterwards doesn't clear
+    /// the running agent's taint.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_server_locks_its_lock_file_again_once_its_removed() {
+        let folder = folder("relock");
+        let records = folder.join("records");
+        make_private(&records).unwrap();
+        let path = records.join("taint-named-test");
+        let lock = path.with_extension("lock");
+        // It hasn't seen the taint, so only its lock keeps the record.
+        let server = AgentTaint::join(path.clone(), Duration::from_millis(10));
+        let running = server.running.as_ref().unwrap();
+        assert!(locked(&lock));
+
+        fs::remove_file(&lock).unwrap();
+        assert!(eventually(|| locked(&lock)), "locked again once removed");
+
+        // The folder goes and can't be made again for a while (a file is
+        // in its place). The keeper waits while it's swapped.
+        let paused = running.lock().unwrap();
+        fs::remove_dir_all(&records).unwrap();
+        fs::write(&records, "").unwrap();
+        drop(paused);
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Then it's made again, and a server that saw the taint puts the
+        // record back.
+        let paused = running.lock().unwrap();
+        fs::remove_file(&records).unwrap();
+        make_private(&records).unwrap();
+        write_record(&path, "the output of tool `fetch`").unwrap();
+        drop(paused);
+        assert!(
+            eventually(|| locked(&lock)),
+            "locked again once its folder is back"
+        );
+
+        // A server starting now sees the agent running.
+        let next = AgentTaint::join(path.clone(), CHECK);
+        assert_eq!(next.get().as_deref(), Some("the output of tool `fetch`"));
+
+        // No lock is left behind once they stop.
+        drop(server);
+        drop(next);
+        assert!(!locked(&lock));
         let _ = fs::remove_dir_all(&folder);
     }
 
