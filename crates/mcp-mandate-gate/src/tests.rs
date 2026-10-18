@@ -497,6 +497,15 @@ fn huge_answer(id: u64) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A call to `tool` whose arguments are as large as [`huge_answer`].
+fn huge_call(id: u64, tool: &str) -> Vec<u8> {
+    let rows = vec![r#"{"id":1,"name":"x"}"#; 80_000].join(",");
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"{tool}\",\"arguments\":{{\"rows\":[{rows}]}}}}}}\n"
+    )
+    .into_bytes()
+}
+
 #[test]
 fn a_message_too_large_to_check_is_answered_rather_than_left_waiting() {
     let (mut gate, log) = gate_with_log(ALLOW_ALL, Some(taint_pins()));
@@ -867,6 +876,161 @@ fn observe_mode_passes_an_answer_whose_taint_cant_be_shared() {
     assert!(event.reason.unwrap().contains("couldn't be shared"));
 }
 
+const OBSERVE: &str = "mode = \"observe\"\n";
+
+#[test]
+fn observe_mode_tracks_a_request_it_would_block_so_its_answer_taints() {
+    // Neither is approved, so enforcing would block both.
+    for (method, params, result, source) in [
+        (
+            "prompts/get",
+            json!({"name": "jailbreak"}),
+            json!({"messages": [{"role": "user", "content": {"type": "text", "text": INJECTION}}]}),
+            "a prompt from the server",
+        ),
+        (
+            "resources/read",
+            json!({"uri": "test://inbox/2"}),
+            json!({"contents": [{"uri": "test://inbox/2", "text": INJECTION}]}),
+            "a resource from the server",
+        ),
+    ] {
+        let record = Arc::new(Record::default());
+        let (mut gate, log) = sharing_gate(OBSERVE, &record);
+        let asked = request(20, method, params);
+        assert_eq!(
+            gate.from_client(&asked),
+            vec![Action::ToServer(asked.clone())]
+        );
+        assert_eq!(log.last().would, Some(audit::Verdict::Block), "{method}");
+        gate.from_server(&response(20, result));
+        assert_eq!(gate.taint().as_deref(), Some(source), "{method}");
+        assert_eq!(record.get().as_deref(), Some(source), "{method}");
+    }
+}
+
+#[test]
+fn observe_mode_taints_for_an_answer_it_cant_read() {
+    let repeated_key = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"hi\",\"text\":\"{INJECTION}\"}}]}}}}\n"
+    );
+    let nested = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":{{\"content\":[],\"structuredContent\":{}{}}}}}\n",
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    for answer in [
+        huge_answer(10),
+        repeated_key.into_bytes(),
+        nested.into_bytes(),
+    ] {
+        let record = Arc::new(Record::default());
+        let (mut gate, _) = sharing_gate(OBSERVE, &record);
+        let fetch = request(
+            10,
+            "tools/call",
+            json!({"name": "fetch_page", "arguments": {}}),
+        );
+        assert_eq!(
+            gate.from_client(&fetch),
+            vec![Action::ToServer(fetch.clone())]
+        );
+        assert_eq!(
+            gate.from_server(&answer),
+            vec![Action::ToClient(answer.clone())]
+        );
+        assert_eq!(
+            record.get().as_deref(),
+            Some("the output of tool `fetch_page`"),
+            "{}",
+            String::from_utf8_lossy(&answer[..60])
+        );
+        assert!(!gate.pending.contains_key("10"));
+    }
+
+    // One whose id can't be read could answer any request still waiting.
+    let record = Arc::new(Record::default());
+    let (mut gate, _) = sharing_gate(OBSERVE, &record);
+    let fetch = request(
+        10,
+        "tools/call",
+        json!({"name": "fetch_page", "arguments": {}}),
+    );
+    gate.from_client(&fetch);
+    let unknown_id = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":10,\"id\":10,\"result\":{{\"text\":\"{INJECTION}\"}}}}\n"
+    );
+    assert_eq!(
+        gate.from_server(unknown_id.as_bytes()),
+        vec![Action::ToClient(unknown_id.clone().into_bytes())]
+    );
+    assert_eq!(
+        record.get().as_deref(),
+        Some("the output of tool `fetch_page`")
+    );
+
+    // So does an answer whose envelope can be read but not the rest
+    // (classifying refuses one first, so it's checked here directly).
+    let record = Arc::new(Record::default());
+    let (mut gate, _) = sharing_gate(OBSERVE, &record);
+    let deep = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":{}{}}}\n",
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    let fetching = Pending::ToolCall(Some("fetch_page".to_owned()));
+    assert_eq!(
+        gate.server_response(deep.as_bytes(), Some(fetching)),
+        vec![Action::ToClient(deep.clone().into_bytes())]
+    );
+    assert_eq!(
+        record.get().as_deref(),
+        Some("the output of tool `fetch_page`")
+    );
+
+    // What wouldn't taint the session when it can be read still doesn't.
+    let record = Arc::new(Record::default());
+    let (mut gate, _) = sharing_gate(OBSERVE, &record);
+    let note = request(
+        11,
+        "tools/call",
+        json!({"name": "add_note", "arguments": {}}),
+    );
+    gate.from_client(&note);
+    gate.from_server(&huge_answer(11));
+    assert_eq!(gate.taint(), None);
+    assert_eq!(record.get(), None);
+}
+
+#[test]
+fn observe_mode_expects_an_answer_to_a_request_it_cant_read() {
+    let record = Arc::new(Record::default());
+    let (mut gate, log) = sharing_gate(OBSERVE, &record);
+    // Which tool it calls can't be read, so even a closed-world one counts
+    // as reading untrusted content.
+    let call = huge_call(11, "add_note");
+    assert_eq!(
+        gate.from_client(&call),
+        vec![Action::ToServer(call.clone())]
+    );
+    let answer = response(
+        11,
+        json!({"content": [{"type": "text", "text": INJECTION}]}),
+    );
+    assert_eq!(
+        gate.from_server(&answer),
+        vec![Action::ToClient(answer.clone())]
+    );
+    assert_eq!(
+        record.get().as_deref(),
+        Some("the output of a tool call mcp-mandate couldn't read in full")
+    );
+    // Checked as the answer it is, not as one to no request.
+    let event = log.last();
+    assert_eq!(event.method.as_deref(), Some("tools/call"));
+    assert_eq!(event.would, None);
+}
+
 #[test]
 fn redacts_secrets_from_tool_results_and_notifications() {
     let mut gate = taint_gate("");
@@ -1065,6 +1229,60 @@ fn nothing_passes_while_the_audit_log_cannot_be_written() {
         None,
         "traffic resumes once the log can be written"
     );
+}
+
+#[test]
+fn nobody_waits_for_an_answer_while_the_audit_log_cannot_be_written() {
+    let (mut gate, log) = gate_with_log(ALLOW_ALL, Some(taint_pins()));
+    list(&mut gate, Kind::Tool, taint_tools());
+    let note = request(
+        10,
+        "tools/call",
+        json!({"name": "add_note", "arguments": {}}),
+    );
+    assert_eq!(
+        gate.from_client(&note),
+        vec![Action::ToServer(note.clone())]
+    );
+    for id in [5, 6] {
+        let roots = request(id, "roots/list", json!({}));
+        assert_eq!(
+            gate.from_server(&roots),
+            vec![Action::ToClient(roots.clone())]
+        );
+    }
+    log.fail(true);
+    let refused = |text: &str| {
+        assert!(text.contains("the audit log can't be written"), "{text}");
+    };
+
+    // The server's answer, too large to check: the client gets a tool
+    // error in its place.
+    let reply = only_to_client(&gate.from_server(&huge_answer(10)));
+    assert_eq!(reply["id"], 10);
+    assert_eq!(reply["result"]["isError"], true);
+    refused(reply["result"]["content"][0]["text"].as_str().unwrap());
+
+    // The client's request, too large to check.
+    let reply = only_to_client(&gate.from_client(&huge_call(11, "add_note")));
+    assert_eq!(reply["id"], 11);
+    assert_eq!(reply["result"]["isError"], true);
+    refused(reply["result"]["content"][0]["text"].as_str().unwrap());
+    assert!(!gate.pending.contains_key("11"));
+
+    // The client's answers to the server's requests, whether they can be
+    // checked or not: the server gets an error in their place.
+    for (id, answer) in [(5, huge_answer(5)), (6, response(6, json!({"roots": []})))] {
+        let actions = gate.from_client(&answer);
+        let [Action::ToServer(bytes)] = actions.as_slice() else {
+            panic!("expected an error to the server, got {actions:?}");
+        };
+        let error: Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(error["id"], id);
+        assert_eq!(error["error"]["code"], BLOCKED_ERROR_CODE);
+        refused(error["error"]["message"].as_str().unwrap());
+    }
+    assert!(gate.server_pending.is_empty());
 }
 
 #[test]
