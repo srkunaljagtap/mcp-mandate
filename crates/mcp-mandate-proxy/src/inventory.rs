@@ -2,6 +2,7 @@
 //! handshake, then each list method it supports, page by page. This is
 //! what `mcp-mandate pin` records and Scout reviews.
 
+use mcp_mandate_gate::jsonrpc::{ParseError, classify};
 use mcp_mandate_pin::Inventory;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -18,11 +19,12 @@ const MAX_PAGES: usize = 100;
 /// a hostile one could otherwise fill memory, and make the review that
 /// follows crawl.
 const MAX_ITEMS: usize = 10_000;
-/// Most values (object keys included) one reply may hold, as in one message
-/// the gate checks. A reply is read whole, where each value takes many
-/// times its size in the text, so a reply of tiny values (`[{},{},…]`)
-/// could otherwise fill memory before the limits above are checked.
-const MAX_VALUES: usize = 1_000_000;
+/// Most memory everything listed from one server may take, in bytes as
+/// [`kept`] estimates them: four times what the gate lets one message take.
+/// Each reply is held to the gate's own limit as it's read (see
+/// [`read_reply`]), but a list may span [`MAX_PAGES`] pages, there are four
+/// lists, and every page's items are kept until the listing ends.
+const MAX_KEPT: usize = 256_000_000;
 
 /// A way to send requests to an MCP server.
 pub(crate) trait Rpc {
@@ -34,6 +36,7 @@ pub(crate) trait Rpc {
 
 /// Does the handshake and lists everything the server offers.
 pub(crate) async fn collect(rpc: &mut impl Rpc) -> Result<Inventory, ProxyError> {
+    let mut budget = Budget::new(MAX_KEPT);
     let init = rpc
         .request(
             "initialize",
@@ -44,6 +47,7 @@ pub(crate) async fn collect(rpc: &mut impl Rpc) -> Result<Inventory, ProxyError>
             }),
         )
         .await?;
+    budget.charge("initialize", std::slice::from_ref(&init))?;
     rpc.notify("notifications/initialized").await?;
 
     let offers = |capability: &str| {
@@ -59,29 +63,35 @@ pub(crate) async fn collect(rpc: &mut impl Rpc) -> Result<Inventory, ProxyError>
         ..Inventory::default()
     };
     if offers("tools") {
-        inventory.tools = list_all(rpc, "tools/list", "tools").await?;
+        inventory.tools = list_all(rpc, "tools/list", "tools", &mut budget).await?;
     }
     if offers("prompts") {
-        inventory.prompts = list_all(rpc, "prompts/list", "prompts").await?;
+        inventory.prompts = list_all(rpc, "prompts/list", "prompts", &mut budget).await?;
     }
     if offers("resources") {
-        inventory.resources = list_all(rpc, "resources/list", "resources").await?;
+        inventory.resources = list_all(rpc, "resources/list", "resources", &mut budget).await?;
         // Templates are optional even for servers with resources, so a
         // server that doesn't list them is recorded as having none, with a
         // warning. A list too long to read whole is an error, as for the
         // other lists.
-        inventory.resource_templates =
-            match list_all(rpc, "resources/templates/list", "resourceTemplates").await {
-                Ok(templates) => templates,
-                Err(error @ ProxyError::TooLong { .. }) => return Err(error),
-                Err(error) => {
-                    warn!(
-                        %error,
-                        "the server didn't list its resource templates, so none are recorded"
-                    );
-                    Vec::new()
-                }
-            };
+        let templates = list_all(
+            rpc,
+            "resources/templates/list",
+            "resourceTemplates",
+            &mut budget,
+        )
+        .await;
+        inventory.resource_templates = match templates {
+            Ok(templates) => templates,
+            Err(error @ ProxyError::TooLong { .. }) => return Err(error),
+            Err(error) => {
+                warn!(
+                    %error,
+                    "the server didn't list its resource templates, so none are recorded"
+                );
+                Vec::new()
+            }
+        };
     }
     Ok(inventory)
 }
@@ -89,7 +99,12 @@ pub(crate) async fn collect(rpc: &mut impl Rpc) -> Result<Inventory, ProxyError>
 /// Calls a list method, following `nextCursor` across pages. A list too
 /// long to read whole is an error: a partial one would pin or review only
 /// some of what the server offers.
-async fn list_all(rpc: &mut impl Rpc, method: &str, field: &str) -> Result<Vec<Value>, ProxyError> {
+async fn list_all(
+    rpc: &mut impl Rpc,
+    method: &str,
+    field: &str,
+    budget: &mut Budget,
+) -> Result<Vec<Value>, ProxyError> {
     let too_long = |limit: String| ProxyError::TooLong {
         method: method.to_owned(),
         limit,
@@ -103,6 +118,7 @@ async fn list_all(rpc: &mut impl Rpc, method: &str, field: &str) -> Result<Vec<V
         };
         let mut result = rpc.request(method, params).await?;
         if let Some(Value::Array(page)) = result.get_mut(field).map(Value::take) {
+            budget.charge(method, &page)?;
             items.extend(page);
         }
         if items.len() > MAX_ITEMS {
@@ -116,42 +132,83 @@ async fn list_all(rpc: &mut impl Rpc, method: &str, field: &str) -> Result<Vec<V
     Err(too_long(format!("{MAX_PAGES} pages")))
 }
 
-/// Parses a message the server sent while being listed: `None` if it isn't
-/// JSON. One with more than [`MAX_VALUES`] values is an error, found before
-/// it's parsed.
-pub(crate) fn read_reply(method: &str, bytes: &[u8]) -> Result<Option<Value>, ProxyError> {
-    if most_values(bytes) > MAX_VALUES {
-        return Err(ProxyError::TooLong {
-            method: method.to_owned(),
-            limit: format!("{MAX_VALUES} values in one reply"),
-        });
-    }
-    Ok(serde_json::from_slice(bytes).ok())
+/// How much memory a listing may still take with what it keeps.
+struct Budget {
+    total: usize,
+    left: usize,
 }
 
-/// The most values (object keys included) that JSON text can hold, counted
-/// without parsing it: each one but the first follows a `[`, `{`, `,` or
-/// `:` outside a string.
-fn most_values(bytes: &[u8]) -> usize {
-    let mut count = 1;
-    let (mut in_string, mut escaped) = (false, false);
-    for &byte in bytes {
-        if in_string {
-            match byte {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-        } else {
-            match byte {
-                b'"' => in_string = true,
-                b'[' | b'{' | b',' | b':' => count += 1,
-                _ => {}
-            }
-        }
+impl Budget {
+    fn new(total: usize) -> Self {
+        Self { total, left: total }
     }
-    count
+
+    /// Takes what keeping `values` costs, or fails if the listing would
+    /// then keep more than it may.
+    fn charge(&mut self, method: &str, values: &[Value]) -> Result<(), ProxyError> {
+        let cost = values.iter().map(kept).fold(0, usize::saturating_add);
+        self.left = self
+            .left
+            .checked_sub(cost)
+            .ok_or_else(|| ProxyError::TooLong {
+                method: method.to_owned(),
+                limit: format!(
+                    "{} MB in memory, counting all its lists",
+                    self.total / 1_000_000
+                ),
+            })?;
+        Ok(())
+    }
+}
+
+/// Roughly how many bytes `value` takes in memory: what the gate counts for
+/// a message it checks (see `mcp_mandate_gate::jsonrpc`), plus the bytes of
+/// its strings. The gate needn't count those, as a message's own size
+/// bounds them, but over many replies they add up.
+fn kept(value: &Value) -> usize {
+    // The gate's weights: a slot for every value and key, and an allocation
+    // of its own for every non-empty string, array and object.
+    const VALUE: usize = 64;
+    const STRING: usize = 32;
+    const ARRAY: usize = 128;
+    const OBJECT: usize = 640;
+    let text = |text: &str| {
+        if text.is_empty() {
+            0
+        } else {
+            STRING + text.len()
+        }
+    };
+    VALUE
+        + match value {
+            Value::String(string) => text(string),
+            Value::Array(items) if !items.is_empty() => {
+                ARRAY + items.iter().map(kept).sum::<usize>()
+            }
+            Value::Object(members) if !members.is_empty() => {
+                OBJECT
+                    + members
+                        .iter()
+                        .map(|(key, value)| VALUE + text(key) + kept(value))
+                        .sum::<usize>()
+            }
+            _ => 0,
+        }
+}
+
+/// Parses a message the server sent while being listed, refusing what the
+/// gate refuses. One too large for the gate to check is an error, found
+/// before it's parsed. Anything else the gate would drop (it isn't JSON,
+/// isn't JSON-RPC, or repeats a key, say) is `None`, without being parsed.
+pub(crate) fn read_reply(method: &str, bytes: &[u8]) -> Result<Option<Value>, ProxyError> {
+    match classify(bytes) {
+        Ok(_) => Ok(serde_json::from_slice(bytes).ok()),
+        Err(ParseError::TooManyValues) => Err(ProxyError::TooLong {
+            method: method.to_owned(),
+            limit: "what the gate can check in one message".to_owned(),
+        }),
+        Err(_) => Ok(None),
+    }
 }
 
 /// The `result` of a JSON-RPC response, taken out of it rather than copied,
@@ -212,6 +269,50 @@ mod tests {
         }
     }
 
+    /// A server whose every list has `pages` pages of one `item` each.
+    struct Paged {
+        item: Value,
+        pages: usize,
+    }
+
+    impl Rpc for Paged {
+        async fn request(&mut self, method: &str, params: Value) -> Result<Value, ProxyError> {
+            let field = method.split('/').next().unwrap();
+            let page: usize = params["cursor"]
+                .as_str()
+                .map_or(1, |cursor| cursor.parse().unwrap());
+            let mut result = json!({});
+            result[field] = json!([self.item.clone()]);
+            if page < self.pages {
+                result["nextCursor"] = json!((page + 1).to_string());
+            }
+            Ok(result)
+        }
+
+        async fn notify(&mut self, _: &str) -> Result<(), ProxyError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn what_a_listing_keeps_has_one_budget_across_pages_and_lists() {
+        let item = json!({"name": "t", "description": "x".repeat(1_000)});
+        let each = kept(&item);
+        assert!(each > 1_000, "a string's bytes count: {each}");
+        let mut rpc = Paged { item, pages: 3 };
+        // Room for two lists of three pages, and no more.
+        let mut budget = Budget::new(6 * each);
+        let tools = list_all(&mut rpc, "tools/list", "tools", &mut budget).await;
+        assert_eq!(tools.unwrap().len(), 3);
+        let prompts = list_all(&mut rpc, "prompts/list", "prompts", &mut budget).await;
+        assert_eq!(prompts.unwrap().len(), 3);
+        let resources = list_all(&mut rpc, "resources/list", "resources", &mut budget).await;
+        assert!(
+            matches!(resources, Err(ProxyError::TooLong { .. })),
+            "{resources:?}"
+        );
+    }
+
     /// A server with one resource, whose resource templates list answers
     /// with `templates`.
     struct WithTemplates {
@@ -262,21 +363,36 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_of_too_many_values_is_refused_before_it_is_parsed() {
-        // Each `{"a":1}` is 3 values in 8 bytes, and hundreds of bytes
-        // once parsed.
-        let tools = vec![r#"{"a":1}"#; MAX_VALUES / 2].join(",");
+    fn a_reply_the_gate_would_refuse_is_refused_before_it_is_parsed() {
+        // 100,000 `{"":0}` are 300,000 values in 700 kB of text, but would
+        // take over 80 MB once parsed: more than the gate reads of one
+        // message.
+        let tools = vec![r#"{"":0}"#; 100_000].join(",");
         let reply = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{tools}]}}}}"#);
+        assert!(matches!(
+            classify(reply.as_bytes()),
+            Err(ParseError::TooManyValues)
+        ));
         assert!(matches!(
             read_reply("tools/list", reply.as_bytes()),
             Err(ProxyError::TooLong { .. })
         ));
         // What's inside a string is one value, however it looks.
-        let text = "[{,:\\\"".repeat(MAX_VALUES);
+        let text = "[{,:\\\"".repeat(1_000_000);
         let reply = json!({"jsonrpc": "2.0", "id": 1, "result": {"text": text}}).to_string();
         let message = read_reply("tools/list", reply.as_bytes()).unwrap().unwrap();
         assert_eq!(result_of("tools/list", message).unwrap()["text"], text);
-        assert_eq!(most_values(br#"["a\"[,", {"b": [1, 2]}]"#), 7);
+        // What the gate would drop is skipped like a line that isn't JSON,
+        // and a repeated key is found before the rest is read.
+        let repeated =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"id":1,"result":{{"tools":[{tools}]}}}}"#);
+        assert!(
+            read_reply("tools/list", repeated.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        let not_json_rpc = br#"{"id":1,"result":{"tools":[]}}"#;
+        assert!(read_reply("tools/list", not_json_rpc).unwrap().is_none());
         assert!(read_reply("tools/list", b"not json").unwrap().is_none());
     }
 }
