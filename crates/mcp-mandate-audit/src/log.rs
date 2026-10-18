@@ -84,8 +84,33 @@ struct LogFile {
     /// The file's device and inode, to notice it being replaced.
     #[cfg(unix)]
     identity: (u64, u64),
+    /// Set once the file is found replaced or cut short. It then takes no
+    /// more entries, even once a new file appears at the path, so entries
+    /// can't vanish unnoticed; only a restart carries on.
+    stopped: Option<Stop>,
     /// Where the end of the file is read into, kept between catch-ups.
     tail: Vec<u8>,
+}
+
+/// Why a log file takes no more entries.
+#[derive(Clone, Copy)]
+enum Stop {
+    Replaced,
+    Shrank { expected: u64, actual: u64 },
+}
+
+impl Stop {
+    fn error(self, path: &Path) -> AuditError {
+        let path = path.to_owned();
+        match self {
+            Self::Replaced => AuditError::Replaced { path },
+            Self::Shrank { expected, actual } => AuditError::Shrank {
+                path,
+                expected,
+                actual,
+            },
+        }
+    }
 }
 
 /// An entry as written, before its hash is added.
@@ -177,6 +202,7 @@ impl LogFile {
             seq: 0,
             prev: GENESIS.to_owned(),
             len: 0,
+            stopped: None,
             tail: Vec::new(),
         };
         log.file.lock().map_err(open_error)?;
@@ -202,14 +228,23 @@ impl LogFile {
 
     /// Appends one entry. Call with the file locked.
     fn append(&mut self, session: &str, event: &Event) -> Result<(), AuditError> {
-        self.check_identity()?;
+        if let Some(stop) = self.stopped {
+            return Err(stop.error(&self.path));
+        }
         let len = self.file_len()?;
-        if len < self.len {
-            return Err(AuditError::Shrank {
-                path: self.path.clone(),
+        let stop = if self.replaced() {
+            Some(Stop::Replaced)
+        } else if len < self.len {
+            Some(Stop::Shrank {
                 expected: self.len,
                 actual: len,
-            });
+            })
+        } else {
+            None
+        };
+        if let Some(stop) = stop {
+            self.stopped = Some(stop);
+            return Err(stop.error(&self.path));
         }
         if len > self.len {
             // Another process appended since our last entry.
@@ -297,19 +332,16 @@ impl LogFile {
             .map_err(|source| self.write_error(source))
     }
 
-    /// Fails if `path` no longer names the file this log has open.
-    fn check_identity(&self) -> Result<(), AuditError> {
-        let replaced = || AuditError::Replaced {
-            path: self.path.clone(),
-        };
-        let on_disk = std::fs::metadata(&self.path).map_err(|_| replaced())?;
-        #[cfg(unix)]
-        if identity(&on_disk) != self.identity {
-            return Err(replaced());
+    /// Whether `path` no longer names the file this log has open. On
+    /// Windows, only a file gone from the path is noticed.
+    fn replaced(&self) -> bool {
+        match std::fs::metadata(&self.path) {
+            #[cfg(unix)]
+            Ok(on_disk) => identity(&on_disk) != self.identity,
+            #[cfg(not(unix))]
+            Ok(_) => false,
+            Err(_) => true,
         }
-        #[cfg(not(unix))]
-        let _ = on_disk;
-        Ok(())
     }
 
     fn write_error(&self, source: std::io::Error) -> AuditError {
