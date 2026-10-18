@@ -99,15 +99,22 @@ impl From<String> for Refusal {
 /// content through one server holds sending through all of them (each
 /// server normally has its own gate).
 pub trait SharedTaint: Send + Sync {
-    /// What tainted the agent's sessions, if anything has. A tainted gate
-    /// asks while messages pass (at most once a second), and sets it again
-    /// if it finds nothing, so a record that went missing comes back.
+    /// What tainted the agent's sessions, if anything has. It may go on
+    /// reporting a taint it has seen after the record itself is gone, so
+    /// holds don't lapse.
     fn get(&self) -> Option<String>;
     /// Records that `source` tainted them. Returns whether it could: if
     /// not, the gate doesn't pass the answer that tainted its session
     /// (except in observe mode), since the other sessions wouldn't hold
     /// their tools.
     fn set(&self, source: &str) -> bool;
+    /// Makes sure the record is still where the other sessions read it,
+    /// putting `source` back if something removed it. Returns whether it's
+    /// there: if not, the gate treats its taint as unshared again. A
+    /// tainted gate asks while messages pass (at most once a second).
+    fn reshare(&self, source: &str) -> bool {
+        self.get().is_some() || self.set(source)
+    }
 }
 
 /// How often, at most, a tainted gate checks that its taint is still where
@@ -1210,9 +1217,11 @@ impl Gate {
 
     /// Puts this session's taint back where the agent's other gates read
     /// it, if something removed it meanwhile (a cleaner of temporary files,
-    /// say): they read only that, and this session stays tainted. Checked
-    /// at most once every [`TAINT_CHECK`], since reading it can mean
-    /// reading a file.
+    /// say): they read only that, and this session stays tainted. If it
+    /// can't be put back, the taint counts as unshared again, as if it
+    /// couldn't be shared at first (see [`mark_tainted`](Self::mark_tainted)).
+    /// Checked at most once every [`TAINT_CHECK`], since reading it can
+    /// mean reading a file.
     fn keep_taint_shared(&mut self) {
         let (Some(source), Some(shared)) = (&self.session.taint, &self.shared_taint) else {
             return;
@@ -1225,14 +1234,11 @@ impl Gate {
             return;
         }
         self.taint_checked = Some(now);
-        if shared.get().is_none() {
-            self.taint_shared = shared.set(source);
-            if !self.taint_shared {
-                warn!(
-                    "couldn't put this session's taint back where the agent's other servers read it"
-                );
-            }
+        let present = shared.reshare(source);
+        if self.taint_shared && !present {
+            warn!("couldn't put this session's taint back where the agent's other servers read it");
         }
+        self.taint_shared = present;
     }
 
     /// Taints the session (once; it stays tainted), and every other session

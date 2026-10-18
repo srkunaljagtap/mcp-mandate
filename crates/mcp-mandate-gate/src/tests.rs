@@ -786,7 +786,7 @@ fn a_tainted_gate_checks_the_shared_record_at_most_once_a_second() {
 /// A gate whose `fetch_page` reads untrusted content but sends nothing out
 /// (so it can be called again once tainted), sharing taint through
 /// `record`.
-fn sharing_gate(mode: &str, record: &Arc<Record>) -> (Gate, Memory) {
+fn sharing_gate<T: SharedTaint + 'static>(mode: &str, record: &Arc<T>) -> (Gate, Memory) {
     let policy = format!(
         "{mode}{ALLOW_ALL}[[tools]]\nmatch = \"fetch_page\"\nsends_out = false\n\n[server_requests]\nsampling = \"allow\"\n"
     );
@@ -906,6 +906,38 @@ fn observe_mode_tracks_a_request_it_would_block_so_its_answer_taints() {
         gate.from_server(&response(20, result));
         assert_eq!(gate.taint().as_deref(), Some(source), "{method}");
         assert_eq!(record.get().as_deref(), Some(source), "{method}");
+    }
+}
+
+/// A shared record that, like the agent's file, goes on reporting a taint
+/// it has seen once the record itself is gone, so holds don't lapse: only
+/// `reshare` says whether the record is really there.
+#[derive(Default)]
+struct Remembered {
+    record: Record,
+    seen: Mutex<Option<String>>,
+}
+
+impl SharedTaint for Remembered {
+    fn get(&self) -> Option<String> {
+        let recorded = self.record.get();
+        let mut seen = self.seen.lock().unwrap();
+        if seen.is_none() {
+            seen.clone_from(&recorded);
+        }
+        recorded.or_else(|| seen.clone())
+    }
+
+    fn set(&self, source: &str) -> bool {
+        self.seen
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| source.to_owned());
+        self.record.set(source)
+    }
+
+    fn reshare(&self, source: &str) -> bool {
+        self.record.reshare(source)
     }
 }
 
@@ -1029,6 +1061,43 @@ fn observe_mode_expects_an_answer_to_a_request_it_cant_read() {
     let event = log.last();
     assert_eq!(event.method.as_deref(), Some("tools/call"));
     assert_eq!(event.would, None);
+}
+
+#[test]
+fn answers_are_withheld_while_a_removed_record_cant_be_put_back() {
+    let record = Arc::new(Remembered::default());
+    let (mut gate, log) = sharing_gate("", &record);
+    let shown = call_and_answer(&mut gate, 10, "fetch_page", "anything");
+    assert_eq!(shown["result"]["content"][0]["text"], "anything");
+
+    // The record goes, and can't be written again (its folder was removed
+    // for good, say). What was seen still holds tools.
+    *record.record.source.lock().unwrap() = None;
+    record.record.failing.store(true, Ordering::SeqCst);
+    assert!(record.get().is_some());
+
+    let reply = call_and_answer(&mut gate, 11, "fetch_page", INJECTION);
+    assert_eq!(reply["result"]["isError"], true);
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("the taint couldn't be shared with the agent's other servers"),
+        "{text}"
+    );
+    assert!(!text.contains(INJECTION));
+    assert_eq!(log.last().verdict, Some(audit::Verdict::Block));
+    blocked_with(
+        call(&mut gate, "send_email", json!({})),
+        "read untrusted content",
+    );
+
+    // Once it can be written, it's put back and answers pass again.
+    record.record.failing.store(false, Ordering::SeqCst);
+    let shown = call_and_answer(&mut gate, 12, "fetch_page", INJECTION);
+    assert_eq!(shown["result"]["content"][0]["text"], INJECTION);
+    assert_eq!(
+        record.record.get().as_deref(),
+        Some("the output of tool `fetch_page`")
+    );
 }
 
 #[test]
