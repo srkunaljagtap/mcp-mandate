@@ -373,30 +373,44 @@ fn needs_escape(c: char) -> bool {
     is_hidden(c) || (c.is_control() && c != '\n' && c != '\t')
 }
 
-/// Whether `c` is invisible or changes text direction: zero-width
-/// characters, direction overrides, Unicode "tag" characters and variation
-/// selectors (the ones Scout flags).
-fn is_hidden(c: char) -> bool {
+/// Whether `c` is invisible or changes how text around it shows: one of
+/// Unicode's default-ignorable code points, which show as nothing (such as
+/// zero-width characters, direction overrides, variation selectors, "tag"
+/// characters and the code points set aside for more of them), or a format
+/// character (general category Cf), which steers layout instead of showing
+/// as itself.
+pub fn is_hidden(c: char) -> bool {
     matches!(
         c,
+        // Default_Ignorable_Code_Point (Unicode 16.0).
         '\u{00AD}'
             | '\u{034F}'
             | '\u{061C}'
-            | '\u{115F}'
-            | '\u{1160}'
-            | '\u{17B4}'
-            | '\u{17B5}'
-            | '\u{180E}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
+            | '\u{2060}'..='\u{206F}'
             | '\u{3164}'
             | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
             | '\u{FFA0}'
-            | '\u{E0000}'..='\u{E007F}'
-            | '\u{E0100}'..='\u{E01EF}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+            // The rest of Cf: number signs that span the digits after
+            // them, interlinear annotation marks and hieroglyph layout.
+            | '\u{0600}'..='\u{0605}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
     )
 }
 
@@ -567,6 +581,42 @@ mod tests {
     }
 
     #[test]
+    fn escapes_every_character_that_shows_as_nothing() {
+        // Default-ignorable code points, assigned or set aside, and format
+        // characters.
+        for c in [
+            '\u{180B}',
+            '\u{180F}',
+            '\u{2065}',
+            '\u{FFF0}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{1BCA0}',
+            '\u{1D173}',
+            '\u{1D17A}',
+            '\u{E0080}',
+            '\u{E0FFF}',
+            '\u{0600}',
+            '\u{13430}',
+        ] {
+            let tool = json!({"name": format!("a{c}b"), "description": format!("x{c}y")});
+            let inventory = Inventory {
+                tools: vec![tool],
+                ..Inventory::default()
+            };
+            let pins = Pins::from_inventory("server", &inventory);
+            let text = pins.to_toml();
+            assert!(!text.contains(c), "{c:?} is written as it is in:\n{text}");
+            assert_eq!(toml::from_str::<Pins>(&text).unwrap(), pins);
+        }
+        assert!(
+            !"Echoes the message — café, 日本語, مرحبا"
+                .chars()
+                .any(is_hidden)
+        );
+    }
+
+    #[test]
     fn parses_text_already_read_and_names_its_file_in_errors() {
         let path = Path::new("server.pins.toml");
         let text = "format = 1\nserver = \"s\"\n[tools.echo]\nsha256 = \"ab\"\n";
@@ -627,6 +677,8 @@ mod properties {
             '\u{200b}',
             '\u{202e}',
             '\u{e0041}',
+            '\u{180b}',
+            '\u{fff9}',
         ]);
         prop::collection::vec(prop_oneof![any::<char>(), awkward], 0..12)
             .prop_map(String::from_iter)

@@ -12,4 +12,4 @@ mod pins;
 
 pub use fingerprint::fingerprint;
 pub use package::unpinned_package;
-pub use pins::{FORMAT, Inventory, Kind, Pinned, Pins, PinsError, Verdict};
+pub use pins::{FORMAT, Inventory, Kind, Pinned, Pins, PinsError, Verdict, is_hidden};

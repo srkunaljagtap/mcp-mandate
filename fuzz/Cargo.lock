@@ -1033,6 +1033,7 @@ name = "mcp-mandate-audit"
 version = "0.1.0"
 dependencies = [
  "nix",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",

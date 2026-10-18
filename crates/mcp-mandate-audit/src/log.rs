@@ -19,7 +19,8 @@ pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
 const TAIL_BYTES: u64 = 8 * 1024;
 /// How long a write waits for another process to let go of the log's lock.
 /// Writers hold it only for a moment, so a longer wait means something is
-/// stuck or holding it on purpose: the write fails rather than hang.
+/// stuck or holding it on purpose: the write fails rather than hang, and
+/// the writes after it don't wait again until one gets the lock.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// Somewhere decisions are recorded.
@@ -61,6 +62,11 @@ pub enum AuditError {
         expected: u64,
         actual: u64,
     },
+    #[error(
+        "the audit log {} was cut short or rewritten while in use: the last entry mcp-mandate saw in it is no longer where it was; restart mcp-mandate to carry on from what's there now",
+        path.display()
+    )]
+    Rewritten { path: PathBuf },
     #[error("an audit entry would be {size} bytes, over the {MAX_LINE_BYTES}-byte limit")]
     TooLarge { size: usize },
 }
@@ -85,22 +91,33 @@ struct LogFile {
     seq: u64,
     prev: String,
     len: u64,
-    /// The file's device and inode, to notice it being replaced.
-    #[cfg(unix)]
-    identity: (u64, u64),
-    /// Set once the file is found replaced or cut short. It then takes no
-    /// more entries, even once a new file appears at the path, so entries
-    /// can't vanish unnoticed; only a restart carries on.
+    /// Which file this is, to notice another taking its place at `path`.
+    identity: Identity,
+    /// Set once the file is found replaced, cut short or rewritten. It then
+    /// takes no more entries, even once a new file appears at the path, so
+    /// entries can't vanish unnoticed; only a restart carries on.
     stopped: Option<Stop>,
+    /// Set when a wait for the lock ran out. Until a write gets the lock
+    /// again, writes try for it once instead of each waiting in turn.
+    contended: bool,
     /// Where the end of the file is read into, kept between catch-ups.
     tail: Vec<u8>,
 }
+
+/// What tells one file from another: its device and inode on Unix, and
+/// elsewhere its volume serial number and file index. Windows promises
+/// those only while the file is open, so they're kept with an open handle.
+#[cfg(unix)]
+type Identity = (u64, u64);
+#[cfg(not(unix))]
+type Identity = same_file::Handle;
 
 /// Why a log file takes no more entries.
 #[derive(Clone, Copy)]
 enum Stop {
     Replaced,
     Shrank { expected: u64, actual: u64 },
+    Rewritten,
 }
 
 impl Stop {
@@ -113,6 +130,7 @@ impl Stop {
                 expected,
                 actual,
             },
+            Self::Rewritten => AuditError::Rewritten { path },
         }
     }
 }
@@ -200,16 +218,16 @@ impl LogFile {
         let file = options.open(path).map_err(open_error)?;
         let mut log = Self {
             path: path.to_owned(),
-            #[cfg(unix)]
-            identity: identity(&file.metadata().map_err(open_error)?),
+            identity: identity(&file).map_err(open_error)?,
             file,
             seq: 0,
             prev: GENESIS.to_owned(),
             len: 0,
             stopped: None,
+            contended: false,
             tail: Vec::new(),
         };
-        lock(&log.file).map_err(open_error)?;
+        lock(&log.file, LOCK_WAIT).map_err(open_error)?;
         let caught_up = log.catch_up();
         let unlocked = log.file.unlock().map_err(open_error);
         caught_up?;
@@ -218,7 +236,19 @@ impl LogFile {
     }
 
     fn record(&mut self, session: &str, event: &Event) -> Result<(), AuditError> {
-        lock(&self.file).map_err(|source| self.write_error(source))?;
+        // Every session sharing this file queues behind this write: once
+        // one has waited out the lock, the rest fail at once instead of
+        // each waiting in full, until one gets it.
+        let wait = if self.contended {
+            Duration::ZERO
+        } else {
+            LOCK_WAIT
+        };
+        let locked = lock(&self.file, wait);
+        self.contended = locked
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut);
+        locked.map_err(|source| self.write_error(source))?;
         let appended = self.append(session, event);
         let unlocked = self
             .file
@@ -241,6 +271,8 @@ impl LogFile {
                 expected: self.len,
                 actual: len,
             })
+        } else if len > self.len && !self.last_seen_in_place()? {
+            Some(Stop::Rewritten)
         } else {
             None
         };
@@ -294,6 +326,25 @@ impl LogFile {
         Ok(())
     }
 
+    /// Whether the entry this log last wrote or caught up to still ends
+    /// where it did. Call with the file longer than that: a log cut short
+    /// and then written past that point again (by another process carrying
+    /// on from what was left) is longer, but no longer holds it.
+    fn last_seen_in_place(&mut self) -> Result<bool, AuditError> {
+        if self.len == 0 {
+            return Ok(true);
+        }
+        let mut tail = std::mem::take(&mut self.tail);
+        let last = self.last_entry(self.len, &mut tail);
+        self.tail = tail;
+        match last {
+            Ok((_, hash)) => Ok(hash == self.prev),
+            // No whole entry ends there now.
+            Err(AuditError::Tail { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The number and hash of the last entry in a file `len` bytes long,
     /// reading the end of the file into `tail`: a little first, and twice as
     /// much each time that holds no whole line, up to the longest line.
@@ -334,14 +385,10 @@ impl LogFile {
             .map_err(|source| self.write_error(source))
     }
 
-    /// Whether `path` no longer names the file this log has open. On
-    /// Windows, only a file gone from the path is noticed.
+    /// Whether `path` no longer names the file this log has open.
     fn replaced(&self) -> bool {
-        match std::fs::metadata(&self.path) {
-            #[cfg(unix)]
-            Ok(on_disk) => identity(&on_disk) != self.identity,
-            #[cfg(not(unix))]
-            Ok(_) => false,
+        match identity_at(&self.path) {
+            Ok(on_disk) => on_disk != self.identity,
             Err(_) => true,
         }
     }
@@ -354,15 +401,16 @@ impl LogFile {
     }
 }
 
-/// Takes the exclusive lock on `file`, waiting up to [`LOCK_WAIT`] for
-/// another process to let go of it.
-fn lock(file: &File) -> std::io::Result<()> {
+/// Takes the exclusive lock on `file`, waiting up to `wait` for another
+/// process to let go of it. Called with no wait only once a wait of
+/// [`LOCK_WAIT`] has run out and no write has had the lock since.
+fn lock(file: &File, wait: Duration) -> std::io::Result<()> {
     let started = Instant::now();
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(()),
             Err(TryLockError::Error(error)) => return Err(error),
-            Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+            Err(TryLockError::WouldBlock) if started.elapsed() < wait => {
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(TryLockError::WouldBlock) => {
@@ -378,10 +426,35 @@ fn lock(file: &File) -> std::io::Result<()> {
     }
 }
 
+/// The identity of the open file `file`.
 #[cfg(unix)]
-fn identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+fn identity(file: &File) -> std::io::Result<Identity> {
     use std::os::unix::fs::MetadataExt;
-    (metadata.dev(), metadata.ino())
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn identity(file: &File) -> std::io::Result<Identity> {
+    same_file::Handle::from_file(file.try_clone()?)
+}
+
+/// The identity of the file at `path` now. On Unix it's read with `stat`,
+/// without opening the file: opening a FIFO put at the path would wait for
+/// a writer, holding the log's lock all the while.
+#[cfg(unix)]
+fn identity_at(path: &Path) -> std::io::Result<Identity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Windows reads a file index only through an open handle. The file is
+/// opened for reading and shared, so it can still be renamed or deleted
+/// meanwhile; a file that can't be opened counts as replaced.
+#[cfg(not(unix))]
+fn identity_at(path: &Path) -> std::io::Result<Identity> {
+    same_file::Handle::from_path(path)
 }
 
 /// 16 hex digits, unique enough to tell sessions in one log apart.
@@ -587,6 +660,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn notices_entries_removed_even_once_the_log_grows_back() {
+        let path = temp_dir("regrown").join("audit.jsonl");
+        let mut log = Log::open(&path).unwrap();
+        log.record(&message(Verdict::Allow)).unwrap();
+        log.record(&message(Verdict::Block)).unwrap();
+        let first_line = std::fs::read_to_string(&path).unwrap().find('\n').unwrap() + 1;
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(first_line as u64)
+            .unwrap();
+        // Another gate carries on from what's left, past where `log` was,
+        // before `log` writes again.
+        let mut other = Log::open(&path).unwrap();
+        for _ in 0..3 {
+            other.record(&message(Verdict::Allow)).unwrap();
+        }
+
+        let error = log.record(&message(Verdict::Allow)).unwrap_err();
+        assert!(matches!(error, AuditError::Rewritten { .. }), "{error}");
+        assert!(
+            log.record(&message(Verdict::Allow)).is_err(),
+            "it stays stopped"
+        );
+        assert_eq!(verify(&path, None).unwrap().entries, 4);
+    }
+
+    #[test]
+    fn notices_the_log_being_replaced_while_in_use() {
+        let dir = temp_dir("replaced");
+        let path = dir.join("audit.jsonl");
+        let moved = dir.join("audit.1.jsonl");
+        let mut log = Log::open(&path).unwrap();
+        log.record(&message(Verdict::Allow)).unwrap();
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"").unwrap();
+
+        let error = log.record(&message(Verdict::Allow)).unwrap_err();
+        assert!(matches!(error, AuditError::Replaced { .. }), "{error}");
+        assert_eq!(verify(&moved, None).unwrap().entries, 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn notices_the_log_being_deleted_and_recreated_between_entries() {
+        let path = temp_dir("recreated").join("audit.jsonl");
+        let mut log = Log::open(&path).unwrap();
+        log.record(&message(Verdict::Allow)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // Where a deleted file keeps its name until it's closed, no new one
+        // can be made yet: the test above covers that.
+        if std::fs::write(&path, b"").is_err() {
+            return;
+        }
+
+        let error = log.record(&message(Verdict::Allow)).unwrap_err();
+        assert!(matches!(error, AuditError::Replaced { .. }), "{error}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
     fn notices_the_log_being_deleted_while_in_use() {
         let path = temp_dir("deleted").join("audit.jsonl");
         let mut log = Log::open(&path).unwrap();
@@ -646,6 +781,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn once_one_write_has_waited_out_the_lock_the_next_fail_at_once() {
+        let path = temp_dir("contended").join("audit.jsonl");
+        let log = Log::open(&path).unwrap();
+        let mut other = log.new_session();
+        let holder = File::open(&path).unwrap();
+        holder.lock().unwrap();
+
+        let (mut log, recorded) = without_hanging(move || {
+            let mut log = log;
+            let recorded = log.record(&message(Verdict::Allow));
+            (log, recorded)
+        });
+        assert!(recorded.is_err());
+        let started = Instant::now();
+        let error = other.record(&message(Verdict::Allow)).unwrap_err();
+        assert!(matches!(error, AuditError::Write { .. }), "{error}");
+        let waited = started.elapsed();
+        assert!(waited < LOCK_WAIT / 2, "it waited {waited:?}");
+
+        // Once a write gets the lock, writes wait for it again.
+        holder.unlock().unwrap();
+        other.record(&message(Verdict::Allow)).unwrap();
+        holder.lock().unwrap();
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            holder.unlock().unwrap();
+        });
+        log.record(&message(Verdict::Allow)).unwrap();
+        letting_go.join().unwrap();
+        assert_eq!(verify(&path, None).unwrap().entries, 2);
+    }
+
+    #[test]
     fn catches_up_past_a_long_last_entry() {
         let path = temp_dir("long-tail").join("audit.jsonl");
         let mut a = Log::open(&path).unwrap();
@@ -658,11 +826,14 @@ pub(crate) mod tests {
         })
         .unwrap();
         b.record(&message(Verdict::Allow)).unwrap();
+        // `a` finds its long entry where it left it, and carries on.
+        a.record(&message(Verdict::Allow)).unwrap();
 
         let entries = lines(&path);
         assert_eq!(entries[2]["seq"], 3);
         assert_eq!(entries[2]["prev"], entries[1]["hash"]);
-        assert_eq!(verify(&path, None).unwrap().entries, 3);
+        assert_eq!(entries[3]["prev"], entries[2]["hash"]);
+        assert_eq!(verify(&path, None).unwrap().entries, 4);
     }
 
     #[test]
