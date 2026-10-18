@@ -7,6 +7,7 @@ use mcp_mandate_pin::{Inventory, Kind, Pins};
 use serde_json::Value;
 
 use crate::rules::command_arguments;
+use crate::text::is_hidden;
 use crate::{Finding, Severity, Subject, printable};
 
 /// What the draft proposes for a tool. Ordered from least to most
@@ -287,15 +288,23 @@ fn literal_glob(name: &str) -> String {
     pattern
 }
 
-/// `text` as a TOML basic string.
+/// `text` as a TOML basic string. Control and hidden characters are
+/// written as escapes, as in the pins file, so a reader sees them (two
+/// tools named `read_file` and `read\u{200B}_file` must not look alike);
+/// TOML reads them back as the same text.
 fn toml_string(text: &str) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if c.is_control() => {
-                let _ = write!(out, "\\u{:04X}", u32::from(c));
+            c if c.is_control() || is_hidden(c) => {
+                let code = u32::from(c);
+                if code <= 0xFFFF {
+                    let _ = write!(out, "\\u{code:04X}");
+                } else {
+                    let _ = write!(out, "\\U{code:08X}");
+                }
             }
             c => out.push(c),
         }
@@ -472,6 +481,45 @@ mod tests {
                 .pins
                 .is_none()
         );
+    }
+
+    #[test]
+    fn hidden_characters_in_a_name_are_escaped_in_its_rule() {
+        let local = json!({"readOnlyHint": true, "openWorldHint": false});
+        let hidden = "read\u{200B}_file";
+        let tagged = "note\u{E0041}s";
+        let tools = inventory(vec![
+            tool("read_file", Some(local.clone())),
+            tool(hidden, Some(local.clone())),
+            tool(tagged, Some(local)),
+        ]);
+        let draft = Draft::new(&tools, &[], "server", None);
+        // Nothing hidden is written raw, so the two `read_file` rules don't
+        // look alike.
+        assert!(
+            !draft.text.contains(['\u{200B}', '\u{E0041}']),
+            "{}",
+            draft.text
+        );
+        assert!(
+            draft.text.contains("match = \"read\\u200B_file\"\n"),
+            "{}",
+            draft.text
+        );
+        assert!(
+            draft.text.contains("match = \"note\\U000E0041s\"\n"),
+            "{}",
+            draft.text
+        );
+        // TOML reads each one back as the name it was written for.
+        let policy = Policy::parse(&draft.text, Path::new(".")).unwrap_or_else(|error| {
+            panic!("{error}:\n{}", draft.text);
+        });
+        for name in ["read_file", hidden, tagged] {
+            let decision = policy.for_tool(name);
+            assert_eq!(decision.action, Action::Allow, "{name:?}");
+            assert_eq!(decision.matched, [name], "{name:?}");
+        }
     }
 
     #[test]

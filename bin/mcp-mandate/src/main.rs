@@ -276,7 +276,13 @@ fn warn_if_exposed(what: &str, path: &Path) {
         let me = nix::unistd::geteuid().as_raw();
         let exposure_of = |path: &Path| {
             let metadata = std::fs::metadata(path).ok()?;
-            exposure(metadata.mode(), metadata.uid(), metadata.gid(), me)
+            exposure(
+                metadata.mode(),
+                metadata.uid(),
+                metadata.gid(),
+                me,
+                owners_private_group,
+            )
         };
         match exposure_of(&full) {
             Some(Exposure::Owner) => warn!(
@@ -319,16 +325,23 @@ enum Exposure {
 /// What lets users other than `me` (the current user) and root change a
 /// file or folder with this mode, owner and group, if anything. Others who
 /// can write to a folder with the sticky bit (as /tmp has) can add files to
-/// it, but not replace yours, so that doesn't count.
+/// it, but not replace yours, so that doesn't count. `private_group` says
+/// whether a group (the second id) is a user's (the first) private group.
 #[cfg(unix)]
-fn exposure(mode: u32, uid: u32, gid: u32, me: u32) -> Option<Exposure> {
+fn exposure(
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    me: u32,
+    private_group: impl FnOnce(u32, u32) -> bool,
+) -> Option<Exposure> {
     const FILE_TYPE: u32 = 0o170000;
     const FOLDER: u32 = 0o040000;
     const STICKY: u32 = 0o1000;
     let sticky_folder = mode & FILE_TYPE == FOLDER && mode & STICKY != 0;
     if uid != me && uid != 0 {
         Some(Exposure::Owner)
-    } else if writable_by_others(mode, uid, gid) && !sticky_folder {
+    } else if writable_by_others(mode, uid, gid, private_group) && !sticky_folder {
         Some(Exposure::Writers)
     } else {
         None
@@ -336,13 +349,45 @@ fn exposure(mode: u32, uid: u32, gid: u32, me: u32) -> Option<Exposure> {
 }
 
 /// Whether a file or folder with this mode, owner and group can be written
-/// by users other than its owner. Group write doesn't count when the
-/// group's id is the owner's user id: that's the owner's own private group
-/// on systems that give each user one (Fedora, Ubuntu), whose umask makes
-/// new files and folders group-writable.
+/// by users other than its owner. Group write doesn't count when the group
+/// is the owner's own private group (as `private_group` says), on systems
+/// that give each user one (Fedora, Ubuntu), whose umask makes new files and
+/// folders group-writable. The permission bits are all it reads, not ACLs.
 #[cfg(unix)]
-fn writable_by_others(mode: u32, uid: u32, gid: u32) -> bool {
-    mode & 0o002 != 0 || (mode & 0o020 != 0 && gid != uid)
+fn writable_by_others(
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    private_group: impl FnOnce(u32, u32) -> bool,
+) -> bool {
+    mode & 0o002 != 0 || (mode & 0o020 != 0 && !private_group(uid, gid))
+}
+
+/// Whether group `gid` is user `uid`'s private group, as the system's user
+/// and group lists describe them. One that can't be looked up isn't.
+#[cfg(unix)]
+fn owners_private_group(uid: u32, gid: u32) -> bool {
+    use nix::unistd::{Gid, Group, Uid, User};
+    if gid != uid {
+        return false; // without looking anything up
+    }
+    let user = User::from_uid(Uid::from_raw(uid)).ok().flatten();
+    let group = Group::from_gid(Gid::from_raw(gid)).ok().flatten();
+    match (user, group) {
+        (Some(user), Some(group)) => {
+            is_private_group(uid, &user.name, gid, &group.name, &group.mem)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a group with this id, name and member list is the private group
+/// of the user with this id and name: it has the user's id and name, and
+/// lists no members (the user is in it as their primary group). Its id
+/// alone doesn't say so, as a shared group can have the same number.
+#[cfg(unix)]
+fn is_private_group(uid: u32, user: &str, gid: u32, group: &str, members: &[String]) -> bool {
+    gid == uid && group == user && members.is_empty()
 }
 
 /// Whether `file` is inside `here`, the folder the server runs in. Not when
@@ -1084,24 +1129,55 @@ mod tests {
         assert!(!inside(&project, &home.join(".config").join("policy.toml")));
     }
 
+    /// Groups as a system with user-private groups has them: every group
+    /// whose id is a user's is that user's own.
+    #[cfg(unix)]
+    fn same_id(uid: u32, gid: u32) -> bool {
+        uid == gid
+    }
+
     #[cfg(unix)]
     #[test]
     fn group_write_counts_unless_the_group_is_the_owners_own() {
         // A user-private group (umask 002): only the owner is in it.
-        assert!(!writable_by_others(0o40775, 1000, 1000));
-        assert!(!writable_by_others(0o100664, 1000, 1000));
+        assert!(!writable_by_others(0o40775, 1000, 1000, same_id));
+        assert!(!writable_by_others(0o100664, 1000, 1000, same_id));
         // A shared group, such as `users` or macOS's `staff`.
-        assert!(writable_by_others(0o40775, 1000, 100));
-        assert!(writable_by_others(0o40775, 501, 20));
+        assert!(writable_by_others(0o40775, 1000, 100, same_id));
+        assert!(writable_by_others(0o40775, 501, 20, same_id));
+        // A shared group that happens to have the owner's id.
+        assert!(writable_by_others(0o40775, 1000, 1000, |_, _| false));
         // Anyone, whatever the group.
-        assert!(writable_by_others(0o100646, 1000, 1000));
-        assert!(!writable_by_others(0o40755, 1000, 100));
+        assert!(writable_by_others(0o100646, 1000, 1000, same_id));
+        assert!(!writable_by_others(0o40755, 1000, 100, same_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_group_named_like_its_user_and_with_no_members_is_private() {
+        assert!(is_private_group(1000, "alice", 1000, "alice", &[]));
+        // A shared group with the same id as a user.
+        assert!(!is_private_group(1000, "alice", 1000, "team", &[]));
+        // One that lists members, who can write what the group can.
+        assert!(!is_private_group(
+            1000,
+            "alice",
+            1000,
+            "alice",
+            &["bob".to_owned()]
+        ));
+        // Named like the user, but another group.
+        assert!(!is_private_group(1000, "alice", 1001, "alice", &[]));
+        // Ids no user or group has can't be looked up, so they don't count.
+        let unknown = 3_999_999_999;
+        assert!(!owners_private_group(unknown, unknown));
     }
 
     #[cfg(unix)]
     #[test]
     fn another_users_file_or_folder_is_exposed_whatever_its_mode() {
         let me = 1000;
+        let exposure = |mode, uid, gid, me| exposure(mode, uid, gid, me, same_id);
         // Another user can change what they own, and replace what's in a
         // folder they own, sticky bit or not.
         assert_eq!(exposure(0o100600, 1001, 1001, me), Some(Exposure::Owner));
