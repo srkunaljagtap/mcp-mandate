@@ -150,9 +150,11 @@ impl SecretDetector {
     /// Replaces every exact string added or set before with `literals`,
     /// reported as `name`: for a secret that changes, such as a renewed
     /// token, so the old ones don't pile up. Short strings are skipped, as
-    /// [`add_literal`](Self::add_literal) skips them. Nothing is rebuilt
-    /// when the strings are the ones already set, so this is cheap to call
-    /// before every message.
+    /// [`add_literal`](Self::add_literal) skips them. They're found with one
+    /// pattern, so each text is searched once however many there are; where
+    /// two start at the same place, the longer is redacted whole. Nothing is
+    /// rebuilt when the strings are the ones already set, so this is cheap
+    /// to call before every message.
     pub fn set_literals(&mut self, name: &str, literals: &[String]) {
         let mut wanted: Vec<String> = Vec::new();
         for literal in literals {
@@ -161,17 +163,33 @@ impl SecretDetector {
                 wanted.push(escaped);
             }
         }
+        // The longest first: of the alternatives that match at one place,
+        // the first listed is taken.
+        wanted.sort_by_key(|escaped| std::cmp::Reverse(escaped.len()));
+        let combined = wanted.join("|");
         let kept = self.patterns.len() - self.literals;
         let current = &self.patterns[kept..];
-        let unchanged = current.len() == wanted.len()
-            && current.iter().zip(&wanted).all(|(pattern, escaped)| {
-                pattern.name == name && pattern.regex.as_str() == escaped
-            });
+        let sources: Vec<&str> = current
+            .iter()
+            .map(|pattern| pattern.regex.as_str())
+            .collect();
+        // Set already, as one pattern or (if that was too large) one each.
+        let unchanged = current.iter().all(|pattern| pattern.name == name)
+            && (sources == [combined.as_str()] || sources.iter().eq(wanted.iter()));
         if unchanged {
             return;
         }
         self.patterns.truncate(kept);
         self.literals = 0;
+        if wanted.is_empty() {
+            return;
+        }
+        if let Ok(pattern) = SecretPattern::new(name, &combined) {
+            self.patterns.push(pattern);
+            self.literals = 1;
+            return;
+        }
+        // Too large to compile as one: one pattern each.
         for escaped in wanted {
             if let Ok(pattern) = SecretPattern::new(name, &escaped) {
                 self.patterns.push(pattern);
@@ -777,8 +795,8 @@ mod tests {
         }
         assert_eq!(
             detector.patterns.len(),
-            built_in + 2,
-            "the latest token's two forms, and nothing else"
+            built_in + 1,
+            "the latest token's two forms, in one pattern, and nothing else"
         );
         assert_eq!(
             detector.find("echo: opaque-token-99"),
@@ -790,6 +808,31 @@ mod tests {
         assert!(!text.contains("opaque-token-99"), "{text}");
         detector.set_literals("gateway-credential", &[]);
         assert_eq!(detector.patterns.len(), built_in);
+    }
+
+    #[test]
+    fn many_exact_strings_are_searched_for_at_once() {
+        let mut detector = SecretDetector::default();
+        let built_in = detector.patterns.len();
+        let mut set = vec!["client-secret".to_owned()];
+        for n in 0..16 {
+            set.push(format!("Bearer opaque-token-{n}"));
+            set.push(format!("opaque-token-{n}"));
+        }
+        // Starts where another does, and goes on past it.
+        set.push("client-secret-and-more".to_owned());
+        detector.set_literals("gateway-credential", &set);
+        assert_eq!(detector.patterns.len(), built_in + 1, "one pattern");
+        for literal in &set {
+            let text = format!("echo: {literal}.");
+            assert_eq!(
+                detector.find(&text),
+                Some("gateway-credential"),
+                "{literal}"
+            );
+            let (redacted, _) = detector.redact_text(&text).unwrap();
+            assert_eq!(redacted, "echo: [REDACTED: gateway-credential].");
+        }
     }
 
     #[test]

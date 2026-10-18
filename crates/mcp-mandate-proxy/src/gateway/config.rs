@@ -430,7 +430,7 @@ fn check_server(
             name: "authorization".to_owned(),
             value: Secret(format!(
                 "Bearer {}",
-                secret(token_env, token_file, "token")?.expose()
+                in_header(name, "token", secret(token_env, token_file, "token")?)?.expose()
             )),
         },
         AuthFile::Header {
@@ -446,7 +446,7 @@ fn check_server(
             }
             Auth::Header {
                 name: header,
-                value: secret(value_env, value_file, "value")?,
+                value: in_header(name, "value", secret(value_env, value_file, "value")?)?,
             }
         }
         AuthFile::ClientCredentials {
@@ -510,6 +510,18 @@ fn read_secret(
         )));
     }
     Ok(Secret(value))
+}
+
+/// A secret the gateway sends in a header, which must be ASCII: a server
+/// may read other bytes there as some other text than the secret, and
+/// echo that, which wouldn't be redacted.
+fn in_header(server: &str, what: &str, secret: Secret) -> Result<Secret, ConfigError> {
+    if secret.expose().is_ascii() {
+        return Ok(secret);
+    }
+    Err(ConfigError::Invalid(format!(
+        "server `{server}`: its {what} isn't ASCII, as a value sent in an HTTP header must be"
+    )))
 }
 
 /// Parses a URL that must use HTTPS (plain HTTP only to this machine) and
@@ -654,6 +666,10 @@ auth = { type = "bearer", token_env = "TOKEN" }
         assert!(error(&userinfo).contains("user name or password"));
         let unset = config(top).replace("token_env = \"TOKEN\"", "token_env = \"NOPE\"");
         assert!(error(&unset).contains("NOPE"));
+        std::fs::write(dir().join("umlaut.token"), "pässwort-1234").unwrap();
+        let not_ascii =
+            config(top).replace("token_env = \"TOKEN\"", "token_file = \"umlaut.token\"");
+        assert!(error(&not_ascii).contains("isn't ASCII"));
         let inline = config(top).replace("token_env = \"TOKEN\"", "token = \"abc\"");
         assert!(
             toml::from_str::<ConfigFile>(&inline).is_err(),
