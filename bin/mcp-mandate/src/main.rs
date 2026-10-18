@@ -270,16 +270,18 @@ fn warn_if_exposed(what: &str, path: &Path) {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode =
-            |path: &Path| std::fs::metadata(path).map(|metadata| metadata.permissions().mode());
-        if mode(&full).is_ok_and(|mode| mode & 0o022 != 0) {
+        use std::os::unix::fs::MetadataExt;
+        let exposed = |metadata: &std::fs::Metadata| {
+            writable_by_others(metadata.mode(), metadata.uid(), metadata.gid())
+        };
+        if std::fs::metadata(&full).is_ok_and(|metadata| exposed(&metadata)) {
             warn!(file = %path.display(), "the {what} is writable by other users");
         }
         // Whoever can write to a folder can replace the files in it, unless
         // it has the sticky bit (as /tmp does).
         if let Some(folder) = full.parent()
-            && mode(folder).is_ok_and(|mode| mode & 0o022 != 0 && mode & 0o1000 == 0)
+            && std::fs::metadata(folder)
+                .is_ok_and(|metadata| exposed(&metadata) && metadata.mode() & 0o1000 == 0)
         {
             warn!(
                 file = %path.display(),
@@ -287,6 +289,16 @@ fn warn_if_exposed(what: &str, path: &Path) {
             );
         }
     }
+}
+
+/// Whether a file or folder with this mode, owner and group can be written
+/// by users other than its owner. Group write doesn't count when the
+/// group's id is the owner's user id: that's the owner's own private group
+/// on systems that give each user one (Fedora, Ubuntu), whose umask makes
+/// new files and folders group-writable.
+#[cfg(unix)]
+fn writable_by_others(mode: u32, uid: u32, gid: u32) -> bool {
+    mode & 0o002 != 0 || (mode & 0o020 != 0 && gid != uid)
 }
 
 /// Whether `file` is inside `here`, the folder the server runs in. Not when
@@ -484,10 +496,12 @@ fn write_output(out: &Path, text: &str, force: bool) -> std::io::Result<()> {
     let create = |path: &Path| {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        // Readable and writable only by you, like the audit log, whatever
-        // the umask: whoever can edit a pins file approves what's in it.
+        // Writable only by you, whatever the umask: whoever can edit a pins
+        // file approves what's in it. Still readable by others (they hold
+        // no secrets), so a gateway running as another user, such as the
+        // container image's, can load them.
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
         let mut file = options.open(path)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()
@@ -698,6 +712,8 @@ fn warn_if_unpinned(command: &ServerCommand) {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     if let Some(package) = unpinned_package(&program, &args) {
+        // The package can be a URL with a token in it.
+        let package = stdio::masked(&package);
         warn!(
             %package,
             "the server's package has no pinned version: its launcher fetches the newest release on every run, so its code can change while its tool descriptions don't. Pin a version, e.g. `{package}@1.2.3`"
@@ -1010,6 +1026,20 @@ mod tests {
         assert!(!inside(&project, &home.join(".config").join("policy.toml")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn group_write_counts_unless_the_group_is_the_owners_own() {
+        // A user-private group (umask 002): only the owner is in it.
+        assert!(!writable_by_others(0o40775, 1000, 1000));
+        assert!(!writable_by_others(0o100664, 1000, 1000));
+        // A shared group, such as `users` or macOS's `staff`.
+        assert!(writable_by_others(0o40775, 1000, 100));
+        assert!(writable_by_others(0o40775, 501, 20));
+        // Anyone, whatever the group.
+        assert!(writable_by_others(0o100646, 1000, 1000));
+        assert!(!writable_by_others(0o40755, 1000, 100));
+    }
+
     #[test]
     fn log_fields_cant_move_the_cursor_or_forge_a_line() {
         use std::sync::{Arc, Mutex};
@@ -1106,15 +1136,18 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Private whatever the umask, a replaced file included.
-            let mode = std::fs::metadata(&out).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+            let mode_of =
+                |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            // A file created as usual gets 0o666 less the umask.
+            std::fs::write(dir.join("usual"), "").unwrap();
+            let umasked = mode_of(&dir.join("usual"));
+            // Only you can write it whatever the umask, a replaced file
+            // included, but others can read it unless the umask says not.
             write_output(&dir.join("new.toml"), "one", false).unwrap();
-            let mode = std::fs::metadata(dir.join("new.toml"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+            for path in [out.clone(), dir.join("new.toml")] {
+                let mode = mode_of(&path);
+                assert_eq!(mode, 0o644 & umasked, "{mode:o}, umask leaves {umasked:o}");
+            }
 
             let target = dir.join("elsewhere");
             let link = dir.join("link.toml");

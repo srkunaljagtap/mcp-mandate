@@ -319,25 +319,26 @@ fn find_session(
 
 /// Opens a session for `caller` on server `name`: its own gate, recording
 /// to the server's audit log. If the log can't be written, nothing opens.
+/// The session closes again unless it's [kept](Opening::keep).
+///
+/// Run it as a task of its own: once the session's start is recorded, the
+/// session must be built, so that its end is recorded too, even if the
+/// client leaves meanwhile.
 // The error is the HTTP response to send back; one is built per refused request.
 #[allow(clippy::result_large_err)]
-async fn open_session(
-    app: &Arc<App>,
-    name: &str,
-    caller: &Caller,
-) -> Result<Arc<Session>, Response> {
-    let server = &app.config.servers[name];
+async fn open_session(app: Arc<App>, name: String, caller: Caller) -> Result<Opening, Response> {
+    let server = &app.config.servers[&name];
     let unavailable =
         |problem: &str| (StatusCode::SERVICE_UNAVAILABLE, problem.to_owned()).into_response();
     // All of a server's sessions record through one open file, which may
     // have to wait for its lock: not on a thread that serves requests.
-    let mut log = app.logs[name].new_session();
-    let start = session_start(app, server, caller);
+    let mut log = app.logs[&name].new_session();
+    let start = session_start(&app, server, &caller);
     let recorded = tokio::task::spawn_blocking(move || log.record(&start).map(|()| log)).await;
     let log = match recorded {
         Ok(Ok(log)) => log,
         Ok(Err(failure)) => {
-            error!(server = name, error = %describe(&failure), "couldn't open a session: the audit log can't be written");
+            error!(server = name.as_str(), error = %describe(&failure), "couldn't open a session: the audit log can't be written");
             return Err(unavailable(
                 "the audit log can't be written, so no session can open",
             ));
@@ -348,14 +349,17 @@ async fn open_session(
         .with_shared_taint(Arc::new(app.taints.for_caller(&caller.subject)));
     // If the server ever echoes the gateway's own credential, the caller
     // mustn't get it. Kept current before every check, as tokens renew.
-    gate.set_secret_literals(&app.upstreams[name].credential_strings());
-    let session = Arc::new(Session::new(name, caller.clone(), gate));
-    if app.sessions.insert(Arc::clone(&session)).is_err() {
-        close_session(app, &session);
+    gate.set_secret_literals(&app.upstreams[&name].credential_strings());
+    let opening = Opening {
+        session: Arc::new(Session::new(&name, caller.clone(), gate)),
+        app: Arc::clone(&app),
+        kept: false,
+    };
+    if app.sessions.insert(Arc::clone(&opening.session)).is_err() {
         return Err(unavailable("too many open sessions"));
     }
-    info!(server = name, caller = %caller.subject, "opened a session");
-    Ok(session)
+    info!(server = name.as_str(), caller = %caller.subject, "opened a session");
+    Ok(opening)
 }
 
 fn session_start(app: &App, server: &ServerConfig, caller: &Caller) -> audit::Event {
@@ -400,7 +404,8 @@ fn close_session(app: &Arc<App>, session: &Arc<Session>) -> Option<JoinHandle<()
 
 /// Closes a session that `initialize` opened unless its reply goes back to
 /// the client: a client that never got the session's id can't use it or
-/// end it. That includes a client that left while waiting.
+/// end it. That includes a client that left while waiting, or while the
+/// session was opening.
 struct Opening {
     app: Arc<App>,
     session: Arc<Session>,
@@ -442,9 +447,9 @@ async fn post_message(
         None
     };
     // Counted before the body is read, so a session can't have any number
-    // of bodies arriving, or requests waiting, at once.
-    let in_flight = match existing.as_ref().map(|session| session.start_request()) {
-        Some(None) => return too_many("this session already has its most requests in flight"),
+    // of bodies arriving at once.
+    let arriving = match existing.as_ref().map(|session| session.start_message()) {
+        Some(None) => return too_many("this session already has its most messages arriving"),
         Some(permit) => permit,
         None => None,
     };
@@ -452,23 +457,45 @@ async fn post_message(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let (initialize, request_id) = match classify(&body) {
+    // Read where blocking is fine: a body may be large.
+    let parsed = body.clone();
+    let Ok(message) = tokio::task::spawn_blocking(move || classify(&parsed)).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    // The client's answers to the server and its notifications aren't
+    // requests: they get through however many requests are in flight, so
+    // the client can always answer or cancel those.
+    let request = !matches!(
+        message,
+        Ok(Message::Response { .. } | Message::Notification { .. })
+    );
+    let (initialize, request_id) = match message {
         Ok(Message::Request { id, method }) => (method == "initialize", Some(id)),
         _ => (false, None),
     };
     let (session, in_flight, opening) = match existing {
-        Some(session) => (session, in_flight, None),
+        Some(session) if request => {
+            drop(arriving);
+            match session.start_request() {
+                Some(in_flight) => (session, Some(in_flight), None),
+                None => {
+                    return too_many("this session already has its most requests in flight");
+                }
+            }
+        }
+        Some(session) => (session, arriving, None),
         None if initialize => {
-            let session = match open_session(&app, &name, &caller).await {
-                Ok(session) => session,
-                Err(response) => return response,
+            // A task of its own, which the client leaving can't stop
+            // halfway.
+            let opened =
+                tokio::spawn(open_session(Arc::clone(&app), name.clone(), caller.clone())).await;
+            let opening = match opened {
+                Ok(Ok(opening)) => opening,
+                Ok(Err(response)) => return response,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             };
+            let session = Arc::clone(&opening.session);
             let in_flight = session.start_request();
-            let opening = Opening {
-                app: Arc::clone(&app),
-                session: Arc::clone(&session),
-                kept: false,
-            };
             (session, in_flight, Some(opening))
         }
         None => {
@@ -560,8 +587,8 @@ async fn abandon(session: &Session, request_id: Option<&Value>) {
 }
 
 /// Sends the server's reply back to the client, every message through the
-/// gate: a single JSON message, or an event stream. The request stays
-/// counted `in_flight` until its reply is done.
+/// gate: a single JSON message, or an event stream. The client's message
+/// stays counted by `in_flight` until its reply is done.
 async fn relay(
     app: Arc<App>,
     session: Arc<Session>,
@@ -615,7 +642,7 @@ async fn relay(
     };
     let (answers, to_server) = split(actions);
     for message in to_server {
-        answer_server(&app, &session, message, protocol.clone());
+        answer_server(&app, &session, message, protocol.clone()).await;
     }
     match answers.into_iter().next() {
         Some(answer) => json_reply(answer, Some(&session.id)),
@@ -723,12 +750,17 @@ async fn relay_events(
             }
             // A session with a live stream isn't idle.
             session.touch();
-            let answer = request_id.is_some_and(|wanted| {
-                matches!(classify(&event.data), Ok(Message::Response { id, .. }) if id == *wanted)
-            });
             let data = event.data;
-            let Some(actions) = gate_check(app, session, move |gate| gate.from_server(&data)).await
-            else {
+            // Whether it's the answer is worked out with the check, where
+            // reading a large message holds no thread that serves requests.
+            let wanted = request_id.filter(|_| !*answered).cloned();
+            let checked = gate_check(app, session, move |gate| {
+                let answer = wanted.is_some_and(|wanted| {
+                    matches!(classify(&data), Ok(Message::Response { id, .. }) if id == wanted)
+                });
+                (answer, gate.from_server(&data))
+            });
+            let Some((answer, actions)) = checked.await else {
                 return;
             };
             *answered |= answer;
@@ -741,7 +773,7 @@ async fn relay_events(
                         }
                     }
                     Action::ToServer(message) => {
-                        answer_server(app, session, message, protocol.cloned());
+                        answer_server(app, session, message, protocol.cloned()).await;
                     }
                 }
             }
@@ -749,19 +781,17 @@ async fn relay_events(
     }
 }
 
-/// Sends the gate's answer to a server request back to the server. Every
-/// such answer is a refusal, so when the server already has too many
-/// waiting to be sent, it gets no more.
-fn answer_server(
+/// Sends the gate's answer to a server request back to the server. Only a
+/// few are sent at once per session; until one is done, this waits, and so
+/// does the stream that brought the request: a server flooding requests
+/// slows only itself, and a burst of them is still answered in full.
+async fn answer_server(
     app: &Arc<App>,
     session: &Arc<Session>,
     message: Vec<u8>,
     protocol: Option<HeaderValue>,
 ) {
-    let Some(slot) = session.start_answer() else {
-        warn!(server = %session.server, "didn't answer a request of the MCP server: too many answers are still being sent");
-        return;
-    };
+    let slot = session.start_answer().await;
     let app = Arc::clone(app);
     let session = Arc::clone(session);
     tokio::spawn(async move {
@@ -1050,17 +1080,17 @@ impl Rpc for HttpRpc<'_> {
         }
         let bad_reply = || ProxyError::BadReply(method.to_owned());
         let message = if is_event_stream(response.headers()) {
-            self.find_in_stream(response, id)
+            self.find_in_stream(response, method, id)
                 .await?
                 .ok_or_else(bad_reply)?
         } else {
             let body = read_limited(response).await.map_err(|_| bad_reply())?;
-            serde_json::from_slice::<Value>(&body).map_err(|_| bad_reply())?
+            inventory::read_reply(method, &body)?.ok_or_else(bad_reply)?
         };
         if message.get("id") != Some(&json!(id)) {
             return Err(bad_reply());
         }
-        let result = result_of(method, &message)?;
+        let result = result_of(method, message)?;
         if method == "initialize" {
             let version = result
                 .get("protocolVersion")
@@ -1098,6 +1128,7 @@ impl HttpRpc<'_> {
     async fn find_in_stream(
         &self,
         response: reqwest::Response,
+        method: &str,
         id: u64,
     ) -> Result<Option<Value>, ProxyError> {
         let mut parser = sse::Parser::new(MAX_MESSAGE_BYTES);
@@ -1107,7 +1138,7 @@ impl HttpRpc<'_> {
                 .push(&chunk?)
                 .map_err(|_| ProxyError::BadReply("a streamed reply".to_owned()))?;
             for event in events {
-                let Ok(message) = serde_json::from_slice::<Value>(&event.data) else {
+                let Some(message) = inventory::read_reply(method, &event.data)? else {
                     continue;
                 };
                 if message.get("method").is_some() {

@@ -1,6 +1,7 @@
 //! Spotting secrets in text and in JSON messages.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use base64::Engine;
@@ -274,6 +275,9 @@ impl SecretDetector {
                 .for_each(|item| self.redact_value(item, kinds)),
             Value::Object(map) => {
                 let binary = binary_field(map);
+                // The next number to try for each key that's taken, so
+                // numbering many keys that redact alike stays quick.
+                let mut next_number: HashMap<String, u64> = HashMap::new();
                 // Keys can't be changed in place, so the map is rebuilt.
                 for (mut key, mut item) in std::mem::take(map) {
                     if secret_field(&key, &item) {
@@ -294,10 +298,13 @@ impl SecretDetector {
                     // Two keys can redact to the same text: number the later
                     // ones rather than lose them.
                     if map.contains_key(&key) {
-                        key = (2..)
-                            .map(|n| format!("{key} #{n}"))
-                            .find(|numbered| !map.contains_key(numbered))
+                        let next = next_number.entry(key.clone()).or_insert(2);
+                        let (n, numbered) = (*next..)
+                            .map(|n| (n, format!("{key} #{n}")))
+                            .find(|(_, numbered)| !map.contains_key(numbered))
                             .expect("some number is free");
+                        *next = n + 1;
+                        key = numbered;
                     }
                     map.insert(key, item);
                 }
@@ -639,6 +646,59 @@ mod tests {
             ],
             "{message}"
         );
+    }
+
+    #[test]
+    fn numbers_many_keys_that_redact_alike_quickly() {
+        let detector = SecretDetector::default();
+        let count = 20_000;
+        let mut message = Value::Object(
+            (0..count)
+                .map(|n| (format!("AKIA{n:016}"), json!(n)))
+                .collect(),
+        );
+        let started = std::time::Instant::now();
+        detector.redact_json(&mut message);
+        let took = started.elapsed();
+        let keys = message.as_object().unwrap();
+        assert_eq!(keys.len(), count);
+        assert!(keys.contains_key(&format!("[REDACTED: aws-access-key-id] #{count}")));
+        assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    }
+
+    #[test]
+    fn numbering_skips_numbers_already_taken() {
+        let detector = SecretDetector::default();
+        let token = |c: &str| format!("ghp_{}", c.repeat(36));
+        let mut message = json!({
+            "[REDACTED: github-token] #2": 0,
+            token("a"): 1,
+            token("b"): 2,
+            token("c"): 3
+        });
+        detector.redact_json(&mut message);
+        assert_eq!(
+            message,
+            json!({
+                "[REDACTED: github-token]": 1,
+                "[REDACTED: github-token] #2": 0,
+                "[REDACTED: github-token] #3": 2,
+                "[REDACTED: github-token] #4": 3
+            })
+        );
+    }
+
+    #[test]
+    fn takes_quoted_text_after_a_secret_name_as_a_secret() {
+        let detector = SecretDetector::default();
+        // A quoted value is taken whole, so a passphrase with spaces is
+        // caught, and so is prose in quotes after such a name.
+        assert_eq!(
+            detector.find(r#"const PASSWORD_PROMPT = "Enter your password";"#),
+            Some("secret-assignment")
+        );
+        // An unquoted value stops at the first space.
+        assert_eq!(detector.find("Password: must be 12 characters"), None);
     }
 
     #[test]

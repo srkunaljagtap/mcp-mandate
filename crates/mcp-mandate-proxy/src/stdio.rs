@@ -54,7 +54,9 @@ const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
 /// anything that looks like one is masked: a URL's user name, password,
 /// query and fragment, the value of a variable (`NAME=value`), of an option
 /// or header named like a secret (`--api-key`, `Authorization:`), and
-/// anything shaped like a known kind of key.
+/// anything shaped like a known kind of key. A value can have spaces, so it
+/// is masked up to its closing quote, if it opens one, or else up to the
+/// next option.
 #[derive(Debug, Clone)]
 pub struct ServerCommand {
     pub program: OsString,
@@ -82,63 +84,119 @@ impl fmt::Display for ServerCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let secrets = SecretDetector::default();
         write!(f, "{}", self.program.to_string_lossy())?;
-        // Whether the next argument is the value of `--api-key` or such.
-        let mut secret_next = false;
+        // Whether this argument is the value of `--api-key` or such.
+        let mut value = false;
         for arg in &self.args {
-            let mut secret = std::mem::take(&mut secret_next);
-            // Word by word, for scripts passed to a shell (`sh -c "…"`) and
-            // values with spaces (`Authorization: Bearer …`). Once a word
-            // reveals a secret, the rest of the argument is masked, up to
-            // the next option.
-            let mut words = Vec::new();
-            for word in arg.to_string_lossy().split_whitespace() {
-                let (open, word, close) = unquote(word);
-                if word.starts_with('-') {
-                    secret = false;
-                }
-                let shown = if secret {
-                    MASK.to_owned()
-                } else {
-                    redact_word(word, &secrets)
-                };
-                words.push(format!("{open}{shown}{close}"));
-                secret_next = reveals_secret(word);
-                secret |= secret_next;
-            }
-            write!(f, " {}", words.join(" "))?;
+            let (shown, value_next) = mask(&arg.to_string_lossy(), value, &secrets);
+            write!(f, " {shown}")?;
+            value = value_next;
         }
         Ok(())
     }
 }
 
-/// One word of an argument, with anything that may be a secret masked.
-fn redact_word(word: &str, secrets: &SecretDetector) -> String {
-    let shown = if let Some(url) = without_credentials(word) {
-        url
-    } else if let Some((name, separator, value)) = assignment(word)
-        && !value.is_empty()
-    {
+/// One argument as a [`ServerCommand`] shows it, for a part of a command
+/// shown on its own, such as the package a launcher runs.
+pub fn masked(arg: &str) -> String {
+    mask(arg, false, &SecretDetector::default()).0
+}
+
+/// How far a secret goes on past the word that starts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// It doesn't.
+    No,
+    /// Up to the next option, into the next argument too: the value of
+    /// `--api-key` or `Authorization:`.
+    Value,
+    /// Up to the next option in this argument: the rest of `NAME=value` or
+    /// `--password=value`, as a value can have spaces.
+    Rest,
+    /// Up to the word that closes this quote: `PASSWORD='a b c'`.
+    Quote(char),
+}
+
+/// One argument with anything that may be a secret masked, and whether the
+/// next argument is a secret's value. `value` says whether this one is.
+fn mask(arg: &str, value: bool, secrets: &SecretDetector) -> (String, bool) {
+    // Word by word, for scripts passed to a shell (`sh -c "…"`) and values
+    // with spaces (`Authorization: Bearer …`).
+    let mut run = if value { Run::Value } else { Run::No };
+    let mut value_next = false;
+    let mut words = Vec::new();
+    for raw in arg.split_whitespace() {
+        let (open, word, close) = unquote(raw);
+        if matches!(run, Run::Value | Run::Rest) && word.starts_with('-') {
+            run = Run::No;
+        }
+        let shown = if run == Run::No {
+            let (shown, starts) = redact_word(word, secrets);
+            run = match starts {
+                // The quote around the value closes in this same word.
+                Run::Quote(quote) if close.contains(quote) => Run::No,
+                starts => starts,
+            };
+            // A name whose value comes next, in the next argument if this
+            // is the last word: `--api-key`, `Authorization:Bearer`.
+            value_next = run == Run::Value;
+            shown
+        } else {
+            if let Run::Quote(quote) = run
+                && raw.ends_with(quote)
+            {
+                run = Run::No;
+            }
+            value_next = false;
+            MASK.to_owned()
+        };
+        words.push(format!("{open}{shown}{close}"));
+    }
+    (words.join(" "), value_next)
+}
+
+/// One word of an argument, with anything that may be a secret masked, and
+/// how far past it a secret it starts goes.
+fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
+    let (shown, run) = if let Some(url) = without_credentials(word) {
+        (url, Run::No)
+    } else if let Some((name, separator, value)) = assignment(word) {
         // A variable's value may be anything; an option's or a header's
         // is a secret when its name says so.
         if (separator == '=' && !name.starts_with('-')) || secret_name(name) {
-            format!("{name}{separator}{MASK}")
+            let shown = if value.is_empty() {
+                format!("{name}{separator}")
+            } else {
+                format!("{name}{separator}{MASK}")
+            };
+            (shown, secret_run(name, separator, value))
         } else {
-            format!("{name}{separator}{}", redact_word(value, secrets))
+            // `--header=Authorization: …`, `--url='https://…'`
+            let (open, value, close) = unquote(value);
+            let (value, run) = redact_word(value, secrets);
+            (format!("{name}{separator}{open}{value}{close}"), run)
         }
+    } else if word.starts_with('-') && secret_name(word) {
+        (word.to_owned(), Run::Value)
     } else {
-        word.to_owned()
+        (word.to_owned(), Run::No)
     };
-    secrets
+    let shown = secrets
         .redact_text(&shown)
-        .map_or(shown, |(redacted, _)| redacted)
+        .map_or(shown, |(redacted, _)| redacted);
+    (shown, run)
 }
 
-/// Whether `word` names a secret whose value comes after it: an option
-/// such as `--api-key`, or `Authorization:` followed by a space.
-fn reveals_secret(word: &str) -> bool {
-    match assignment(word) {
-        Some((name, _, value)) => value.is_empty() && secret_name(name),
-        None => word.starts_with('-') && secret_name(word),
+/// How far the masked value of `name` goes past its first word.
+fn secret_run(name: &str, separator: char, value: &str) -> Run {
+    match value.chars().next() {
+        // `Authorization:` or `--token=` with the value after a space.
+        None if secret_name(name) => Run::Value,
+        None => Run::No,
+        Some(quote @ ('"' | '\'')) if value[1..].contains(quote) => Run::No,
+        Some(quote @ ('"' | '\'')) => Run::Quote(quote),
+        // `Authorization:Bearer` with the token after it.
+        Some(_) if separator == ':' => Run::Value,
+        Some(_) => Run::Rest,
     }
 }
 
@@ -546,7 +604,7 @@ impl Rpc for InventoryClient {
             if !read_frame(&mut self.reader, &mut self.frame, MAX_MESSAGE_BYTES).await? {
                 return Err(ProxyError::Closed(method.to_owned()));
             }
-            let Ok(message) = serde_json::from_slice::<Value>(&self.frame) else {
+            let Some(message) = inventory::read_reply(method, &self.frame)? else {
                 warn!("ignored a line from the server that isn't JSON");
                 continue;
             };
@@ -564,7 +622,7 @@ impl Rpc for InventoryClient {
             if message.get("id") != Some(&json!(id)) {
                 continue;
             }
-            return result_of(method, &message);
+            return result_of(method, message);
         }
     }
 
@@ -917,12 +975,102 @@ mod tests {
             shown("server", &[&token]),
             "server [REDACTED: github-token]"
         );
+        // A value can have spaces: it's masked up to the next option.
         assert_eq!(
             shown(
                 "sh",
                 &["-c", "API_KEY=abc123 node server.js --token 'abc 123'"]
             ),
-            "sh -c API_KEY=*** node server.js --token '*** ***'"
+            "sh -c API_KEY=*** *** *** --token '*** ***'"
         );
+        assert_eq!(
+            shown(
+                "server",
+                &["--db-password=correct horse battery staple", "--port", "1"]
+            ),
+            "server --db-password=*** *** *** *** --port 1"
+        );
+        assert_eq!(
+            shown("docker", &["run", "-e", "TEAM=a b c", "image"]),
+            "docker run -e TEAM=*** *** *** image"
+        );
+        // Or up to its closing quote.
+        assert_eq!(
+            shown(
+                "sh",
+                &["-c", "PGPASSWORD='correct horse battery' psql -h db"]
+            ),
+            "sh -c PGPASSWORD=*** *** ***' psql -h db"
+        );
+        assert_eq!(
+            shown(
+                "sh",
+                &[
+                    "-c",
+                    "node server.js --url=\"https://user:pw@example.com/\""
+                ]
+            ),
+            "sh -c node server.js --url=\"https://***@example.com/\""
+        );
+    }
+
+    #[test]
+    fn masks_a_header_value_however_it_is_split() {
+        let masked = "npx mcp-remote https://example.com/sse --header Authorization:*** ***";
+        assert_eq!(
+            shown(
+                "npx",
+                &[
+                    "mcp-remote",
+                    "https://example.com/sse",
+                    "--header",
+                    "Authorization:Bearer abcd1234efgh5678"
+                ]
+            ),
+            masked
+        );
+        // As a client on Windows may pass it.
+        assert_eq!(
+            shown(
+                "npx",
+                &[
+                    "mcp-remote",
+                    "https://example.com/sse",
+                    "--header",
+                    "Authorization:Bearer",
+                    "abcd1234efgh5678"
+                ]
+            ),
+            masked
+        );
+        assert_eq!(
+            shown(
+                "npx",
+                &[
+                    "mcp-remote",
+                    "--header=Authorization: Bearer abcd1234efgh5678",
+                    "https://example.com/sse"
+                ]
+            ),
+            "npx mcp-remote --header=Authorization: *** *** https://example.com/sse"
+        );
+        assert_eq!(
+            shown("server", &["--header", "X-Api-Key:abcd1234efgh5678"]),
+            "server --header X-Api-Key:***"
+        );
+        // Other headers are shown.
+        assert_eq!(
+            shown("server", &["--header", "Accept:text/plain", "/srv"]),
+            "server --header Accept:text/plain /srv"
+        );
+    }
+
+    #[test]
+    fn masks_one_argument_on_its_own() {
+        assert_eq!(
+            masked("git+https://oauth2:glpat-abcd1234@gitlab.com/org/server.git"),
+            "git+https://***@gitlab.com/org/server.git"
+        );
+        assert_eq!(masked("some-server@latest"), "some-server@latest");
     }
 }

@@ -149,12 +149,15 @@ fn dump_tool() -> Value {
 }
 
 /// Gamma's own tools, which behave badly in one way each:
-/// - `flood` answers on a stream, after sending 50 requests of its own;
+/// - `flood` answers on a stream, after sending 50 requests of its own,
+///   whose answers it never takes;
+/// - `burst` answers on a stream, after sending 10 requests of its own,
+///   whose answers it takes 200 ms each to take;
 /// - `wait` never answers;
 /// - `linger` answers on a stream that stays open a second longer;
 /// - `slow` answers after two seconds.
 fn gamma_tools() -> Vec<Value> {
-    ["flood", "wait", "linger", "slow"]
+    ["flood", "burst", "wait", "linger", "slow"]
         .iter()
         .map(|name| {
             json!({"name": name, "description": "Does what it's told", "inputSchema": {"type": "object"},
@@ -324,16 +327,21 @@ async fn serve_mcp(
             }
             axum::Json(reply(json!({ "tools": tools }))).into_response()
         }
+        "(response)" if gamma && id.as_str().is_some_and(|id| id.starts_with('b')) => {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            StatusCode::ACCEPTED.into_response()
+        }
         "(response)" if gamma => hold(&fake.holding).await,
         "tools/call" if gamma && tool == "wait" => hold(&fake.holding).await,
-        "tools/call" if gamma && tool == "flood" => {
-            let mut events: String = (0..50)
+        "tools/call" if gamma && (tool == "flood" || tool == "burst") => {
+            let (prefix, count) = if tool == "flood" { ("s", 50) } else { ("b", 10) };
+            let mut events: String = (0..count)
                 .map(|n| {
-                    let request = json!({"jsonrpc": "2.0", "id": format!("s{n}"), "method": "x/y"});
+                    let request = json!({"jsonrpc": "2.0", "id": format!("{prefix}{n}"), "method": "x/y"});
                     format!("event: message\ndata: {request}\n\n")
                 })
                 .collect();
-            let answer = reply(json!({"content": [{"type": "text", "text": "flooded"}]}));
+            let answer = reply(json!({"content": [{"type": "text", "text": tool}]}));
             events.push_str(&format!("event: message\ndata: {answer}\n\n"));
             event_stream(Body::from(events))
         }
@@ -1123,8 +1131,31 @@ async fn a_server_stream_stops_when_its_client_leaves() {
     .await;
 }
 
+impl World {
+    /// Starts calling `tool` on gamma without waiting for the answer; the
+    /// task returns the reply's body.
+    fn start_call(
+        &self,
+        token: &str,
+        session: &str,
+        tool: &str,
+        id: u64,
+    ) -> tokio::task::JoinHandle<String> {
+        let call = self
+            .client
+            .post(self.url("gamma"))
+            .bearer_auth(token)
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-session-id", session)
+            .json(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": tool, "arguments": {}}}))
+            .send();
+        tokio::spawn(async move { call.await.unwrap().text().await.unwrap() })
+    }
+}
+
 #[tokio::test]
-async fn a_session_has_a_limit_on_requests_in_flight() {
+async fn a_session_has_a_limit_on_requests_in_flight_but_can_still_cancel_them() {
     let world = world().await;
     let token = world.token("alice", json!({}));
     let session = world.initialize("gamma", &token).await;
@@ -1132,59 +1163,89 @@ async fn a_session_has_a_limit_on_requests_in_flight() {
     world
         .post("gamma", Some(&token), Some(&session), list)
         .await;
-    let wait = |id: u64| {
-        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": {"name": "wait", "arguments": {}}})
-    };
     let waiting: Vec<_> = (0..16)
-        .map(|id| {
-            let call = world
-                .client
-                .post(world.url("gamma"))
-                .bearer_auth(&token)
-                .header(header::ACCEPT, "application/json, text/event-stream")
-                .header("mcp-session-id", &session)
-                .json(&wait(10 + id))
-                .send();
-            tokio::spawn(call)
-        })
+        .map(|id| world.start_call(&token, &session, "wait", 10 + id))
         .collect();
     wait_until("16 calls are waiting at the server", || {
         world.holding.load(Ordering::SeqCst) == 16
     })
     .await;
-    let refused = tokio::time::timeout(
-        Duration::from_secs(5),
-        world.post("gamma", Some(&token), Some(&session), wait(99)),
-    )
+    let post = |message: Value| {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            world.post("gamma", Some(&token), Some(&session), message),
+        )
+    };
+    let refused = post(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/call",
+        "params": {"name": "wait", "arguments": {}}}))
     .await
     .expect("refused at once");
     assert_eq!(refused.status(), 429);
+    // The client's notifications and answers aren't requests: they still
+    // get through.
+    let cancelled = post(
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 10}}),
+    )
+    .await
+    .expect("passed on at once");
+    assert_eq!(cancelled.status(), 202);
+    assert!(
+        world
+            .seen()
+            .iter()
+            .any(|seen| seen.method == "notifications/cancelled")
+    );
+    let answer = post(json!({"jsonrpc": "2.0", "id": "s1", "result": {}}))
+        .await
+        .expect("checked at once");
+    assert_eq!(answer.status(), 202, "dropped: the server asked nothing");
     for call in waiting {
         call.abort();
     }
 }
 
 #[tokio::test]
-async fn a_server_flooding_requests_gets_only_a_few_answers_at_once() {
+async fn a_server_flooding_requests_is_answered_only_a_few_at_a_time() {
     let world = world().await;
     let token = world.token("alice", json!({}));
     let session = world.initialize("gamma", &token).await;
-    // The server sends 50 requests, which the gate refuses; it never takes
-    // the refusals.
-    let answer = world
-        .list_and_call("gamma", &token, &session, "flood")
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    world
+        .post("gamma", Some(&token), Some(&session), list)
         .await;
-    assert_eq!(
-        answer["result"]["content"][0]["text"], "flooded",
-        "{answer}"
-    );
+    // The server sends 50 requests, which the gate refuses; it never takes
+    // the refusals, so the rest of its stream waits behind them.
+    let flood = world.start_call(&token, &session, "flood", 2);
     wait_until("refusals reach the server", || {
         world.holding.load(Ordering::SeqCst) >= 8
     })
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(world.holding.load(Ordering::SeqCst), 8);
+    assert!(!flood.is_finished(), "its answer waits behind its requests");
+    flood.abort();
+}
+
+#[tokio::test]
+async fn a_burst_of_server_requests_is_answered_in_full() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let session = world.initialize("gamma", &token).await;
+    // The server sends 10 requests at once, more than are answered at
+    // once, and takes its time over each answer.
+    let answer = world
+        .list_and_call("gamma", &token, &session, "burst")
+        .await;
+    assert_eq!(answer["result"]["content"][0]["text"], "burst", "{answer}");
+    let answered = || {
+        world
+            .seen()
+            .iter()
+            .filter(|seen| seen.method == "(response)")
+            .count()
+    };
+    wait_until("every request is answered", || answered() == 10).await;
 }
 
 #[tokio::test]
@@ -1301,6 +1362,61 @@ async fn listing_ends_even_when_the_server_never_confirms_the_end_of_its_session
     let listed = tokio::time::timeout(Duration::from_secs(30), inventory(&config.servers["gamma"]))
         .await
         .expect("the listing ended");
-    assert_eq!(listed.unwrap().tools.len(), 9);
+    assert_eq!(listed.unwrap().tools.len(), 10);
     assert_eq!(world.deletes(), 1);
+}
+
+#[tokio::test]
+async fn a_session_whose_client_leaves_while_it_opens_still_has_its_end_recorded() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let log = world.dir.join("alpha.policy.audit.jsonl");
+    // Holding the log's lock keeps the session's start from being recorded
+    // until the client has left.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&log)
+        .unwrap();
+    held.lock().unwrap();
+    let body = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}})
+    .to_string();
+    let request = format!(
+        "POST /servers/alpha/mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut connection = TcpStream::connect(world.gateway.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    connection.write_all(request.as_bytes()).await.unwrap();
+    // Enough for the session to start opening; then the client leaves.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(connection);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    held.unlock().unwrap();
+
+    let count = |event: &str| {
+        // Read without the lock, so a read may fail while a write is under
+        // way on Windows: then it's read again.
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["event"] == event)
+            .count()
+    };
+    wait_until("the session's start and end are recorded", || {
+        count("session-start") == 1 && count("session-end") == 1
+    })
+    .await;
+    let report = mcp_mandate_audit::verify(&log, None).unwrap();
+    assert_eq!(report.unfinished, 0);
+}
+
+#[tokio::test]
+async fn a_token_whose_expiry_has_a_fraction_is_accepted() {
+    let world = world().await;
+    let token = world.token("alice", json!({"exp": now() as f64 + 600.5}));
+    world.initialize("alpha", &token).await;
 }

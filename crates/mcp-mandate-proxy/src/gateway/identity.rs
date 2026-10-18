@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use jsonwebtoken::jwk::{Jwk, JwkSet, PublicKeyUse};
 use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, Validation, decode, decode_header};
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -96,7 +96,25 @@ struct Claims {
     sub: String,
     azp: Option<String>,
     client_id: Option<String>,
+    #[serde(deserialize_with = "numeric_date")]
     exp: u64,
+}
+
+/// A JWT `NumericDate`: seconds since the Unix epoch, which may have a
+/// fraction (RFC 7519). The fraction is dropped, so a deadline taken from
+/// it comes no later than the token's.
+fn numeric_date<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let number = serde_json::Number::deserialize(deserializer)?;
+    number
+        .as_u64()
+        .or_else(|| {
+            number
+                .as_f64()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                // Truncates, saturating at u64::MAX.
+                .map(|seconds| seconds as u64)
+        })
+        .ok_or_else(|| serde::de::Error::custom("not a NumericDate"))
 }
 
 impl Identity {
@@ -326,6 +344,29 @@ mod tests {
             fetched: Instant::now(),
             attempted: Instant::now(),
         }
+    }
+
+    #[test]
+    fn a_tokens_expiry_may_have_a_fraction() {
+        let expiry = |exp: Value| {
+            serde_json::from_value::<Claims>(serde_json::json!({"sub": "alice", "exp": exp}))
+                .map(|claims| claims.exp)
+                .ok()
+        };
+        assert_eq!(
+            expiry(serde_json::json!(1_760_000_000)),
+            Some(1_760_000_000)
+        );
+        assert_eq!(
+            expiry(serde_json::json!(1_760_000_000.5)),
+            Some(1_760_000_000)
+        );
+        assert_eq!(
+            expiry(serde_json::json!(1_760_000_000.0)),
+            Some(1_760_000_000)
+        );
+        assert_eq!(expiry(serde_json::json!(-1)), None);
+        assert_eq!(expiry(serde_json::json!("1760000000")), None);
     }
 
     #[test]

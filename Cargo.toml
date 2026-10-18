@@ -39,6 +39,8 @@ jsonschema = { version = "0.59.0", default-features = false }
 # has an unfixed timing side channel (RUSTSEC-2023-0071).
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
 regex = "1.13.1"
+# The parser `regex` uses, to work out the shortest text a pattern matches.
+regex-syntax = "0.8.11"
 nix = { version = "0.31.3", default-features = false, features = ["fs", "process", "signal", "user"] }
 # Random-input tests on stable Rust; the defaults would add process forking.
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }

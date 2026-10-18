@@ -51,7 +51,7 @@ pub fn plan_tools(inventory: &Inventory, findings: &[Finding]) -> Vec<ToolPlan> 
     for tool in &inventory.tools {
         if let Some(name) = Pins::item_name(Kind::Tool, tool) {
             *listed.entry(name).or_default() += 1;
-            *twins.entry(as_on_windows(name)).or_default() += 1;
+            *twins.entry(slashes_alike(name)).or_default() += 1;
         }
     }
     let about = by_subject(findings);
@@ -61,27 +61,25 @@ pub fn plan_tools(inventory: &Inventory, findings: &[Finding]) -> Vec<ToolPlan> 
         .filter_map(|tool| {
             let name = Pins::item_name(Kind::Tool, tool)?;
             // Two definitions under one name: which one a client (or the
-            // pins file) keeps is unclear, so neither is trusted. Glob
-            // patterns read `\` differently across platforms (Windows reads
-            // it as `/`), so a name with one can't be matched exactly, and
-            // names that differ only in `/` and `\` can be one name to the
-            // gate: those are denied too.
+            // pins file) keeps is unclear, so neither is trusted. A `\` in a
+            // name is easy to take for a `/`, so names with one, and names
+            // that differ only in `/` and `\`, are denied too, out of caution.
             let (base, reach, open_world) = if listed[name] > 1 {
                 (
                     Proposal::Deny,
                     "is listed more than once under this name",
                     true,
                 )
-            } else if twins[&as_on_windows(name)] > 1 {
+            } else if twins[&slashes_alike(name)] > 1 {
                 (
                     Proposal::Deny,
-                    "has a twin whose name differs only in `/` and `\\`, which a policy on Windows can treat as one name",
+                    "has a twin whose name differs only in `/` and `\\`; such names are easy to confuse, so both are denied out of caution",
                     true,
                 )
             } else if name.contains('\\') {
                 (
                     Proposal::Deny,
-                    "has a `\\` in its name, which glob patterns read differently across platforms, so no rule names it exactly",
+                    "has a `\\` in its name, which is easy to confuse with a `/`, so it's denied out of caution",
                     true,
                 )
             } else {
@@ -123,8 +121,9 @@ fn by_subject(findings: &[Finding]) -> HashMap<&Subject, Vec<&Finding>> {
     about
 }
 
-/// A tool name with each `\` read as `/`, as glob matching on Windows can.
-fn as_on_windows(name: &str) -> String {
+/// A tool name with each `\` read as `/`, so names that differ only in
+/// those come out the same.
+fn slashes_alike(name: &str) -> String {
     name.replace('\\', "/")
 }
 
@@ -221,17 +220,10 @@ impl Draft {
                     printable(&finding.detail, 160)
                 );
             }
-            let pattern = literal_glob(&plan.name);
-            if plan.name.contains('\\') {
-                text.push_str(
-                    "# Each `\\` is matched with `?`, which also matches a `/` there (and any\n\
-                     # other character), so the rule can only deny.\n",
-                );
-            }
             let _ = write!(
                 text,
                 "[[tools]]\nmatch = {}\naction = \"{}\"\n",
-                toml_string(&pattern),
+                toml_string(&literal_glob(&plan.name)),
                 plan.proposal.label()
             );
             if plan.proposal != Proposal::Deny {
@@ -271,10 +263,9 @@ impl Draft {
     }
 }
 
-/// A glob that matches `name`: glob metacharacters are put in brackets, so
-/// it matches exactly. A `\`, which glob patterns read differently across
-/// platforms, becomes `?`: that matches it everywhere, but also a `/` (its
-/// twin on Windows) or any other character, so it's only fit for a deny.
+/// A glob that matches exactly `name`, and nothing else: glob
+/// metacharacters are put in brackets, and a `\` (which escapes the next
+/// character in a policy's glob, on every platform) is escaped itself.
 fn literal_glob(name: &str) -> String {
     let mut pattern = String::with_capacity(name.len());
     for c in name.chars() {
@@ -284,7 +275,7 @@ fn literal_glob(name: &str) -> String {
                 pattern.push(c);
                 pattern.push(']');
             }
-            '\\' => pattern.push('?'),
+            '\\' => pattern.push_str("\\\\"),
             c => pattern.push(c),
         }
     }
@@ -482,7 +473,7 @@ mod tests {
     fn literal_globs_escape_pattern_characters() {
         assert_eq!(literal_glob("get*"), "get[*]");
         assert_eq!(literal_glob("{a,b}"), "[{]a,b[}]");
-        assert_eq!(literal_glob("a\\b"), "a?b");
+        assert_eq!(literal_glob("a\\b"), "a\\\\b");
     }
 
     #[test]
@@ -492,15 +483,14 @@ mod tests {
             tool("notes/read", Some(local.clone())),
             tool("notes\\read", Some(local.clone())),
             tool("files\\list", Some(local.clone())),
-            tool("files/open", Some(local)),
+            tool("files/open", Some(local.clone())),
+            tool("files_list", Some(local)),
         ]);
         let draft = Draft::new(&tools, &scan(&tools), "server", None);
         let policy = Policy::parse(&draft.text, Path::new(".")).unwrap_or_else(|error| {
             panic!("{error}:\n{}", draft.text);
         });
-        // Where a policy reads `\` as `/` (Windows), an allow for one twin
-        // would also allow the other; the draft allows neither.
-        for name in ["notes/read", "notes\\read", "files\\list", "files/list"] {
+        for name in ["notes/read", "notes\\read", "files\\list"] {
             assert_eq!(
                 policy.for_tool(name).action,
                 Action::Deny,
@@ -508,10 +498,19 @@ mod tests {
                 draft.text
             );
         }
-        assert_eq!(policy.for_tool("files/open").action, Action::Allow);
+        // Each rule names its tool exactly, so the denials reach no other
+        // tool, and what the draft counts as allowed is allowed.
+        for name in ["files/open", "files_list"] {
+            assert_eq!(
+                policy.for_tool(name).action,
+                Action::Allow,
+                "{name}:\n{}",
+                draft.text
+            );
+        }
         assert_eq!(
             (draft.count(Proposal::Allow), draft.count(Proposal::Deny)),
-            (1, 3)
+            (2, 3)
         );
     }
 

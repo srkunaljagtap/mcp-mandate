@@ -563,6 +563,48 @@ fn observe_mode_records_taint_but_holds_nothing() {
     assert_eq!(call(&mut gate, "send_email", json!({})), None);
 }
 
+/// An agent's shared taint record, which something can remove (as a
+/// cleaner of temporary files might remove the file it's kept in).
+#[derive(Default)]
+struct Record(Mutex<Option<String>>);
+
+impl SharedTaint for Record {
+    fn get(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn set(&self, source: &str) {
+        *self.0.lock().unwrap() = Some(source.to_owned());
+    }
+}
+
+#[test]
+fn a_tainted_gate_puts_back_a_shared_record_that_was_removed() {
+    let record = Arc::new(Record::default());
+    let mut reader = taint_gate("").with_shared_taint(Arc::clone(&record) as Arc<dyn SharedTaint>);
+    call_and_answer(&mut reader, 10, "fetch_page", "anything");
+    assert!(record.get().is_some());
+
+    // Removed while the agent runs; a gate that never saw it starts.
+    *record.0.lock().unwrap() = None;
+    let mut sender = taint_gate("").with_shared_taint(Arc::clone(&record) as Arc<dyn SharedTaint>);
+    // The reader handles anything at all.
+    let ping = request(11, "ping", json!({}));
+    assert_eq!(
+        reader.from_client(&ping),
+        vec![Action::ToServer(ping.clone())]
+    );
+
+    assert_eq!(
+        record.get().as_deref(),
+        Some("the output of tool `fetch_page`")
+    );
+    blocked_with(
+        call(&mut sender, "send_email", json!({})),
+        "read untrusted content",
+    );
+}
+
 #[test]
 fn redacts_secrets_from_tool_results_and_notifications() {
     let mut gate = taint_gate("");

@@ -4,6 +4,7 @@
 
 use mcp_mandate_pin::Inventory;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::ProxyError;
 
@@ -17,6 +18,11 @@ const MAX_PAGES: usize = 100;
 /// a hostile one could otherwise fill memory, and make the review that
 /// follows crawl.
 const MAX_ITEMS: usize = 10_000;
+/// Most values (object keys included) one reply may hold, as in one message
+/// the gate checks. A reply is read whole, where each value takes many
+/// times its size in the text, so a reply of tiny values (`[{},{},…]`)
+/// could otherwise fill memory before the limits above are checked.
+const MAX_VALUES: usize = 1_000_000;
 
 /// A way to send requests to an MCP server.
 pub(crate) trait Rpc {
@@ -60,11 +66,22 @@ pub(crate) async fn collect(rpc: &mut impl Rpc) -> Result<Inventory, ProxyError>
     }
     if offers("resources") {
         inventory.resources = list_all(rpc, "resources/list", "resources").await?;
-        // Templates are optional even for servers with resources.
+        // Templates are optional even for servers with resources, so a
+        // server that doesn't list them is recorded as having none, with a
+        // warning. A list too long to read whole is an error, as for the
+        // other lists.
         inventory.resource_templates =
-            list_all(rpc, "resources/templates/list", "resourceTemplates")
-                .await
-                .unwrap_or_default();
+            match list_all(rpc, "resources/templates/list", "resourceTemplates").await {
+                Ok(templates) => templates,
+                Err(error @ ProxyError::TooLong { .. }) => return Err(error),
+                Err(error) => {
+                    warn!(
+                        %error,
+                        "the server didn't list its resource templates, so none are recorded"
+                    );
+                    Vec::new()
+                }
+            };
     }
     Ok(inventory)
 }
@@ -99,9 +116,47 @@ async fn list_all(rpc: &mut impl Rpc, method: &str, field: &str) -> Result<Vec<V
     Err(too_long(format!("{MAX_PAGES} pages")))
 }
 
-/// The `result` of a JSON-RPC response, or the server's error as a
-/// [`ProxyError`].
-pub(crate) fn result_of(method: &str, message: &Value) -> Result<Value, ProxyError> {
+/// Parses a message the server sent while being listed: `None` if it isn't
+/// JSON. One with more than [`MAX_VALUES`] values is an error, found before
+/// it's parsed.
+pub(crate) fn read_reply(method: &str, bytes: &[u8]) -> Result<Option<Value>, ProxyError> {
+    if most_values(bytes) > MAX_VALUES {
+        return Err(ProxyError::TooLong {
+            method: method.to_owned(),
+            limit: format!("{MAX_VALUES} values in one reply"),
+        });
+    }
+    Ok(serde_json::from_slice(bytes).ok())
+}
+
+/// The most values (object keys included) that JSON text can hold, counted
+/// without parsing it: each one but the first follows a `[`, `{`, `,` or
+/// `:` outside a string.
+fn most_values(bytes: &[u8]) -> usize {
+    let mut count = 1;
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in bytes {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'[' | b'{' | b',' | b':' => count += 1,
+                _ => {}
+            }
+        }
+    }
+    count
+}
+
+/// The `result` of a JSON-RPC response, taken out of it rather than copied,
+/// or the server's error as a [`ProxyError`].
+pub(crate) fn result_of(method: &str, mut message: Value) -> Result<Value, ProxyError> {
     if let Some(error) = message.get("error") {
         return Err(ProxyError::Server {
             method: method.to_owned(),
@@ -112,7 +167,10 @@ pub(crate) fn result_of(method: &str, message: &Value) -> Result<Value, ProxyErr
                 .to_owned(),
         });
     }
-    Ok(message.get("result").cloned().unwrap_or(Value::Null))
+    Ok(message
+        .get_mut("result")
+        .map(Value::take)
+        .unwrap_or(Value::Null))
 }
 
 #[cfg(test)]
@@ -152,5 +210,73 @@ mod tests {
                 listed.map(|inventory| inventory.tools.len())
             );
         }
+    }
+
+    /// A server with one resource, whose resource templates list answers
+    /// with `templates`.
+    struct WithTemplates {
+        templates: fn() -> Result<Value, ProxyError>,
+    }
+
+    impl Rpc for WithTemplates {
+        async fn request(&mut self, method: &str, _: Value) -> Result<Value, ProxyError> {
+            match method {
+                "initialize" => Ok(json!({"capabilities": {"resources": {}}})),
+                "resources/list" => Ok(json!({"resources": [{"name": "r", "uri": "file:///r"}]})),
+                _ => (self.templates)(),
+            }
+        }
+
+        async fn notify(&mut self, _: &str) -> Result<(), ProxyError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn too_many_templates_is_an_error_but_no_templates_list_is_none() {
+        let too_many = || -> Result<Value, ProxyError> {
+            Ok(json!({"resourceTemplates": vec![json!({"name": "t"}); MAX_ITEMS + 1]}))
+        };
+        let listed = collect(&mut WithTemplates {
+            templates: too_many,
+        })
+        .await;
+        assert!(
+            matches!(listed, Err(ProxyError::TooLong { .. })),
+            "{:?}",
+            listed.map(|inventory| inventory.resource_templates.len())
+        );
+        let unsupported = || -> Result<Value, ProxyError> {
+            Err(ProxyError::Server {
+                method: "resources/templates/list".to_owned(),
+                message: "Method not found".to_owned(),
+            })
+        };
+        let listed = collect(&mut WithTemplates {
+            templates: unsupported,
+        })
+        .await
+        .unwrap();
+        assert_eq!(listed.resources.len(), 1);
+        assert!(listed.resource_templates.is_empty());
+    }
+
+    #[test]
+    fn a_reply_of_too_many_values_is_refused_before_it_is_parsed() {
+        // Each `{"a":1}` is 3 values in 8 bytes, and hundreds of bytes
+        // once parsed.
+        let tools = vec![r#"{"a":1}"#; MAX_VALUES / 2].join(",");
+        let reply = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{tools}]}}}}"#);
+        assert!(matches!(
+            read_reply("tools/list", reply.as_bytes()),
+            Err(ProxyError::TooLong { .. })
+        ));
+        // What's inside a string is one value, however it looks.
+        let text = "[{,:\\\"".repeat(MAX_VALUES);
+        let reply = json!({"jsonrpc": "2.0", "id": 1, "result": {"text": text}}).to_string();
+        let message = read_reply("tools/list", reply.as_bytes()).unwrap().unwrap();
+        assert_eq!(result_of("tools/list", message).unwrap()["text"], text);
+        assert_eq!(most_values(br#"["a\"[,", {"b": [1, 2]}]"#), 7);
+        assert!(read_reply("tools/list", b"not json").unwrap().is_none());
     }
 }

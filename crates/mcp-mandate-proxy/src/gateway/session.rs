@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mcp_mandate_gate::{Gate, SharedTaint};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, watch};
 
 use super::identity::Caller;
 
@@ -18,6 +18,10 @@ const MAX_SESSIONS_PER_CALLER: usize = 32;
 /// Most requests in flight at once per session. A request answered with a
 /// stream counts until the stream ends.
 const MAX_REQUESTS_PER_SESSION: usize = 16;
+/// Most of the client's messages arriving at once per session, and of its
+/// answers and notifications being passed on: those don't count as
+/// requests, so a client can always answer or cancel what's in flight.
+const MAX_MESSAGES_PER_SESSION: usize = 16;
 /// Most server streams (GET) open at once per session.
 const MAX_STREAMS_PER_SESSION: usize = 4;
 /// Most answers to the server's own requests being sent at once per
@@ -36,10 +40,27 @@ pub struct Session {
     /// Set once the session is closed: nothing passes through it after.
     closed: watch::Sender<bool>,
     /// A check panicked, so the gate may be half-updated.
-    broken: AtomicBool,
+    broken: Arc<AtomicBool>,
     requests: Arc<Semaphore>,
+    messages: Arc<Semaphore>,
     streams: Arc<Semaphore>,
     answers: Arc<Semaphore>,
+}
+
+/// The gate while a check runs. If the check panics, the session is marked
+/// broken before the gate is let go, whether or not anyone still awaits
+/// the check: the next check mustn't run on a half-updated gate.
+struct Checking {
+    gate: OwnedMutexGuard<Gate>,
+    broken: Arc<AtomicBool>,
+}
+
+impl Drop for Checking {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.broken.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Session {
@@ -52,8 +73,9 @@ impl Session {
             upstream_id: Mutex::new(None),
             last_used: Mutex::new(Instant::now()),
             closed: watch::Sender::new(false),
-            broken: AtomicBool::new(false),
+            broken: Arc::default(),
             requests: Arc::new(Semaphore::new(MAX_REQUESTS_PER_SESSION)),
+            messages: Arc::new(Semaphore::new(MAX_MESSAGES_PER_SESSION)),
             streams: Arc::new(Semaphore::new(MAX_STREAMS_PER_SESSION)),
             answers: Arc::new(Semaphore::new(MAX_ANSWERS_PER_SESSION)),
         }
@@ -70,13 +92,21 @@ impl Session {
         if self.unusable() {
             return None;
         }
-        let mut gate = Arc::clone(&self.gate).lock_owned().await;
+        let gate = Arc::clone(&self.gate).lock_owned().await;
         // Closed while waiting its turn: its end is recorded, so nothing
         // more is.
         if self.unusable() {
             return None;
         }
-        match tokio::task::spawn_blocking(move || check(&mut gate)).await {
+        let checking = Checking {
+            gate,
+            broken: Arc::clone(&self.broken),
+        };
+        let checked = tokio::task::spawn_blocking(move || {
+            let mut checking = checking;
+            check(&mut checking.gate)
+        });
+        match checked.await {
             Ok(result) => Some(result),
             Err(_) => {
                 self.broken.store(true, Ordering::SeqCst);
@@ -115,15 +145,29 @@ impl Session {
         Arc::clone(&self.requests).try_acquire_owned().ok()
     }
 
+    /// Whether any request is in flight.
+    fn busy(&self) -> bool {
+        self.requests.available_permits() < MAX_REQUESTS_PER_SESSION
+    }
+
+    /// Counts a client message arriving, or an answer or notification of
+    /// the client's being passed on; `None` when the session has too many.
+    pub fn start_message(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.messages).try_acquire_owned().ok()
+    }
+
     /// Counts a new server stream; `None` when the session has too many.
     pub fn open_stream(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.streams).try_acquire_owned().ok()
     }
 
-    /// Counts an answer being sent to the server; `None` when the session
-    /// has too many.
-    pub fn start_answer(&self) -> Option<OwnedSemaphorePermit> {
-        Arc::clone(&self.answers).try_acquire_owned().ok()
+    /// Counts an answer being sent to the server, once fewer than the most
+    /// allowed are: until then, it waits.
+    pub async fn start_answer(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.answers)
+            .acquire_owned()
+            .await
+            .expect("the session's semaphores are never closed")
     }
 
     pub fn upstream_id(&self) -> Option<String> {
@@ -185,14 +229,16 @@ impl Sessions {
         self.map.lock().ok()?.remove(id)
     }
 
-    /// Removes and returns sessions idle for longer than `idle`.
+    /// Removes and returns sessions idle for longer than `idle`. A session
+    /// with a request in flight isn't idle, however quiet its stream: a
+    /// long call is still under way.
     pub fn sweep(&self, idle: Duration) -> Vec<Arc<Session>> {
         let Ok(mut map) = self.map.lock() else {
             return Vec::new();
         };
         let stale: Vec<String> = map
             .iter()
-            .filter(|(_, session)| session.idle_for() > idle)
+            .filter(|(_, session)| session.idle_for() > idle && !session.busy())
             .map(|(id, _)| id.clone())
             .collect();
         stale.iter().filter_map(|id| map.remove(id)).collect()
@@ -323,12 +369,12 @@ mod tests {
     type Start = fn(&Session) -> Option<OwnedSemaphorePermit>;
 
     #[test]
-    fn a_session_has_limits_on_streams_requests_and_answers() {
+    fn a_session_has_limits_on_streams_requests_and_messages() {
         let session = session("alice");
         let limits: [(Start, usize); 3] = [
             (Session::open_stream, MAX_STREAMS_PER_SESSION),
             (Session::start_request, MAX_REQUESTS_PER_SESSION),
-            (Session::start_answer, MAX_ANSWERS_PER_SESSION),
+            (Session::start_message, MAX_MESSAGES_PER_SESSION),
         ];
         for (start, limit) in limits {
             let open: Vec<OwnedSemaphorePermit> =
@@ -337,6 +383,26 @@ mod tests {
             drop(open);
             assert!(start(&session).is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn an_answer_beyond_the_limit_waits_for_one_to_be_sent() {
+        let session = session("alice");
+        let mut sending = Vec::new();
+        for _ in 0..MAX_ANSWERS_PER_SESSION {
+            sending.push(session.start_answer().await);
+        }
+        let short = Duration::from_millis(50);
+        assert!(
+            tokio::time::timeout(short, session.start_answer())
+                .await
+                .is_err(),
+            "waits while the most are being sent"
+        );
+        sending.pop();
+        let _sending = tokio::time::timeout(Duration::from_secs(5), session.start_answer())
+            .await
+            .expect("goes once one is sent");
     }
 
     #[tokio::test]
@@ -364,6 +430,36 @@ mod tests {
         let session = session("alice");
         assert_eq!(session.check(|_| panic!("a bug")).await, None::<()>);
         assert_eq!(session.check(|gate| gate.taint()).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_check_that_panics_after_its_caller_left_still_leaves_the_session_unusable() {
+        let session = session("alice");
+        let (started, has_started) = std::sync::mpsc::channel();
+        let check = session.check(move |_| {
+            let _ = started.send(());
+            std::thread::sleep(Duration::from_millis(100));
+            panic!("a bug");
+        });
+        // The caller leaves once the check is under way, so nobody hears of
+        // the panic.
+        tokio::select! {
+            _ = check => panic!("the check was meant to panic"),
+            _ = tokio::task::spawn_blocking(move || has_started.recv()) => {}
+        }
+        assert_eq!(session.check(|gate| gate.taint()).await, None);
+    }
+
+    #[test]
+    fn a_session_with_a_request_in_flight_isnt_idle() {
+        let sessions = Sessions::default();
+        let calling = session("alice");
+        sessions.insert(Arc::clone(&calling)).unwrap();
+        let call = calling.start_request().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(sessions.sweep(Duration::from_millis(10)).is_empty());
+        drop(call);
+        assert_eq!(sessions.sweep(Duration::from_millis(10)).len(), 1);
     }
 
     #[test]

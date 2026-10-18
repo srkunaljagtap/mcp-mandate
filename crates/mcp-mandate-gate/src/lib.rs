@@ -95,7 +95,9 @@ impl From<String> for Refusal {
 /// content through one server holds sending through all of them (each
 /// server normally has its own gate).
 pub trait SharedTaint: Send + Sync {
-    /// What tainted the agent's sessions, if anything has.
+    /// What tainted the agent's sessions, if anything has. A tainted gate
+    /// asks before every message, and sets it again if it finds nothing,
+    /// so a record that went missing comes back.
     fn get(&self) -> Option<String>;
     /// Records that `source` tainted them.
     fn set(&self, source: &str);
@@ -292,6 +294,7 @@ impl Gate {
 
     /// Decides what happens to one message from the client, and records it.
     pub fn from_client(&mut self, frame: &[u8]) -> Vec<Action> {
+        self.keep_taint_shared();
         let message = classify(frame);
         self.begin(Origin::Client, frame, &message);
         let actions = match message {
@@ -388,6 +391,7 @@ impl Gate {
 
     /// Decides what happens to one message from the server, and records it.
     pub fn from_server(&mut self, frame: &[u8]) -> Vec<Action> {
+        self.keep_taint_shared();
         let message = classify(frame);
         self.begin(Origin::Server, frame, &message);
         let actions = match message {
@@ -949,6 +953,17 @@ impl Gate {
             vec![Action::ToClient(encode(&message))]
         } else {
             to_client(frame)
+        }
+    }
+
+    /// Puts this session's taint back where the agent's other gates read
+    /// it, if something removed it meanwhile (a cleaner of temporary files,
+    /// say): they read only that, and this session stays tainted.
+    fn keep_taint_shared(&self) {
+        if let (Some(source), Some(shared)) = (&self.session.taint, &self.shared_taint)
+            && shared.get().is_none()
+        {
+            shared.set(source);
         }
     }
 

@@ -25,6 +25,21 @@ const MAX_METHOD_BYTES: usize = 256;
 /// text or a base64 image is one value.
 const MAX_VALUES: usize = 1_000_000;
 
+/// What reading a message in full costs in memory, beyond its text, as
+/// serde_json lays it out. Every value and key takes a 32-byte slot (twice
+/// that, counting the room a growing array keeps), and a non-empty string,
+/// array or object takes an allocation of its own besides: an object's is
+/// a tree node with room for eleven members, so `[{"":0},…]` costs about
+/// a hundred times its size.
+const VALUE_COST: usize = 64;
+const STRING_COST: usize = 32;
+const ARRAY_COST: usize = 128;
+const OBJECT_COST: usize = 640;
+
+/// The most a message may cost: about 64 MB, as much as [`MAX_VALUES`]
+/// numbers do.
+const MAX_COST: usize = MAX_VALUES * VALUE_COST;
+
 /// What a message is, as far as routing and checking are concerned.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -73,7 +88,10 @@ pub enum ParseError {
     Json(#[from] serde_json::Error),
     #[error("not a JSON-RPC 2.0 message: {0}")]
     NotJsonRpc(&'static str),
-    #[error("too large to check: more than {max} values", max = MAX_VALUES)]
+    #[error(
+        "too large to check: reading it would take more memory than {max} values do",
+        max = MAX_VALUES
+    )]
     TooManyValues,
 }
 
@@ -89,7 +107,10 @@ pub enum ParseError {
 /// - a request whose id is null, or isn't a short string or an integer;
 /// - a notification not named `notifications/…`: a request sent without an
 ///   id would otherwise skip every check, and some servers run it anyway;
-/// - a method name over 256 bytes, or more than 1,000,000 values in all.
+/// - a method name over 256 bytes;
+/// - a message that would take more memory to read in full than 1,000,000
+///   values do (fewer when they are small objects, arrays or strings,
+///   which take more each).
 pub fn classify(frame: &[u8]) -> Result<Message, ParseError> {
     let body = trim_json_whitespace(frame);
     if body.is_empty() {
@@ -128,16 +149,17 @@ fn trim_json_whitespace(mut frame: &[u8]) -> &[u8] {
     frame
 }
 
-/// Reads the whole message, refusing a repeated key or too many values.
+/// Reads the whole message, refusing a repeated key or one that would cost
+/// too much to read in full.
 fn check_values(body: &[u8]) -> Result<(), ParseError> {
-    let count = Cell::new(0);
+    let cost = Cell::new(0);
     let mut deserializer = serde_json::Deserializer::from_slice(body);
-    let checked = NoDuplicates { count: &count }
+    let checked = NoDuplicates { cost: &cost }
         .deserialize(&mut deserializer)
         .and_then(|()| deserializer.end());
     match checked {
         Ok(()) => Ok(()),
-        Err(_) if count.get() > MAX_VALUES => Err(ParseError::TooManyValues),
+        Err(_) if cost.get() > MAX_COST => Err(ParseError::TooManyValues),
         Err(error) => Err(error.into()),
     }
 }
@@ -273,20 +295,20 @@ impl<'de> Visitor<'de> for ErrorObject {
 
 /// Reads a whole JSON document only to fail on an object with a repeated
 /// key (compared after unescaping, so `"name"` repeats `"name"`), or on
-/// more than [`MAX_VALUES`] values and keys in all.
+/// one that would cost more than [`MAX_COST`] to read in full.
 #[derive(Clone, Copy)]
 struct NoDuplicates<'a> {
-    /// Values and keys read so far, in the whole document.
-    count: &'a Cell<usize>,
+    /// What the document read so far would cost.
+    cost: &'a Cell<usize>,
 }
 
 impl NoDuplicates<'_> {
-    /// Counts one more value or key.
-    fn tally<E: de::Error>(self) -> Result<(), E> {
-        let count = self.count.get() + 1;
-        self.count.set(count);
-        if count > MAX_VALUES {
-            Err(E::custom("too many values"))
+    /// Adds `cost` to the document's.
+    fn charge<E: de::Error>(self, cost: usize) -> Result<(), E> {
+        let total = self.cost.get().saturating_add(cost);
+        self.cost.set(total);
+        if total > MAX_COST {
+            Err(E::custom("too large to check"))
         } else {
             Ok(())
         }
@@ -297,7 +319,7 @@ impl<'de> DeserializeSeed<'de> for NoDuplicates<'_> {
     type Value = ();
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        self.tally()?;
+        self.charge(VALUE_COST)?;
         deserializer.deserialize_any(self)
     }
 }
@@ -325,8 +347,12 @@ impl<'de> Visitor<'de> for NoDuplicates<'_> {
         Ok(())
     }
 
-    fn visit_str<E>(self, _: &str) -> Result<(), E> {
-        Ok(())
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<(), E> {
+        if text.is_empty() {
+            Ok(())
+        } else {
+            self.charge(STRING_COST)
+        }
     }
 
     fn visit_unit<E>(self) -> Result<(), E> {
@@ -334,14 +360,24 @@ impl<'de> Visitor<'de> for NoDuplicates<'_> {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        while seq.next_element_seed(self)?.is_some() {}
+        if seq.next_element_seed(self)?.is_some() {
+            self.charge(ARRAY_COST)?;
+            while seq.next_element_seed(self)?.is_some() {}
+        }
         Ok(())
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         let mut seen = HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
-            self.tally()?;
+            let mut cost = VALUE_COST;
+            if !key.is_empty() {
+                cost += STRING_COST;
+            }
+            if seen.is_empty() {
+                cost += OBJECT_COST;
+            }
+            self.charge(cost)?;
             if !seen.insert(key) {
                 return Err(de::Error::custom("an object repeats a key"));
             }
@@ -496,20 +532,23 @@ mod tests {
         assert!(classify(named(&"x".repeat(257)).as_bytes()).is_err());
     }
 
+    /// A tool call whose arguments are `items` copies of `item`.
+    fn call_with(item: &str, items: usize) -> String {
+        let mut text = String::from(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":["#,
+        );
+        text.push_str(&vec![item; items].join(","));
+        text.push_str("]}}");
+        text
+    }
+
     #[test]
     fn refuses_more_values_than_any_real_message_holds() {
-        // 13 values and keys, plus the arguments' items.
-        let call = |items: usize| {
-            let mut text = String::from(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":["#,
-            );
-            text.push_str(&vec!["0"; items].join(","));
-            text.push_str("]}}");
-            text
-        };
-        assert!(classify(call(MAX_VALUES - 13).as_bytes()).is_ok());
+        // The envelope, with its objects, keys and strings, costs as much
+        // as 39.5 numbers.
+        assert!(classify(call_with("0", MAX_VALUES - 40).as_bytes()).is_ok());
         assert!(matches!(
-            classify(call(MAX_VALUES - 12).as_bytes()),
+            classify(call_with("0", MAX_VALUES - 39).as_bytes()),
             Err(ParseError::TooManyValues)
         ));
         // Long text is one value.
@@ -518,6 +557,24 @@ mod tests {
             "a".repeat(4 * 1024 * 1024)
         );
         assert!(classify(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn counts_small_objects_by_the_memory_they_take() {
+        // 13 values and keys in the envelope, three in each object: a
+        // million in all, but each object takes a whole tree node once
+        // read, so this 2.3 MB message would take over 200 MB.
+        let objects = (MAX_VALUES - 13) / 3;
+        assert!(matches!(
+            classify(call_with(r#"{"":0}"#, objects).as_bytes()),
+            Err(ParseError::TooManyValues)
+        ));
+        // A large result with many small objects still passes.
+        let rows = vec![r#"{"id":1,"name":"x"}"#; 40_000].join(",");
+        let result = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"structuredContent":{{"rows":[{rows}]}}}}}}"#
+        );
+        assert!(classify(result.as_bytes()).is_ok());
     }
 
     #[test]

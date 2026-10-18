@@ -1,11 +1,11 @@
 //! Appending entries to the log file.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -17,6 +17,10 @@ pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// How much of the end of the log is read first to find its last entry;
 /// more is read only if that entry is longer.
 const TAIL_BYTES: u64 = 8 * 1024;
+/// How long a write waits for another process to let go of the log's lock.
+/// Writers hold it only for a moment, so a longer wait means something is
+/// stuck or holding it on purpose: the write fails rather than hang.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// Somewhere decisions are recorded.
 pub trait Recorder: Send {
@@ -205,7 +209,7 @@ impl LogFile {
             stopped: None,
             tail: Vec::new(),
         };
-        log.file.lock().map_err(open_error)?;
+        lock(&log.file).map_err(open_error)?;
         let caught_up = log.catch_up();
         let unlocked = log.file.unlock().map_err(open_error);
         caught_up?;
@@ -214,9 +218,7 @@ impl LogFile {
     }
 
     fn record(&mut self, session: &str, event: &Event) -> Result<(), AuditError> {
-        self.file
-            .lock()
-            .map_err(|source| self.write_error(source))?;
+        lock(&self.file).map_err(|source| self.write_error(source))?;
         let appended = self.append(session, event);
         let unlocked = self
             .file
@@ -348,6 +350,30 @@ impl LogFile {
         AuditError::Write {
             path: self.path.clone(),
             source,
+        }
+    }
+}
+
+/// Takes the exclusive lock on `file`, waiting up to [`LOCK_WAIT`] for
+/// another process to let go of it.
+fn lock(file: &File) -> std::io::Result<()> {
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::Error(error)) => return Err(error),
+            Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "another process has kept it locked for over {} seconds",
+                        LOCK_WAIT.as_secs()
+                    ),
+                ));
+            }
         }
     }
 }
@@ -548,6 +574,16 @@ pub(crate) mod tests {
             log.record(&message(Verdict::Allow)).is_err(),
             "it stays stopped"
         );
+
+        // It stays stopped once the log grows past where it was, too: it
+        // would otherwise carry on as if nothing had been removed.
+        let mut restarted = Log::open(&path).unwrap();
+        for _ in 0..3 {
+            restarted.record(&message(Verdict::Allow)).unwrap();
+        }
+        let error = log.record(&message(Verdict::Allow)).unwrap_err();
+        assert!(matches!(error, AuditError::Shrank { .. }), "{error}");
+        assert_eq!(verify(&path, None).unwrap().entries, 4);
     }
 
     #[test]
@@ -561,11 +597,51 @@ pub(crate) mod tests {
         assert!(matches!(error, AuditError::Replaced { .. }), "{error}");
 
         // A new file at the path (a rotated log, say) isn't taken up until
-        // a restart, so entries can't vanish unnoticed.
-        std::fs::write(&path, b"").unwrap();
-        assert!(log.record(&message(Verdict::Allow)).is_err());
+        // a restart, so entries can't vanish unnoticed. (Where a deleted
+        // file keeps its name until it's closed, none can be made yet.)
+        if std::fs::write(&path, b"").is_ok() {
+            let error = log.record(&message(Verdict::Allow)).unwrap_err();
+            assert!(matches!(error, AuditError::Replaced { .. }), "{error}");
+        }
+        drop(log);
         let mut restarted = Log::open(&path).unwrap();
         restarted.record(&message(Verdict::Allow)).unwrap();
+        assert_eq!(verify(&path, None).unwrap().entries, 1);
+    }
+
+    /// Runs `work` on another thread, failing if it takes much longer than
+    /// [`LOCK_WAIT`].
+    fn without_hanging<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(work()));
+        receiver
+            .recv_timeout(LOCK_WAIT * 10)
+            .expect("it waited for the lock instead of failing")
+    }
+
+    #[test]
+    fn fails_rather_than_wait_on_a_lock_held_elsewhere() {
+        let path = temp_dir("held").join("audit.jsonl");
+        let log = Log::open(&path).unwrap();
+        let holder = File::open(&path).unwrap();
+        holder.lock().unwrap();
+
+        let (mut log, recorded) = without_hanging(move || {
+            let mut log = log;
+            let recorded = log.record(&message(Verdict::Allow));
+            (log, recorded)
+        });
+        let error = recorded.unwrap_err();
+        assert!(matches!(error, AuditError::Write { .. }), "{error}");
+        let opened = without_hanging({
+            let path = path.clone();
+            move || Log::open(&path).map(drop)
+        });
+        assert!(matches!(opened, Err(AuditError::Open { .. })));
+
+        // Writing carries on once it's let go.
+        holder.unlock().unwrap();
+        log.record(&message(Verdict::Allow)).unwrap();
         assert_eq!(verify(&path, None).unwrap().entries, 1);
     }
 

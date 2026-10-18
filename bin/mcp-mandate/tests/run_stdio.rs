@@ -91,6 +91,33 @@ fn reports_a_server_that_cannot_be_found() {
 }
 
 #[test]
+fn never_logs_a_token_in_the_servers_package() {
+    let policy = empty_policy("package-token");
+    let done = run(
+        &[
+            "run",
+            "--policy",
+            &policy,
+            "--",
+            "mcp-mandate-test-no-such-folder/npx",
+            "-y",
+            "git+https://oauth2:T0ken5ecret@gitlab.example/org/server.git",
+        ],
+        &[],
+        b"",
+    );
+
+    assert!(
+        done.stderr
+            .contains("git+https://***@gitlab.example/org/server.git"),
+        "{}",
+        done.stderr
+    );
+    assert!(done.stderr.contains("no pinned version"), "{}", done.stderr);
+    assert!(!done.stderr.contains("T0ken5ecret"), "{}", done.stderr);
+}
+
+#[test]
 fn requires_a_policy() {
     let done = run(&["run", "--", "cat"], &[], PING);
 

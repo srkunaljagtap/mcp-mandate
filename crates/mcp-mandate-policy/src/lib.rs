@@ -33,7 +33,8 @@
 //! A rule's `match` is a glob on the whole tool name (`*`, `?`, `[abc]`,
 //! `{a,b}`), case-sensitive. It means the same on every platform: `\` makes
 //! the next character literal (`run\*` matches only `run*`), and `/` and `\`
-//! in a name are ordinary characters.
+//! in a name are ordinary characters. A `**` right before or after a `\`
+//! is refused: globset would read that `\` as a path separator on Windows.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,12 @@ use serde_json::Value;
 
 /// Default cap on a tool call's arguments, as JSON.
 pub const DEFAULT_MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+
+/// The shortest text, in bytes, a custom secret pattern must need to match.
+/// No real secret is shorter, and a pattern that matches less (`token|`,
+/// `[a-z]*`, `[A-Za-z0-9]` without its count) would match ordinary text
+/// everywhere: every call blocked, every message filled with markers.
+const MIN_SECRET_PATTERN_BYTES: usize = 5;
 
 /// Characters that let a string run extra shell commands.
 const SHELL_METACHARACTERS: &[char] = &[
@@ -289,6 +296,10 @@ pub enum PolicyError {
         #[source]
         source: regex::Error,
     },
+    #[error(
+        "tool pattern `{pattern}` has `**` next to `\\`, which would match other tools on Windows (where it reads `\\` as a path separator); write `*` there instead"
+    )]
+    PatternDependsOnPlatform { pattern: String },
     #[error("secret pattern `{name}` isn't a valid regular expression")]
     SecretPattern {
         name: String,
@@ -296,9 +307,10 @@ pub enum PolicyError {
         source: regex::Error,
     },
     #[error(
-        "secret pattern `{name}` can match empty text, so it would match everywhere (every call blocked, every message filled with redaction markers)"
+        "secret pattern `{name}` can match as little as {shortest} bytes of text (it must need at least {min}), so it would match ordinary text everywhere (every call blocked, every message filled with redaction markers)",
+        min = MIN_SECRET_PATTERN_BYTES
     )]
-    SecretPatternMatchesEmpty { name: String },
+    SecretPatternTooShort { name: String, shortest: usize },
 }
 
 /// What the policy says about one tool.
@@ -389,8 +401,13 @@ impl Policy {
                         source,
                     }
                 })?;
-                if matches_empty(&regex) {
-                    return Err(PolicyError::SecretPatternMatchesEmpty { name: pattern.name });
+                if let Some(shortest) = shortest_match(&pattern.regex)
+                    && shortest < MIN_SECRET_PATTERN_BYTES
+                {
+                    return Err(PolicyError::SecretPatternTooShort {
+                        name: pattern.name,
+                        shortest,
+                    });
                 }
                 Ok((pattern.name, regex))
             })
@@ -492,6 +509,11 @@ fn tool_matcher(pattern: &str) -> Result<regex::bytes::Regex, PolicyError> {
             pattern: pattern.to_owned(),
             source,
         })?;
+    if double_star_next_to_backslash(pattern) {
+        return Err(PolicyError::PatternDependsOnPlatform {
+            pattern: pattern.to_owned(),
+        });
+    }
     // As globset compiles it: `*` and `?` match newlines too.
     regex::bytes::RegexBuilder::new(glob.regex())
         .dot_matches_new_line(true)
@@ -502,13 +524,51 @@ fn tool_matcher(pattern: &str) -> Result<regex::bytes::Regex, PolicyError> {
         })
 }
 
-/// Whether `regex` can match empty text (as `token|`, `[a-z]*` or `\b`
-/// do), tried on empty text and on text with word and line boundaries.
-/// Such a pattern would match everywhere.
-fn matches_empty(regex: &regex::Regex) -> bool {
-    ["", " ", "a", "a b", "a1_-. é\n\r\nz"]
-        .iter()
-        .any(|text| regex.find_iter(text).any(|found| found.is_empty()))
+/// Whether a glob globset accepted has a `**` right after a `\` (an escaped
+/// one, `\\**`) or right before one (`**\*`). Only there does globset ask
+/// the platform: it reads `\` as a path separator on Windows, so the glob
+/// would mean something else there.
+fn double_star_next_to_backslash(glob: &str) -> bool {
+    let mut chars = glob.chars().peekable();
+    // The character before the current one, as globset sees it.
+    let mut previous = None;
+    while let Some(c) = chars.next() {
+        match c {
+            // The escaped character is what comes before what follows.
+            '\\' => previous = chars.next(),
+            // A class: its characters are literal, `*` and `\` included,
+            // and a `]` right after the opening (or `!`, `^`) is one of them.
+            '[' => {
+                let _ = chars.next_if(|&c| c == '!' || c == '^');
+                let _ = chars.next_if_eq(&']');
+                for c in chars.by_ref() {
+                    if c == ']' {
+                        break;
+                    }
+                }
+                previous = Some(']');
+            }
+            '*' if chars.next_if_eq(&'*').is_some() => {
+                if previous == Some('\\') || chars.peek() == Some(&'\\') {
+                    return true;
+                }
+                previous = Some('*');
+            }
+            c => previous = Some(c),
+        }
+    }
+    false
+}
+
+/// The length, in bytes, of the shortest text `pattern` can match (`None`
+/// when it can match nothing at all). Empty text counts: `token|`, `[a-z]*`
+/// and `\b` can match it.
+fn shortest_match(pattern: &str) -> Option<usize> {
+    match regex_syntax::parse(pattern) {
+        Ok(hir) => hir.properties().minimum_len(),
+        // The regex crate parses with this same parser, and accepted it.
+        Err(_) => Some(0),
+    }
 }
 
 /// The first shell metacharacter in any string inside `value`.
@@ -599,6 +659,14 @@ mod tests {
         assert!(matches!(broken, Err(PolicyError::SecretPattern { .. })));
     }
 
+    fn secret_pattern(regex: &str) -> Result<Policy, PolicyError> {
+        let text = format!(
+            "[[secrets.patterns]]\nname = \"typo\"\nregex = {}\n",
+            toml::Value::String(regex.to_owned())
+        );
+        Policy::parse(&text, Path::new("."))
+    }
+
     #[test]
     fn rejects_secret_patterns_that_match_empty_text() {
         for regex in [
@@ -610,17 +678,41 @@ mod tests {
             r"\b[a-z]*\b",
             "(?m)^",
         ] {
-            let text = format!(
-                "[[secrets.patterns]]\nname = \"typo\"\nregex = {}\n",
-                toml::Value::String(regex.to_owned())
-            );
             assert!(
                 matches!(
-                    Policy::parse(&text, Path::new(".")),
-                    Err(PolicyError::SecretPatternMatchesEmpty { .. })
+                    secret_pattern(regex),
+                    Err(PolicyError::SecretPatternTooShort { shortest: 0, .. })
                 ),
                 "accepted {regex}"
             );
+        }
+    }
+
+    #[test]
+    fn rejects_secret_patterns_that_match_very_short_text() {
+        // A count forgotten, or a single character: a marker would replace
+        // every letter of every message.
+        for regex in [
+            "[A-Za-z0-9]",
+            "[a-z]",
+            "x",
+            r"\w",
+            r"(?i)k",
+            "ab12",
+            r"\d{4}",
+            r"\bpin\b",
+            "é",
+        ] {
+            assert!(
+                matches!(
+                    secret_pattern(regex),
+                    Err(PolicyError::SecretPatternTooShort { .. })
+                ),
+                "accepted {regex}"
+            );
+        }
+        for regex in [r"\d{6}", "itk_[a-z0-9]{32}", "[A-Za-z0-9]{40}", "[^\\s\\S]"] {
+            assert!(secret_pattern(regex).is_ok(), "refused {regex}");
         }
     }
 
@@ -646,6 +738,51 @@ mod tests {
         assert_eq!(policy.for_tool("admin/x/y").matched, ["admin/*"]);
         assert!(policy.for_tool(r"admin\x").matched.is_empty());
         assert!(policy.for_tool("echo").matched.is_empty(), "case-sensitive");
+    }
+
+    #[test]
+    fn refuses_a_double_star_next_to_a_backslash() {
+        // On Windows globset reads that `\` as a path separator: `**\*`
+        // would match every tool there, but only names ending in `*`
+        // elsewhere.
+        for pattern in [r"**\*", r"files/**\*", r"a\\**", r"**\a", r"{x,**\*}"] {
+            let text = format!(
+                "[[tools]]\nmatch = {}\naction = \"allow\"\n",
+                toml::Value::String(pattern.to_owned())
+            );
+            assert!(
+                matches!(
+                    Policy::parse(&text, Path::new(".")),
+                    Err(PolicyError::PatternDependsOnPlatform { .. })
+                ),
+                "accepted {pattern}"
+            );
+        }
+        // An escaped star before a star, a class holding `\`, and `**`
+        // away from any `\` mean the same everywhere.
+        let policy = policy(
+            r#"
+            [[tools]]
+            match = 'run\**'
+            action = "allow"
+
+            [[tools]]
+            match = '[\]**'
+            action = "allow"
+
+            [[tools]]
+            match = 'a\\*'
+            action = "allow"
+
+            [[tools]]
+            match = 'x/**'
+            action = "allow"
+            "#,
+        );
+        assert_eq!(policy.for_tool("run*now").matched, [r"run\**"]);
+        assert_eq!(policy.for_tool(r"\tool").matched, [r"[\]**"]);
+        assert_eq!(policy.for_tool(r"a\b").matched, [r"a\\*"]);
+        assert_eq!(policy.for_tool("x/y/z").matched, ["x/**"]);
     }
 
     #[test]
