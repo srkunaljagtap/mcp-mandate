@@ -497,7 +497,11 @@ mod tests {
         );
         let secrets = upstream.credential_strings();
         for secret in ["client-secret", "opaque-token-0", "opaque-token-1"] {
-            assert!(secrets.iter().any(|known| known == secret), "{secrets:?}");
+            // The message names no credential, so a failure can't print one.
+            assert!(
+                secrets.iter().any(|known| known == secret),
+                "a credential form is missing from the credential strings"
+            );
         }
 
         // An expired token is no longer listed.
