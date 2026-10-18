@@ -17,7 +17,8 @@
 //! removes it, and touches it now and then so cleaners of old files leave
 //! it alone.
 //!
-//! The file lives in a folder only this user can use. If that can't be set
+//! The file lives in a folder only this user can use, checked again before
+//! every write, and is never written through a link. If that can't be set
 //! up safely, or the agent can't be identified, each server keeps its own
 //! taint, with a warning.
 
@@ -210,11 +211,12 @@ impl Drop for Keeper {
     }
 }
 
-/// Puts the record back if it's gone or empty, and touches it if it's been
-/// untouched for [`TOUCH`].
+/// Puts the record back if it's gone, empty or not a plain file, and
+/// touches it if it's been untouched for [`TOUCH`].
 fn keep_record(path: &Path, source: &str) -> std::io::Result<()> {
-    let modified = match fs::metadata(path) {
-        Ok(metadata) if metadata.len() > 0 => metadata.modified()?,
+    // Links aren't followed: a record is only ever a file.
+    let modified = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => metadata.modified()?,
         Ok(_) => return write_record(path, source),
         Err(error) if error.kind() == ErrorKind::NotFound => return write_record(path, source),
         Err(error) => return Err(error),
@@ -224,8 +226,7 @@ fn keep_record(path: &Path, source: &str) -> std::io::Result<()> {
         .is_ok_and(|age| age > TOUCH)
     {
         let now = SystemTime::now();
-        File::options()
-            .write(true)
+        no_follow(File::options().write(true))
             .open(path)?
             .set_times(FileTimes::new().set_accessed(now).set_modified(now))?;
     }
@@ -233,13 +234,17 @@ fn keep_record(path: &Path, source: &str) -> std::io::Result<()> {
 }
 
 /// Writes a record aside, then renames it into place, so a reader never
-/// sees half of it. If that fails, makes the folder again (something may
-/// have removed it) and tries once more.
+/// sees half of it. The folder is checked first, and made again if
+/// something removed it: in a shared temporary folder, another user could
+/// have made one in its place. A failed write is tried once more.
 fn write_record(path: &Path, source: &str) -> std::io::Result<()> {
     // Each write gets its own temporary file: a keeper may write while
     // another thread of this process does.
     static WRITES: AtomicUsize = AtomicUsize::new(0);
     let attempt = || {
+        if let Some(folder) = path.parent() {
+            make_private(folder).map_err(std::io::Error::other)?;
+        }
         let temporary = path.with_extension(format!(
             "{}-{}.tmp",
             std::process::id(),
@@ -251,14 +256,7 @@ fn write_record(path: &Path, source: &str) -> std::io::Result<()> {
         }
         written
     };
-    let written = attempt();
-    if written.is_err()
-        && let Some(folder) = path.parent()
-        && make_private(folder).is_ok()
-    {
-        return attempt();
-    }
-    written
+    attempt().or_else(|_| attempt())
 }
 
 /// The process that started this one, as `<pid>-<start time>`.
@@ -401,7 +399,7 @@ fn open_lock(record: &Path) -> std::io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(record.with_extension("lock"))
+    no_follow(&mut options).open(record.with_extension("lock"))
 }
 
 /// A folder only this user can read or write, made if needed.
@@ -516,15 +514,31 @@ fn make_private(folder: &Path) -> Result<(), String> {
     }
 }
 
+/// Writes `text` to a new file at `path` that only this user can read. If
+/// anything is already there, even a link, nothing is written: each
+/// temporary file's name is used once, so something else put it there.
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(text.as_bytes())
+    no_follow(&mut options)
+        .open(path)?
+        .write_all(text.as_bytes())
+}
+
+/// Opens a file without following a link in its place, where the system
+/// allows it.
+fn no_follow(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+    }
+    options
 }
 
 /// Removes what agents that are gone left behind, once untouched for
@@ -574,14 +588,14 @@ fn remove_unless_running(record: &Path) {
 mod tests {
     use super::*;
 
-    /// A folder for one test's records.
+    /// A private folder for one test's records.
     fn folder(test: &str) -> PathBuf {
         let folder = std::env::temp_dir().join(format!(
             "mcp-mandate-agent-taint-{}-{test}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&folder);
-        fs::create_dir_all(&folder).unwrap();
+        make_private(&folder).unwrap();
         folder
     }
 
@@ -697,6 +711,47 @@ mod tests {
         fs::remove_file(&path).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// Something else at a record's or a temporary file's name, such as a
+    /// link to another of this user's files, is never written through.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_is_never_written_through_a_link() {
+        let folder = folder("link");
+        let target = folder.join("target");
+        fs::write(&target, "keep").unwrap();
+        let temporary = folder.join("taint-test.1-0.tmp");
+        std::os::unix::fs::symlink(&target, &temporary).unwrap();
+        assert!(write_private(&temporary, "the output of tool `fetch`").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+
+        // A record that's a link is replaced by a file.
+        let record = folder.join("taint-test");
+        std::os::unix::fs::symlink(&target, &record).unwrap();
+        keep_record(&record, "the output of tool `fetch`").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+        assert!(fs::symlink_metadata(&record).unwrap().is_file());
+        assert_eq!(
+            fs::read_to_string(&record).unwrap(),
+            "the output of tool `fetch`"
+        );
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// The folder is checked before every write: one another user could
+    /// use isn't written to.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_is_written_only_in_a_private_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = folder("open-write");
+        let open = folder.join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(write_record(&open.join("taint-test"), "the output of tool `fetch`").is_err());
+        assert_eq!(fs::read_dir(&open).unwrap().count(), 0);
         let _ = fs::remove_dir_all(&folder);
     }
 

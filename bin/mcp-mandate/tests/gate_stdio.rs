@@ -139,8 +139,8 @@ fn pin_records_what_the_server_offers_and_will_not_overwrite_it_silently() {
     let _ = std::fs::remove_file(&out);
     let out_arg = out.display().to_string();
 
-    // The arguments after the script (which ignores them) hold a password
-    // and a token.
+    // The arguments after the script (which ignores them) hold passwords
+    // and tokens.
     let done = run(
         &[
             "pin",
@@ -153,6 +153,11 @@ fn pin_records_what_the_server_offers_and_will_not_overwrite_it_silently() {
             "postgresql://app:S3cret@db/prod",
             "--header",
             "Authorization:Bearer T0ken5ecret",
+            "srv@git+https://oauth2:T0ken5ecret@gitlab.example/org/srv.git",
+            "--header",
+            "Authorization:",
+            "Bearer",
+            "T0ken5ecret",
         ],
         &envs,
         b"",
@@ -169,8 +174,9 @@ fn pin_records_what_the_server_offers_and_will_not_overwrite_it_silently() {
 
     let pins = Pins::load(&out).unwrap();
     assert!(
-        pins.server
-            .ends_with(" postgresql://***@db/prod --header Authorization:*** ***"),
+        pins.server.ends_with(
+            " postgresql://***@db/prod --header Authorization:*** *** srv@git+https://***@gitlab.example/org/srv.git --header Authorization: *** ***"
+        ),
         "{}",
         pins.server
     );

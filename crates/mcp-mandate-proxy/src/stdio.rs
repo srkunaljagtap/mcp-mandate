@@ -51,12 +51,15 @@ const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// It displays as a label for people, in logs and in the files they keep
 /// (pins, Scout's draft). Arguments can carry passwords and tokens, so
-/// anything that looks like one is masked: a URL's user name, password,
-/// query and fragment, the value of a variable (`NAME=value`), of an option
-/// or header named like a secret (`--api-key`, `Authorization:`), and
-/// anything shaped like a known kind of key. A value can have spaces, so it
-/// is masked up to its closing quote, if it opens one, or else up to the
-/// next option.
+/// anything that looks like one is masked: the user name, password, query
+/// and fragment of every URL, wherever it is in an argument
+/// (`name@git+https://…`), the value of a variable (`NAME=value`), of an
+/// option or header named like a secret (`--api-key`, `Authorization:`),
+/// and anything shaped like a known kind of key. A value can have spaces,
+/// so it is masked up to its closing quote, if it opens one, or else up to
+/// the next option. Split over arguments, it is followed for as many words
+/// as it can have: one after `--api-key`, two (a scheme and a token) after
+/// `Authorization:`.
 #[derive(Debug, Clone)]
 pub struct ServerCommand {
     pub program: OsString,
@@ -84,8 +87,8 @@ impl fmt::Display for ServerCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let secrets = SecretDetector::default();
         write!(f, "{}", self.program.to_string_lossy())?;
-        // Whether this argument is the value of `--api-key` or such.
-        let mut value = false;
+        // How many words of a value such as `--api-key`'s are still to come.
+        let mut value = 0;
         for arg in &self.args {
             let (shown, value_next) = mask(&arg.to_string_lossy(), value, &secrets);
             write!(f, " {shown}")?;
@@ -98,7 +101,7 @@ impl fmt::Display for ServerCommand {
 /// One argument as a [`ServerCommand`] shows it, for a part of a command
 /// shown on its own, such as the package a launcher runs.
 pub fn masked(arg: &str) -> String {
-    mask(arg, false, &SecretDetector::default()).0
+    mask(arg, 0, &SecretDetector::default()).0
 }
 
 /// How far a secret goes on past the word that starts it.
@@ -106,9 +109,10 @@ pub fn masked(arg: &str) -> String {
 enum Run {
     /// It doesn't.
     No,
-    /// Up to the next option, into the next argument too: the value of
-    /// `--api-key` or `Authorization:`.
-    Value,
+    /// Up to the next option: the value of `--api-key` or `Authorization:`.
+    /// It goes on into the next arguments until it has this many more
+    /// words, as a client may pass each word as an argument of its own.
+    Value(usize),
     /// Up to the next option in this argument: the rest of `NAME=value` or
     /// `--password=value`, as a value can have spaces.
     Rest,
@@ -116,17 +120,21 @@ enum Run {
     Quote(char),
 }
 
-/// One argument with anything that may be a secret masked, and whether the
-/// next argument is a secret's value. `value` says whether this one is.
-fn mask(arg: &str, value: bool, secrets: &SecretDetector) -> (String, bool) {
+/// One argument with anything that may be a secret masked, and how many
+/// words of a secret's value the arguments after it still hold. `value` is
+/// how many this one does.
+fn mask(arg: &str, value: usize, secrets: &SecretDetector) -> (String, usize) {
     // Word by word, for scripts passed to a shell (`sh -c "…"`) and values
     // with spaces (`Authorization: Bearer …`).
-    let mut run = if value { Run::Value } else { Run::No };
-    let mut value_next = false;
+    let mut run = if value > 0 {
+        Run::Value(value)
+    } else {
+        Run::No
+    };
     let mut words = Vec::new();
     for raw in arg.split_whitespace() {
         let (open, word, close) = unquote(raw);
-        if matches!(run, Run::Value | Run::Rest) && word.starts_with('-') {
+        if matches!(run, Run::Value(_) | Run::Rest) && word.starts_with('-') {
             run = Run::No;
         }
         let shown = if run == Run::No {
@@ -136,29 +144,34 @@ fn mask(arg: &str, value: bool, secrets: &SecretDetector) -> (String, bool) {
                 Run::Quote(quote) if close.contains(quote) => Run::No,
                 starts => starts,
             };
-            // A name whose value comes next, in the next argument if this
-            // is the last word: `--api-key`, `Authorization:Bearer`.
-            value_next = run == Run::Value;
             shown
         } else {
-            if let Run::Quote(quote) = run
-                && raw.ends_with(quote)
-            {
-                run = Run::No;
-            }
-            value_next = false;
+            run = match run {
+                Run::Quote(quote) if raw.ends_with(quote) => Run::No,
+                Run::Value(left) => Run::Value(left.saturating_sub(1)),
+                run => run,
+            };
             MASK.to_owned()
         };
         words.push(format!("{open}{shown}{close}"));
     }
+    // A value that hasn't all its words yet goes on in the next argument:
+    // `--api-key` `abc123`, `Authorization:` `Bearer` `abc123`.
+    let value_next = match run {
+        Run::Value(left) => left,
+        _ => 0,
+    };
     (words.join(" "), value_next)
 }
 
 /// One word of an argument, with anything that may be a secret masked, and
 /// how far past it a secret it starts goes.
 fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
-    let (shown, run) = if let Some(url) = without_credentials(word) {
-        (url, Run::No)
+    // A URL, wherever it is in the word (`name@git+https://…`), unless it's
+    // in a value masked as such (`DATABASE_URL=postgres://…`).
+    let url = find_url(word).filter(|&(start, _)| start == 0 || assignment(word).is_none());
+    let (shown, run) = if let Some(url) = url {
+        (without_credentials(word, url), Run::No)
     } else if let Some((name, separator, value)) = assignment(word) {
         // A variable's value may be anything; an option's or a header's
         // is a secret when its name says so.
@@ -176,7 +189,7 @@ fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
             (format!("{name}{separator}{open}{value}{close}"), run)
         }
     } else if word.starts_with('-') && secret_name(word) {
-        (word.to_owned(), Run::Value)
+        (word.to_owned(), Run::Value(1))
     } else {
         (word.to_owned(), Run::No)
     };
@@ -189,34 +202,68 @@ fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
 /// How far the masked value of `name` goes past its first word.
 fn secret_run(name: &str, separator: char, value: &str) -> Run {
     match value.chars().next() {
-        // `Authorization:` or `--token=` with the value after a space.
-        None if secret_name(name) => Run::Value,
+        // `Authorization:` with its scheme and token after a space.
+        None if secret_name(name) && separator == ':' => Run::Value(2),
+        // `--token=` with the value after a space.
+        None if secret_name(name) => Run::Value(1),
         None => Run::No,
         Some(quote @ ('"' | '\'')) if value[1..].contains(quote) => Run::No,
         Some(quote @ ('"' | '\'')) => Run::Quote(quote),
         // `Authorization:Bearer` with the token after it.
-        Some(_) if separator == ':' => Run::Value,
+        Some(_) if separator == ':' => Run::Value(1),
         Some(_) => Run::Rest,
     }
 }
 
-/// A URL without its user name and password, query and fragment.
-fn without_credentials(word: &str) -> Option<String> {
-    let (scheme, rest) = word.split_once("://")?;
-    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    if !is_scheme {
-        return None;
+/// Where the first URL in `text` starts, and where its `://` is. A scheme
+/// is a letter and then letters, digits, `+`, `-` or `.`; what comes before
+/// it can be anything, such as a package's name (`name@git+https://…`).
+fn find_url(text: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(found) = text[from..].find("://") {
+        let separator = from + found;
+        // The scheme characters just before `://`, from the first letter.
+        let start = text[..separator]
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            .len();
+        if let Some(letter) = text[start..separator].find(|c: char| c.is_ascii_alphabetic()) {
+            return Some((start + letter, separator));
+        }
+        from = separator + 3;
     }
-    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
-    let host = match authority.rfind('@') {
-        Some(at) => format!("{MASK}@{}", &authority[at + 1..]),
-        None => authority.to_owned(),
-    };
-    let path = &tail[..tail.find(['?', '#']).unwrap_or(tail.len())];
-    Some(format!("{scheme}://{host}{path}"))
+    None
+}
+
+/// `word` with the user name and password, query and fragment of every URL
+/// in it masked. `url` is where the first one is, as [`find_url`] gives it.
+fn without_credentials(word: &str, url: (usize, usize)) -> String {
+    let (start, separator) = url;
+    let mut shown = word[..start].to_owned();
+    let mut scheme = &word[start..separator];
+    let mut rest = &word[separator + 3..];
+    loop {
+        // A URL ends where the next one starts: `kafka://a@h1,kafka://b@h2`.
+        let next = find_url(rest);
+        let url = &rest[..next.map_or(rest.len(), |(start, _)| start)];
+        let (authority, tail) = url.split_at(url.find(['/', '?', '#']).unwrap_or(url.len()));
+        shown.push_str(scheme);
+        shown.push_str("://");
+        match authority.rfind('@') {
+            Some(at) => {
+                shown.push_str(MASK);
+                shown.push_str(&authority[at..]);
+            }
+            None => shown.push_str(authority),
+        }
+        let query = tail.find(['?', '#']);
+        shown.push_str(&tail[..query.unwrap_or(tail.len())]);
+        // Whatever follows a query or fragment is part of it.
+        let (Some((start, separator)), None) = (next, query) else {
+            return shown;
+        };
+        scheme = &rest[start..separator];
+        rest = &rest[separator + 3..];
+    }
 }
 
 /// Splits `--name=value`, `NAME=value` or `Name:value` at the separator
@@ -1043,6 +1090,36 @@ mod tests {
             ),
             masked
         );
+        // As a client that doesn't quote spaces passes
+        // `Authorization: Bearer <token>`: each word its own argument.
+        let masked = "npx mcp-remote https://example.com/sse --header Authorization: *** ***";
+        assert_eq!(
+            shown(
+                "npx",
+                &[
+                    "mcp-remote",
+                    "https://example.com/sse",
+                    "--header",
+                    "Authorization:",
+                    "Bearer",
+                    "abcd1234efgh5678"
+                ]
+            ),
+            masked
+        );
+        assert_eq!(
+            shown(
+                "npx",
+                &[
+                    "mcp-remote",
+                    "https://example.com/sse",
+                    "--header",
+                    "Authorization: Bearer",
+                    "abcd1234efgh5678"
+                ]
+            ),
+            masked
+        );
         assert_eq!(
             shown(
                 "npx",
@@ -1053,6 +1130,29 @@ mod tests {
                 ]
             ),
             "npx mcp-remote --header=Authorization: *** *** https://example.com/sse"
+        );
+        // The value ends once it has a scheme and a token, or at an option.
+        assert_eq!(
+            shown(
+                "npx",
+                &[
+                    "mcp-remote",
+                    "--header=Authorization:",
+                    "Bearer",
+                    "abcd1234efgh5678",
+                    "https://example.com/sse"
+                ]
+            ),
+            "npx mcp-remote --header=Authorization: *** *** https://example.com/sse"
+        );
+        assert_eq!(
+            shown("server", &["--header", "Authorization:", "--port", "1"]),
+            "server --header Authorization: --port 1"
+        );
+        // An option's value is one argument.
+        assert_eq!(
+            shown("server", &["--api-key", "abc123", "/srv"]),
+            "server --api-key *** /srv"
         );
         assert_eq!(
             shown("server", &["--header", "X-Api-Key:abcd1234efgh5678"]),
@@ -1072,5 +1172,43 @@ mod tests {
             "git+https://***@gitlab.com/org/server.git"
         );
         assert_eq!(masked("some-server@latest"), "some-server@latest");
+        // A URL after a package's name: npm's `name@url`, PEP 508 without
+        // spaces.
+        assert_eq!(
+            masked("srv@git+https://user:tok@host/r.git"),
+            "srv@git+https://***@host/r.git"
+        );
+        assert_eq!(
+            masked("@scope/pkg@https://u:p@host/p.tgz?sig=abc123"),
+            "@scope/pkg@https://***@host/p.tgz"
+        );
+        assert_eq!(
+            shown(
+                "uvx",
+                &["--from", "srv@git+https://u:Tok3n@github.com/o/r", "srv"]
+            ),
+            "uvx --from srv@git+https://***@github.com/o/r srv"
+        );
+        // Every URL in a word.
+        assert_eq!(
+            masked("kafka://a:S3cret@h1,kafka://b:S3cret@h2/topic"),
+            "kafka://***@h1,kafka://***@h2/topic"
+        );
+        assert_eq!(
+            masked("https://host/go/https://u:S3cret@h2/x"),
+            "https://host/go/https://***@h2/x"
+        );
+        // One in a query is part of the query.
+        assert_eq!(
+            masked("https://host/login?next=https://u:S3cret@h2/"),
+            "https://host/login"
+        );
+        // A variable's value is masked whole, URL or not.
+        assert_eq!(
+            masked("DATABASE_URL=postgres://u:S3cret@db/prod"),
+            "DATABASE_URL=***"
+        );
+        // Not a URL: `://` with no scheme before it.
+        assert_eq!(masked("a@://b"), "a@://b");
     }
 }
