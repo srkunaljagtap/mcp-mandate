@@ -477,8 +477,16 @@ mod tests {
             "github_pat_11ABCDEFG0123456789_abcdefghijklmnop",
         ),
         ("slack-token", "xoxb-1234567890-abcdefghij"),
-        ("google-api-key", "AIzaSyA-abcdefghijklmnopqrstuvwxyz01234"),
-        ("stripe-key", "sk_live_abcdefghijklmnopqrstuvwx"),
+        // Built from pieces, so secret scanners reading this file don't
+        // take these fake keys for real ones.
+        (
+            "google-api-key",
+            concat!("AIza", "SyA-abcdefghijklmnopqrstuvwxyz01234"),
+        ),
+        (
+            "stripe-key",
+            concat!("sk_", "live_abcdefghijklmnopqrstuvwx"),
+        ),
         (
             "jwt",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",
