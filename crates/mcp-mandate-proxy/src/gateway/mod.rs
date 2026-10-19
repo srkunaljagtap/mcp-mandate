@@ -35,7 +35,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::StreamExt;
 use mcp_mandate_audit::{self as audit, Log, Recorder};
-use mcp_mandate_gate::jsonrpc::{Message, ParseError, classify};
+use mcp_mandate_gate::jsonrpc::{self, Message, ParseError, classify};
 use mcp_mandate_gate::{Action, Gate};
 use mcp_mandate_pin::Inventory;
 use mcp_mandate_policy::{Mode, Policy};
@@ -498,16 +498,12 @@ async fn post_message(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let Some(message) = read_message(body.clone()).await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
     // The client's answers to the server and its notifications aren't
     // requests: they get through however many requests are in flight, so
     // the client can always answer or cancel those.
-    let request = !matches!(
-        message,
-        Ok(Message::Response { .. } | Message::Notification { .. })
-    );
+    let Some((message, request)) = read_message(body.clone()).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     let (initialize, request_id) = match message {
         Ok(Message::Request { id, method }) => (method == "initialize", Some(id)),
         _ => (false, None),
@@ -569,10 +565,11 @@ async fn post_message(
     // ...one whose token expired while it was checked isn't sent, and one
     // still waiting for its answer when the token expires is given up on.
     // The client's answers and notifications aren't requests: nothing waits
-    // on them, and the gate has taken them in (an answer it passed is no
-    // longer awaited, so a retry would be dropped). Once passed, they're
-    // sent, and the server gets at least as long to take one as the gate's
-    // own answers.
+    // on them, and the gate has taken them in (an answer it passed, or
+    // answered in the client's place as too large to check, is no longer
+    // awaited, so a retry would be dropped). Once passed, they're sent, and
+    // the server gets at least as long to take one as the gate's own
+    // answers.
     let deadline = if request {
         if passed(deadline) {
             abandon(&session, request_id.as_ref()).await;
@@ -597,6 +594,11 @@ async fn post_message(
     let response = match within(deadline, sent).await {
         Some(Ok(response)) => response,
         Some(Err(failure)) => {
+            // The client ended the session, or the gateway is stopping:
+            // the server may have dropped the message with it.
+            if session.is_closed() {
+                return session_ended();
+            }
             warn!(server = name, error = %describe(&failure), "couldn't reach the MCP server");
             abandon(&session, request_id.as_ref()).await;
             return (StatusCode::BAD_GATEWAY, "couldn't reach the MCP server").into_response();
@@ -642,17 +644,33 @@ async fn post_message(
     reply
 }
 
-/// Works out what kind of message a client sent, on a thread where
-/// blocking is fine, once it's its [turn](session::turn): a body may be
-/// large. `None` if that went wrong.
-async fn read_message(body: Bytes) -> Option<Result<Message, ParseError>> {
+/// Works out what kind of message a client sent, and whether it's a
+/// request (anything but an answer to the server or a notification), on a
+/// thread where blocking is fine, once it's its [turn](session::turn): a
+/// body may be large. A message the gate can't read in full is taken for
+/// what its top-level members say, as the gate takes it: an answer too
+/// large to check still answers the server's request. `None` if that went
+/// wrong.
+async fn read_message(body: Bytes) -> Option<(Result<Message, ParseError>, bool)> {
     let turn = session::turn().await;
     tokio::task::spawn_blocking(move || {
         let _turn = turn;
-        classify(&body)
+        let message = classify(&body);
+        let request = match &message {
+            Ok(message) => is_request(message),
+            Err(_) => jsonrpc::head(&body).is_none_or(|head| is_request(&head)),
+        };
+        (message, request)
     })
     .await
     .ok()
+}
+
+fn is_request(message: &Message) -> bool {
+    !matches!(
+        message,
+        Message::Response { .. } | Message::Notification { .. }
+    )
 }
 
 /// Runs `work` until `deadline`, if there is one: `None` if the deadline
@@ -771,6 +789,11 @@ async fn relay(
     in_flight: Option<OwnedSemaphorePermit>,
     deadline: Option<Instant>,
 ) -> Response {
+    // Whatever the server's reply, nothing more passes through a session
+    // that closed while it waited for it.
+    if session.is_closed() {
+        return session_ended();
+    }
     let status = response.status();
     if status == reqwest::StatusCode::ACCEPTED {
         // An answer to a request may still come, on the server's stream.
@@ -793,6 +816,10 @@ async fn relay(
     let body = match within(deadline, read_limited(response)).await {
         Some(Ok(body)) => body,
         Some(Err(problem)) => {
+            // Or one that closed while the reply arrived.
+            if session.is_closed() {
+                return session_ended();
+            }
             warn!(server = %session.server, %problem, "couldn't read the MCP server's reply");
             abandon(&session, request_id.as_ref()).await;
             return (
@@ -1391,9 +1418,32 @@ mod tests {
             .await
             .expect("read once a turn is free");
         assert!(
-            matches!(read, Some(Ok(Message::Request { .. }))),
+            matches!(read, Some((Ok(Message::Request { .. }), true))),
             "{read:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_answer_too_large_to_check_is_still_an_answer() {
+        // Each small object costs as much memory as hundreds of numbers.
+        let objects = vec![r#"{"a":0}"#; 100_000].join(",");
+        let answer = format!(r#"{{"jsonrpc":"2.0","id":"r1","result":{{"roots":[{objects}]}}}}"#);
+        let notification = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"x":[{objects}]}}}}"#
+        );
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"x":[{objects}]}}}}"#
+        );
+        for (text, request) in [(answer, false), (notification, false), (call, true)] {
+            let read = read_message(Bytes::from(text)).await;
+            assert!(
+                matches!(read, Some((Err(ParseError::TooManyValues), read_as)) if read_as == request),
+                "{read:?}"
+            );
+        }
+        // One that doesn't say what it is counts as a request.
+        let read = read_message(Bytes::from_static(b"[1, 2]")).await;
+        assert!(matches!(read, Some((Err(_), true))), "{read:?}");
     }
 
     #[tokio::test(start_paused = true)]
