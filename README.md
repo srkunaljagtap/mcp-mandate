@@ -467,7 +467,8 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   a request is still in flight. Closing a session also ends its event
   streams and the server's session. A request still waiting on a session
   that closes gets `404`, as for any unknown session, so the client starts
-  a new one.
+  a new one, and so does every request on a session the server forgot (it
+  restarted, say). Nothing more is sent on a closed session.
 - **Every message**, including streamed (SSE) ones, goes through the gate
   exactly as with `mcp-mandate run`. Each session's audit log entries name
   the caller (`sub`) and their OAuth client.
@@ -492,7 +493,10 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   `401`, an event stream ends when the token it was opened with expires,
   and a request still waiting for its answer when the token it was sent
   with expires is given up on (its event stream ends, or the client gets
-  `504`); clients carry on with a fresh token. A reply or event stream
+  `504`); clients carry on with a fresh token. The client's answers to the
+  server and its notifications are sent on once they pass the gate, even
+  if their token expires meanwhile, and the server gets at least 30
+  seconds to take one. A reply or event stream
   from the server that sends nothing for 5 minutes is ended too, so a call
   that runs longer needs the server to send progress notifications or
   keep-alive comments meanwhile. The connection cap is shared by everyone
