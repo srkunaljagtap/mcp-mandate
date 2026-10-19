@@ -178,16 +178,22 @@ pub fn batch_heads(frame: &[u8], mut each: impl FnMut(Option<Message>)) -> bool 
 /// in any copy of a repeated `method` member, whatever its id and its other
 /// members say. For a message whose head can't be read ([`head`]), which
 /// such a client could still take for a sampling request.
+///
+/// Where serde_json refuses something a client's parser may take (`1e999`,
+/// read as infinity; a lone surrogate or a byte that isn't UTF-8, read as
+/// U+FFFD; another message after this one), what comes after it can't be
+/// read here, and could be another copy of `method`: then the name
+/// anywhere in the text, escapes written out, counts.
 pub fn names_sampling(frame: &[u8]) -> bool {
     let found = Cell::new(false);
     let mut deserializer = serde_json::Deserializer::from_slice(trim_json_whitespace(frame));
-    // What was read before anything that isn't JSON counts too.
-    let _ = Sampling {
+    let read = Sampling {
         found: &found,
         batch: true,
     }
-    .deserialize(&mut deserializer);
-    found.get()
+    .deserialize(&mut deserializer)
+    .and_then(|()| deserializer.end());
+    found.get() || (read.is_err() && unescaped(frame).contains("sampling/createMessage"))
 }
 
 /// Whether reading `frame` in full would take no more memory than
@@ -1026,9 +1032,31 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":5.0,"method":"sampling\/createMessage"}"#,
             // In a batch, after messages that can't be read at all.
             r#"[1,{"method":[0]},{"jsonrpc":"2.0","id":5.0,"method":"sampling/createMessage"}]"#,
+            // After something serde_json refuses but a client may read on
+            // past, which hides what follows from a reading here.
+            r#"{"jsonrpc":"2.0","id":6,"method":1e999,"method":"sampling/createMessage"}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"\ud800","method":"sampling/createMessage"}"#,
+            r#"{"jsonrpc":"2.0","\ud800":0,"id":6,"method":"sampling/createMessage"}"#,
+            r#"[{"jsonrpc":"2.0","id":6,"method":1e999,"method":"sampling/createMessage"}]"#,
+            r#"[1e999,{"jsonrpc":"2.0","id":6,"method":"sampling/createMessage"}]"#,
+            r#"["\ud800",{"jsonrpc":"2.0","id":6,"method":"sampling\/createMessage"}]"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"ping"} {"jsonrpc":"2.0","id":7,"method":"sampling/createMessage"}"#,
+            // Anywhere in what isn't JSON at all.
+            "not json, sampling/createMessage",
         ] {
             assert!(names_sampling(text.as_bytes()), "{text}");
             assert_eq!(head(text.as_bytes()), None, "{text}");
+        }
+        // A byte that isn't UTF-8, in the first copy of `method` or before
+        // the message in a batch.
+        for frame in [
+            &b"{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"\xff\",\"method\":\"sampling/createMessage\"}"[..],
+            b"[{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"\xff\",\"method\":\"sampling/createMessage\"}]",
+            b"[\"\xff\",{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"sampling/createMessage\"}]",
+        ] {
+            let text = String::from_utf8_lossy(frame);
+            assert!(names_sampling(frame), "{text}");
+            assert_eq!(head(frame), None, "{text}");
         }
         let long_id = format!(
             r#"{{"jsonrpc":"2.0","id":"{}","method":"sampling/createMessage"}}"#,
@@ -1041,7 +1069,9 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":6,"id":6,"result":{"method":"sampling/createMessage"}}"#,
             r#"{"jsonrpc":"2.0","id":6,"id":6,"method":["sampling/createMessage"]}"#,
             r#"[[{"jsonrpc":"2.0","id":6,"method":"sampling/createMessage"}]]"#,
-            "not json, sampling/createMessage",
+            // Not named at all, in what can't be read.
+            r#"{"jsonrpc":"2.0","id":6,"method":1e999,"method":"ping"}"#,
+            "not json",
         ] {
             assert!(!names_sampling(text.as_bytes()), "{text}");
         }
