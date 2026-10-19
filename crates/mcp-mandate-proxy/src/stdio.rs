@@ -57,12 +57,13 @@ const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
 /// option or header named like a secret (`--api-key`, `Authorization:`,
 /// npm's `--//host/:_authToken=`, Windows-style `/token:`, `/token` and
 /// `/p:Password=`), the whole value of an option that sets a property named
-/// like one (MSBuild's `/p:Configuration=Release;Password=…`), and anything
-/// shaped like a known kind of key. A value can have spaces, so it is
-/// masked up to its closing quote, if it opens one, or else up to the next
-/// option. Split over arguments, it is followed for as many words as it can
-/// have: one after `--api-key`, two (a scheme and a token) after
-/// `Authorization:`.
+/// like one (MSBuild's `/p:Configuration=Release;Password=…`), or the part
+/// of it after a space in an earlier property's value
+/// (`/p:Title=My App;Password=…`), and anything shaped like a known kind of
+/// key. A value can have spaces, so it is masked up to its closing quote,
+/// if it opens one, or else up to the next option. Split over arguments, it
+/// is followed for as many words as it can have: one after `--api-key`, two
+/// (a scheme and a token) after `Authorization:`.
 #[derive(Debug, Clone)]
 pub struct ServerCommand {
     pub program: OsString,
@@ -172,7 +173,7 @@ fn mask(arg: &str, value: usize, secrets: &SecretDetector) -> (String, usize) {
 fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
     let secret_option = is_option(word)
         && (secret_name(option_name(word))
-            || split_option(word).is_some_and(|(_, _, value)| secret_property(value)));
+            || split_option(word).is_some_and(|(_, _, value)| secret_property(value).is_some()));
     // A URL, wherever it is in the word (`name@git+https://…`), unless it's
     // in a value masked as such (`DATABASE_URL=postgres://…`,
     // `--token:https://…`).
@@ -209,6 +210,17 @@ fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
             ),
             _ => (word.to_owned(), Run::Value(1)),
         }
+    } else if let Some(value) = secret_property(word) {
+        // The rest of a property list, split off by a space in an earlier
+        // value: `App;Password=value` in `/p:Title=My App;Password=value`.
+        // Where the list started doesn't matter, so a word naming a secret
+        // property among others is masked wherever it is. A quote before
+        // the property closes an earlier value's; one in its value opens it
+        // (`App";Password="a b"`).
+        (
+            MASK.to_owned(),
+            open_quote(value).map_or(Run::Rest, Run::Quote),
+        )
     } else {
         (word.to_owned(), Run::No)
     };
@@ -347,22 +359,30 @@ fn is_option(word: &str) -> bool {
     !name.is_empty() && (after.starts_with([':', '=']) || alone)
 }
 
-/// Whether `value` sets a property named like a secret: MSBuild's `-p:` and
-/// `/p:` take a list of them, `Name=value` separated by `;` or `,`, and
-/// only the first name is in the option's own. A name is letters, digits,
-/// `_`, `-` and `.`, so a URL's query (`?api_key=…`) isn't taken for one.
-fn secret_property(value: &str) -> bool {
-    value
-        .split([';', ','])
-        .filter_map(|property| property.split_once('='))
-        .map(|(name, _)| name.trim_start_matches(['"', '\'']))
-        .any(|name| {
+/// Whether `value` sets a property named like a secret, and if so, `value`
+/// from that property's value on (the first such property's): MSBuild's
+/// `-p:` and `/p:` take a list of them, `Name=value` separated by `;` or
+/// `,`, and only the first name is in the option's own. A name is letters,
+/// digits, `_`, `-` and `.`, so a URL's query (`?api_key=…`) isn't taken
+/// for one.
+fn secret_property(value: &str) -> Option<&str> {
+    let mut start = 0;
+    for property in value.split([';', ',']) {
+        let secret = property.split_once('=').filter(|(name, _)| {
+            let name = name.trim_start_matches(['"', '\'']);
             !name.is_empty()
                 && name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
                 && secret_name(name)
-        })
+        });
+        if let Some((name, _)) = secret {
+            return Some(&value[start + name.len() + 1..]);
+        }
+        // Past the property and the separator after it.
+        start += property.len() + 1;
+    }
+    None
 }
 
 /// The part of an option word that names it: up to its first `=`, or its
@@ -1455,6 +1475,48 @@ mod tests {
                 &["-c", "dotnet run /p:Password=\"s3cret\" server.csproj"]
             ),
             "sh -c dotnet run /p:***\" server.csproj"
+        );
+    }
+
+    #[test]
+    fn masks_a_property_list_split_by_a_space_in_an_earlier_value() {
+        // One argument, as a client's list of arguments passes it: the
+        // secret property is in the word after the space.
+        assert_eq!(
+            shown(
+                "dotnet",
+                &[
+                    "run",
+                    "/p:Title=My App;ApiToken=abcdef1234567",
+                    "server.csproj"
+                ]
+            ),
+            "dotnet run /p:Title=My *** server.csproj"
+        );
+        // In a script, with the earlier value quoted.
+        assert_eq!(
+            shown(
+                "sh",
+                &["-c", "dotnet build /p:Title=\"My App\";Token=abcdef1234"]
+            ),
+            "sh -c dotnet build /p:Title=\"My ***"
+        );
+        // A quoted secret value is masked up to its closing quote, past
+        // anything in it that looks like an option.
+        assert_eq!(
+            shown(
+                "sh",
+                &[
+                    "-c",
+                    "dotnet run /p:Title=\"My App\";Pwd=\"a -b\" server.csproj"
+                ]
+            ),
+            "sh -c dotnet run /p:Title=\"My *** ***\" server.csproj"
+        );
+        // A list with no secret in it is shown.
+        assert_eq!(
+            shown("dotnet", &["build", "/p:Title=My App;Platform=x64"]),
+            "dotnet build /p:Title=My App;Platform=x64"
         );
     }
 
