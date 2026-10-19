@@ -148,8 +148,10 @@ about an unpinned version: the user name, password, query and fragment of
 every URL, wherever it is in an argument (also in a package spec such as
 `name@git+https://user:token@host/repo.git`), the value of `NAME=value`,
 the values of options and headers such as `--api-key`, `--token:…`,
-`/p:Password=…`, npm's `--//host/:_authToken=…` or `Authorization:`, and
-keys of known shapes. A value can have spaces, so it's masked up to its
+`/token …`, `/p:Password=…`, npm's `--//host/:_authToken=…` or
+`Authorization:`, the whole value of an option that sets a property named
+like a secret (MSBuild's `/p:Configuration=Release;Password=…`), and keys
+of known shapes. A value can have spaces, so it's masked up to its
 closing quote if it opens one, or else up to the next option:
 `--db-password=correct horse` and `Authorization: Bearer <token>` are
 masked whole. When a client passes a value's words as separate arguments,
@@ -195,8 +197,13 @@ root), or when other users can write to the file or its folder. Group
 write access counts unless the group is your own private group (named
 after you, with the same id as your user id, and no other members): on
 systems such as Fedora and Ubuntu, which give each user a private group and
-make new files group-writable, that's a group only you are in. Only the
-permission bits are read, not ACLs, and Windows permissions aren't checked.
+make new files group-writable, that's a group only you are in. It isn't
+counted as yours if another user has it as their primary group, or another
+group has the same id; to check that, mcp-mandate reads the local user and
+group lists (`/etc/passwd` and `/etc/group`), so users and groups that
+only a directory service such as LDAP lists aren't checked for this. Only
+the permission bits are read, not ACLs, and Windows permissions aren't
+checked.
 
 ```toml
 pins = "everything.pins.toml"
@@ -353,9 +360,15 @@ mcp-mandate audit verify policy.audit.jsonl
   configuration so they're still counted as one agent. A named agent's
   taint lasts while any server with that name is running; once they have
   all stopped, the next one starts clean. Each running server holds a lock
-  on a file next to the taint file (`taint-named-<name>.lock`), touches it
-  so it doesn't look old, and makes it again if it was removed, so a
-  cleaner doesn't make a running agent look stopped. If no private folder can be set up, or the agent can't
+  on a file next to the taint file (`taint-named-<name>.lock`) and touches
+  it so it doesn't look old, so a cleaner doesn't make a running agent look
+  stopped. On Windows that file can't be removed while a server holds it.
+  On Linux and macOS each running server checks it every minute, and
+  whenever it checks the taint file; if it was removed or replaced (with
+  its folder when you log out, say), the server makes it again if needed
+  and locks it as soon as the folder can be made again. A server started
+  before then still clears the taint, and the servers that have seen it
+  put it back. If no private folder can be set up, or the agent can't
   be identified, each server keeps its own taint and logs a warning. On the
   HTTPS gateway, taint is shared across every session of the same caller.
 - **Secrets.** API keys, tokens, private keys, and password or secret
@@ -400,7 +413,8 @@ mcp-mandate audit verify policy.audit.jsonl
   of the same agent that enforce are still held: whatever it passes that
   could taint the session does (an answer it can't read or can't match to
   its request, a batch, a request it would have blocked and its answer, a
-  server's sampling request), and a tool call whose tool can't be read
+  server's sampling request, even one it can't read that a lenient client
+  would still take for one), and a tool call whose tool can't be read
   counts as one that reads untrusted content.
 
 A blocked tool call comes back to the agent as a tool error that says why
@@ -453,8 +467,14 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   credential sent in a header must be ASCII. Only the headers MCP needs are
   passed on, and redirects aren't followed, so a server can't bounce the
   credential elsewhere. A server that echoes the credential back gets it
-  redacted, in either mode, in replies and event streams alike (a message
-  the gate can't read that holds it doesn't pass): the whole header value,
+  redacted, in either mode and whatever `[secrets] redact_responses` says,
+  in replies and event streams alike, inside a resource's base64 `blob`
+  too. A message the gate can't check that holds it, or holds a `blob`, is
+  read as JSON and, if a key repeats or the credential has to come out,
+  written out again with one copy of each key; one that can't be read in
+  full that way, or would take too much memory to, doesn't pass (the
+  request it answers gets an error saying why). What's redacted: the whole
+  header value,
   the token after its scheme, the client secret, and every
   client-credential token that may still be valid: until the expiry the
   token endpoint gave (`expires_in`), or for a day when it gave none, the
@@ -465,10 +485,13 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   gate: its own taint, its own audit session. The server's session id is
   never shown to the client. Sessions unused for 30 minutes close, unless
   a request is still in flight. Closing a session also ends its event
-  streams and the server's session. A request still waiting on a session
-  that closes gets `404`, as for any unknown session, so the client starts
-  a new one, and so does every request on a session the server forgot (it
-  restarted, say). Nothing more is sent on a closed session.
+  streams and the server's session. A request whose reply hasn't started
+  when its session closes gets `404`, as for any unknown session, so the
+  client starts a new one, whatever the server then does with it (fails
+  it, drops the connection or answers it); so does every request in flight
+  and every event stream opened when the server forgets the session (it
+  restarted, say). A reply stream already under way just ends. Nothing
+  more is sent on a closed session.
 - **Every message**, including streamed (SSE) ones, goes through the gate
   exactly as with `mcp-mandate run`. Each session's audit log entries name
   the caller (`sub`) and their OAuth client.
@@ -496,7 +519,9 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   `504`); clients carry on with a fresh token. The client's answers to the
   server and its notifications are sent on once they pass the gate, even
   if their token expires meanwhile, and the server gets at least 30
-  seconds to take one. A reply or event stream
+  seconds to take one (in `enforce` mode, that includes an answer too
+  large to check, which the gate replaces with an error). A reply or event
+  stream
   from the server that sends nothing for 5 minutes is ended too, so a call
   that runs longer needs the server to send progress notifications or
   keep-alive comments meanwhile. The connection cap is shared by everyone
