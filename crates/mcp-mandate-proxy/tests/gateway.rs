@@ -239,7 +239,8 @@ fn record(seen: &Recorder, path: String, method: &str, headers: &HeaderMap) {
 /// An MCP server (one endpoint per gateway server) that remembers every
 /// request, and a "thief" that a redirect points to. Its event streams
 /// (`GET`) echo the `authorization` header they got, then send only
-/// keep-alives. Gamma never confirms the end of a session.
+/// keep-alives (see [`serve_stream`]). Gamma never confirms the end of a
+/// session.
 async fn mcp_server() -> (String, Fake, Recorder) {
     let seen: Recorder = Arc::default();
     let stolen: Recorder = Arc::default();
@@ -282,6 +283,14 @@ async fn mcp_server() -> (String, Fake, Recorder) {
     (url, fake, stolen)
 }
 
+/// The server's event stream (`GET`): it echoes the `authorization` header
+/// it got, then sends only keep-alives. Gamma's answers as the
+/// `last-event-id` it's asked with says instead:
+/// - `forgot` answers `404`, as a server that forgot the session does;
+/// - `outlast <then>` waits until a session is ended, then answers as
+///   `then` says: `refuse` with `404`, as for the session just ended,
+///   `fail` with HTTP 500, `stream` on an event stream, `hang up` by
+///   dropping the connection.
 async fn serve_stream(
     State(fake): State<Fake>,
     UrlPath(server): UrlPath<String>,
@@ -294,7 +303,27 @@ async fn serve_stream(
         .unwrap_or("none");
     let echo = json!({"jsonrpc": "2.0", "method": "notifications/message",
         "params": {"level": "debug", "data": format!("GET with {auth}")}});
-    pinging(&fake, Some(format!("event: message\ndata: {echo}\n\n")))
+    let first = format!("event: message\ndata: {echo}\n\n");
+    let resume = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|_| server == "gamma")
+        .unwrap_or_default();
+    if resume == "forgot" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Some(then) = resume.strip_prefix("outlast ") {
+        let mut ended = fake.ends.subscribe();
+        let _ = ended.changed().await;
+        return match then {
+            "refuse" => StatusCode::NOT_FOUND.into_response(),
+            "fail" => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            "stream" => event_stream(Body::from(first)),
+            // As `outlast`'s call does.
+            _ => std::panic::resume_unwind(Box::new("hung up")),
+        };
+    }
+    pinging(&fake, Some(first))
 }
 
 /// An event stream, counted in `streams` while it's open: `first`, then
@@ -1907,4 +1936,78 @@ async fn a_request_whose_session_ends_while_the_server_has_it_is_told_the_sessio
         assert!(text.contains("the session ended"), "{then}: {text}");
         ending.abort();
     }
+}
+
+impl World {
+    /// Asks gamma for its event stream for `session`, resuming after
+    /// `last`, which says how gamma answers (see [`serve_stream`]).
+    async fn resume_stream(&self, token: &str, session: &str, last: &str) -> reqwest::Response {
+        self.client
+            .get(self.url("gamma"))
+            .bearer_auth(token)
+            .header(header::ACCEPT, "text/event-stream")
+            .header("mcp-session-id", session)
+            .header("last-event-id", last)
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_server_stream_whose_session_ends_while_the_server_opens_it_is_told_the_session_ended() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    for then in ["refuse", "fail", "stream", "hang up"] {
+        let session = world.initialize("gamma", &token).await;
+        let last = format!("outlast {then}");
+        let opened = world.resume_stream(&token, &session, &last);
+        let end = async {
+            wait_until("the stream is asked for at the server", || {
+                world.ends.receiver_count() == 1
+            })
+            .await;
+            // Gamma never confirms the end of a session: the gateway's
+            // answer to the client isn't waited for.
+            let ending = world
+                .client
+                .delete(world.url("gamma"))
+                .bearer_auth(&token)
+                .header("mcp-session-id", &session)
+                .send();
+            tokio::spawn(ending).abort_handle()
+        };
+        let (opened, ending) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(opened, end) })
+                .await
+                .expect("the stream was answered");
+        // Not the server's refusal or failure, nor an empty stream.
+        assert_eq!(opened.status(), 404, "{then}");
+        let text = opened.text().await.unwrap();
+        assert!(text.contains("the session ended"), "{then}: {text}");
+        ending.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_client_that_only_listens_is_told_when_the_server_forgets_its_session() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let session = world.initialize("gamma", &token).await;
+    // The server refuses the stream: it no longer has the session.
+    let opened = world.resume_stream(&token, &session, "forgot").await;
+    assert_eq!(opened.status(), 404);
+    let text = opened.text().await.unwrap();
+    assert!(text.contains("the MCP server ended the session"), "{text}");
+    // The session is closed here too, so the client starts over.
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let listed = world
+        .post("gamma", Some(&token), Some(&session), list)
+        .await;
+    assert_eq!(listed.status(), 404);
+    assert!(
+        !world.seen().iter().any(|seen| seen.method == "tools/list"),
+        "the closed session sent nothing more to the server"
+    );
+    world.initialize("gamma", &token).await;
 }

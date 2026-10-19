@@ -692,10 +692,10 @@ fn passed(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| deadline <= Instant::now())
 }
 
-/// The answer to a message whose session closed while it waited (the
-/// server forgot the session, the client ended it, or the gateway is
-/// stopping): `404`, as for any session that's gone, so the client starts
-/// over.
+/// The answer to a message, or to a request for the server's stream, whose
+/// session closed while it waited (the server forgot the session, the
+/// client ended it, or the gateway is stopping): `404`, as for any session
+/// that's gone, so the client starts over.
 fn session_ended() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -1039,6 +1039,9 @@ async fn open_stream(
     }
     let protocol = protocol_version(&headers);
     let upstream = &app.upstreams[&name];
+    // Its id is read before the session is checked, as for a message: a
+    // session the server forgot is closed before its id is cleared, so its
+    // stream isn't asked for without the id (see `post_message`).
     let upstream_id = session.upstream_id();
     let request = upstream.request(
         reqwest::Method::GET,
@@ -1058,14 +1061,36 @@ async fn open_stream(
         Some(id) => request.header("last-event-id", id.clone()),
         None => request,
     };
+    // Nothing is asked of the server for a session that closed meanwhile.
+    if session.is_closed() {
+        return session_ended();
+    }
     let response = match within(deadline, request.send()).await {
         Some(Ok(response)) => response,
         Some(Err(failure)) => {
+            // The client ended the session, or the gateway is stopping:
+            // the server may have dropped the stream with it.
+            if session.is_closed() {
+                return session_ended();
+            }
             warn!(server = name, error = %failure.without_url(), "couldn't reach the MCP server");
             return StatusCode::BAD_GATEWAY.into_response();
         }
         None => return token_expired(),
     };
+    // Whatever the server's answer, no stream opens for a session that
+    // closed while it was asked (a server refuses one for the session the
+    // gateway just ended there).
+    if session.is_closed() {
+        return session_ended();
+    }
+    if response.status() == reqwest::StatusCode::NOT_FOUND && upstream_id.is_some() {
+        // The server forgot the session (see `post_message`): a client that
+        // only listens learns here that it must start over.
+        close_session(&app, &session);
+        session.set_upstream_id(None);
+        return (StatusCode::NOT_FOUND, "the MCP server ended the session").into_response();
+    }
     if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }

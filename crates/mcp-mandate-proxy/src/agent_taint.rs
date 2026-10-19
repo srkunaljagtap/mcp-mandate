@@ -1112,6 +1112,19 @@ mod tests {
             locked(&lock),
             "locked again though the old one can't be read"
         );
+
+        // Replaced, and the file it holds can't be read: another computer
+        // removed it and a server started there made a new one. That new
+        // file is locked.
+        fs::remove_file(&lock).unwrap();
+        fs::write(&lock, "").unwrap();
+        assert!(!locked(&lock));
+        let stale = std::io::Error::from(nix::errno::Errno::ESTALE);
+        follow_lock_from(&path, Err(stale), &mut held).unwrap();
+        assert!(
+            locked(&lock),
+            "locks the file in its place though the old one can't be read"
+        );
         drop(held);
 
         // Removed, and made again by a server that starts before the keeper
