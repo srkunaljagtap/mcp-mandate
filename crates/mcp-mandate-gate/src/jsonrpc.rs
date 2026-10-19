@@ -153,20 +153,53 @@ pub fn head(frame: &[u8]) -> Option<Message> {
 }
 
 /// What each message in a batch says it is, read as [`head`] reads a
-/// single message (`None` for one that doesn't say). `None` when `frame`
-/// isn't a batch, or its messages can't even be told apart.
-pub fn batch_heads(frame: &[u8]) -> Option<Vec<Option<Message>>> {
+/// single message (`None` for one that doesn't say), handed to `each` as
+/// it's read: a batch of any size takes no more memory than one message's
+/// head. If a message can't even be told apart from the next, whatever is
+/// left of the batch is handed on as one more `None`. Returns false, having
+/// handed nothing, when `frame` isn't a batch.
+pub fn batch_heads(frame: &[u8], mut each: impl FnMut(Option<Message>)) -> bool {
     let body = trim_json_whitespace(frame);
     if body.first() != Some(&b'[') {
-        return None;
+        return false;
     }
-    let items: Vec<Envelope<'_>> = serde_json::from_slice(body).ok()?;
-    Some(
-        items
-            .into_iter()
-            .map(|item| item.into_message().ok())
-            .collect(),
-    )
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let read = Heads(&mut each)
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end());
+    if read.is_err() {
+        each(None);
+    }
+    true
+}
+
+/// Whether `frame` names `sampling/createMessage` as its method, or one of
+/// its messages does if it's a batch, read as leniently as a client might:
+/// in any copy of a repeated `method` member, whatever its id and its other
+/// members say. For a message whose head can't be read ([`head`]), which
+/// such a client could still take for a sampling request.
+pub fn names_sampling(frame: &[u8]) -> bool {
+    let found = Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_slice(trim_json_whitespace(frame));
+    // What was read before anything that isn't JSON counts too.
+    let _ = Sampling {
+        found: &found,
+        batch: true,
+    }
+    .deserialize(&mut deserializer);
+    found.get()
+}
+
+/// Whether reading `frame` in full would take no more memory than
+/// [`classify`] allows. Unlike classifying, it reads on past a repeated
+/// key, so every copy counts and a message with one can still be read in
+/// full safely. `Ok` says whether some object in it repeats a key (a parser
+/// keeps only one copy); an error when it would take more
+/// ([`ParseError::TooManyValues`]), or isn't JSON.
+pub fn within_cost(frame: &[u8]) -> Result<bool, ParseError> {
+    let repeated = Cell::new(false);
+    read_values(trim_json_whitespace(frame), Some(&repeated))?;
+    Ok(repeated.get())
 }
 
 /// `frame` as text, with each escape in its strings (`\n`, `\"`, `A`,
@@ -252,11 +285,21 @@ fn trim_json_whitespace(mut frame: &[u8]) -> &[u8] {
 /// Reads the whole message, refusing a repeated key or one that would cost
 /// too much to read in full.
 fn check_values(body: &[u8]) -> Result<(), ParseError> {
+    read_values(body, None)
+}
+
+/// Reads the whole message, refusing one that would cost too much to read
+/// in full, and a repeated key unless `repeated` is given, where it's
+/// noted instead.
+fn read_values(body: &[u8], repeated: Option<&Cell<bool>>) -> Result<(), ParseError> {
     let cost = Cell::new(0);
     let mut deserializer = serde_json::Deserializer::from_slice(body);
-    let checked = NoDuplicates { cost: &cost }
-        .deserialize(&mut deserializer)
-        .and_then(|()| deserializer.end());
+    let checked = NoDuplicates {
+        cost: &cost,
+        repeated,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|()| deserializer.end());
     match checked {
         Ok(()) => Ok(()),
         Err(_) if cost.get() > MAX_COST => Err(ParseError::TooManyValues),
@@ -436,12 +479,16 @@ impl<'de> Visitor<'de> for ErrorObject {
 }
 
 /// Reads a whole JSON document only to fail on an object with a repeated
-/// key (compared after unescaping, so `"name"` repeats `"name"`), or on
-/// one that would cost more than [`MAX_COST`] to read in full.
+/// key (compared after unescaping, so `"name"` repeats `"name"`), unless
+/// told to note one instead, or on one that would cost more than
+/// [`MAX_COST`] to read in full.
 #[derive(Clone, Copy)]
 struct NoDuplicates<'a> {
     /// What the document read so far would cost.
     cost: &'a Cell<usize>,
+    /// Where a repeated key is noted, to read on past it and add up the
+    /// whole document's cost; `None` to fail on one.
+    repeated: Option<&'a Cell<bool>>,
 }
 
 impl NoDuplicates<'_> {
@@ -521,11 +568,171 @@ impl<'de> Visitor<'de> for NoDuplicates<'_> {
             }
             self.charge(cost)?;
             if !seen.insert(key) {
-                return Err(de::Error::custom("an object repeats a key"));
+                match self.repeated {
+                    Some(repeated) => repeated.set(true),
+                    None => return Err(de::Error::custom("an object repeats a key")),
+                }
             }
             map.next_value_seed(self)?;
         }
         Ok(())
+    }
+}
+
+/// Hands each message of a batch, as [`head`] reads it, to the function it
+/// holds.
+struct Heads<F>(F);
+
+impl<'de, F: FnMut(Option<Message>)> DeserializeSeed<'de> for Heads<F> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de, F: FnMut(Option<Message>)> Visitor<'de> for Heads<F> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a batch of JSON-RPC messages")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<(), A::Error> {
+        while let Some(item) = seq.next_element::<Envelope<'de>>()? {
+            (self.0)(item.into_message().ok());
+        }
+        Ok(())
+    }
+}
+
+/// Looks through a message, or each message of a batch, for a `method`
+/// member naming `sampling/createMessage`, skipping everything else unread.
+#[derive(Clone, Copy)]
+struct Sampling<'a> {
+    found: &'a Cell<bool>,
+    /// Whether this may be a batch, rather than a message in one.
+    batch: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for Sampling<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Sampling<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON-RPC message or batch")
+    }
+
+    // Anything but an object (or, at the top, an array) names no method.
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if self.batch {
+            let message = Sampling {
+                batch: false,
+                ..self
+            };
+            while seq.next_element_seed(message)?.is_some() {}
+        } else {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+        }
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "method" {
+                if map.next_value_seed(SamplingMethod)? {
+                    self.found.set(true);
+                }
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether a value is the string `sampling/createMessage`. Anything else is
+/// skipped unread.
+struct SamplingMethod;
+
+impl<'de> DeserializeSeed<'de> for SamplingMethod {
+    type Value = bool;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<bool, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SamplingMethod {
+    type Value = bool;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a method name")
+    }
+
+    fn visit_str<E>(self, method: &str) -> Result<bool, E> {
+        Ok(method == "sampling/createMessage")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_unit<E>(self) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(false)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(false)
     }
 }
 
@@ -746,16 +953,26 @@ mod tests {
         }
     }
 
+    /// The heads [`batch_heads`] hands on, in order; `None` when `frame`
+    /// isn't a batch.
+    fn heads(frame: &[u8]) -> Option<Vec<Option<Message>>> {
+        let mut heads = Vec::new();
+        batch_heads(frame, |head| heads.push(head)).then_some(heads)
+    }
+
     #[test]
     fn the_messages_of_a_batch_can_be_read_one_by_one() {
+        let answer = |id: i32| {
+            Some(Message::Response {
+                id: json!(id),
+                is_error: false,
+            })
+        };
         let batch = br#"[{"jsonrpc":"2.0","id":7,"result":{}},{"jsonrpc":"2.0","id":8,"method":"ping","result":{}},{"jsonrpc":"2.0","method":"notifications/x"}]"#;
         assert_eq!(
-            batch_heads(batch),
+            heads(batch),
             Some(vec![
-                Some(Message::Response {
-                    id: json!(7),
-                    is_error: false
-                }),
+                answer(7),
                 // Both a request and a response.
                 None,
                 Some(Message::Notification {
@@ -763,14 +980,102 @@ mod tests {
                 }),
             ])
         );
-        assert_eq!(
-            batch_heads(br#"{"jsonrpc":"2.0","id":7,"result":{}}"#),
-            None
+        assert_eq!(heads(br#"{"jsonrpc":"2.0","id":7,"result":{}}"#), None);
+        // Each is handed on as it's read: those before a message that can't
+        // be told apart from the next, then one `None` for the rest.
+        for text in [
+            r#"[{"jsonrpc":"2.0","id":7,"result":{}},1,{"jsonrpc":"2.0","id":8,"result":{}}]"#,
+            r#"[{"jsonrpc":"2.0","id":7,"result":{}},{"jsonrpc":"2.0","id":8,"id":8,"result":{}}]"#,
+            r#"[{"jsonrpc":"2.0","id":7,"result":{}}] trailing"#,
+        ] {
+            assert_eq!(
+                heads(text.as_bytes()),
+                Some(vec![answer(7), None]),
+                "{text}"
+            );
+        }
+        // One too large to check is read one message at a time all the
+        // same.
+        let mut batch = String::from("[");
+        batch.push_str(&vec![r#"{"jsonrpc":""}"#; 80_000].join(","));
+        batch.push_str(r#",{"jsonrpc":"2.0","id":7,"result":{}}]"#);
+        assert!(matches!(
+            classify(batch.as_bytes()),
+            Err(ParseError::TooManyValues)
+        ));
+        let mut count = 0;
+        let mut last = None;
+        assert!(batch_heads(batch.as_bytes(), |head| {
+            count += 1;
+            last = head;
+        }));
+        assert_eq!((count, last), (80_001, answer(7)));
+    }
+
+    #[test]
+    fn finds_a_sampling_request_a_lenient_client_would_read() {
+        for text in [
+            // Repeated top-level members, whichever copy a client keeps.
+            r#"{"jsonrpc":"2.0","jsonrpc":"2.0","id":6,"method":"sampling/createMessage","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"ping","method":"sampling/createMessage"}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"sampling/createMessage","method":"ping"}"#,
+            // Ids classifying refuses, which some clients accept.
+            r#"{"jsonrpc":"2.0","id":5.0,"method":"sampling/createMessage","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":18446744073709551616,"method":"sampling/createMessage"}"#,
+            // Written with escapes.
+            r#"{"jsonrpc":"2.0","id":5.0,"method":"sampling\/createMessage"}"#,
+            // In a batch, after messages that can't be read at all.
+            r#"[1,{"method":[0]},{"jsonrpc":"2.0","id":5.0,"method":"sampling/createMessage"}]"#,
+        ] {
+            assert!(names_sampling(text.as_bytes()), "{text}");
+            assert_eq!(head(text.as_bytes()), None, "{text}");
+        }
+        let long_id = format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"sampling/createMessage"}}"#,
+            "x".repeat(200)
         );
+        assert!(names_sampling(long_id.as_bytes()));
+        for text in [
+            r#"{"jsonrpc":"2.0","id":6,"id":6,"method":"ping"}"#,
+            // Named only in what the message carries.
+            r#"{"jsonrpc":"2.0","id":6,"id":6,"result":{"method":"sampling/createMessage"}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"id":6,"method":["sampling/createMessage"]}"#,
+            r#"[[{"jsonrpc":"2.0","id":6,"method":"sampling/createMessage"}]]"#,
+            "not json, sampling/createMessage",
+        ] {
+            assert!(!names_sampling(text.as_bytes()), "{text}");
+        }
+    }
+
+    #[test]
+    fn adds_up_the_cost_of_a_message_past_a_repeated_key() {
+        assert_eq!(within_cost(br#"{"a":1,"b":{"a":2}}"#).ok(), Some(false));
         assert_eq!(
-            batch_heads(br#"[1,{"jsonrpc":"2.0","id":7,"result":{}}]"#),
-            None
+            within_cost(br#"{"a":1,"b":{"c":2,"c":3}}"#).ok(),
+            Some(true)
         );
+        assert!(within_cost(b"not json").is_err());
+        // Classifying stops at the repeated key, before the cost adds up.
+        let values = vec!["0"; MAX_VALUES].join(",");
+        let costly =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"x":0,"x":0,"rows":[{values}]}}}}"#);
+        assert!(matches!(
+            classify(costly.as_bytes()),
+            Err(ParseError::Json(_))
+        ));
+        assert!(matches!(
+            within_cost(costly.as_bytes()),
+            Err(ParseError::TooManyValues)
+        ));
+        // Every copy counts.
+        let copies = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{{}}}}}"#,
+            vec![r#""x":0"#; MAX_VALUES / 2].join(",")
+        );
+        assert!(matches!(
+            within_cost(copies.as_bytes()),
+            Err(ParseError::TooManyValues)
+        ));
     }
 
     #[test]
