@@ -1153,6 +1153,54 @@ fn observe_mode_follows_a_batch_it_passes_on() {
 }
 
 #[test]
+fn observe_mode_follows_the_messages_of_a_batch_as_they_are_read() {
+    let answer =
+        format!("{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"text\":\"{INJECTION}\"}}}}");
+    // 80,000 messages that don't say what they are: too many to check.
+    let unread = vec![r#"{"jsonrpc":""}"#; 80_000].join(",");
+    // The server's: an answer still stops waiting when it comes before a
+    // message that can't be told apart from the next, or in a batch too
+    // large to check.
+    for batch in [format!("[{answer},1]\n"), format!("[{unread},{answer}]\n")] {
+        let record = Arc::new(Record::default());
+        let (mut gate, _) = sharing_gate(OBSERVE, &record);
+        gate.from_client(&fetch_call(7));
+        assert_eq!(
+            gate.from_server(batch.as_bytes()),
+            vec![Action::ToClient(batch.clone().into_bytes())]
+        );
+        assert_eq!(
+            record.get().as_deref(),
+            Some("the output of tool `fetch_page`")
+        );
+        assert!(!gate.pending.contains_key("7"), "{}", &batch[..60]);
+    }
+
+    // The client's, too large to check: its request is still expected.
+    let record = Arc::new(Record::default());
+    let (mut gate, _) = sharing_gate(OBSERVE, &record);
+    let batch = format!(
+        "[{{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{{\"name\":\"add_note\"}}}},{unread}]\n"
+    );
+    assert!(matches!(
+        classify(batch.as_bytes()),
+        Err(ParseError::TooManyValues)
+    ));
+    assert_eq!(
+        gate.from_client(batch.as_bytes()),
+        vec![Action::ToServer(batch.clone().into_bytes())]
+    );
+    gate.from_server(&response(
+        11,
+        json!({"content": [{"type": "text", "text": INJECTION}]}),
+    ));
+    assert_eq!(
+        record.get().as_deref(),
+        Some("the output of a tool call mcp-mandate couldn't read in full")
+    );
+}
+
+#[test]
 fn observe_mode_taints_for_an_answer_whose_id_names_no_waiting_request() {
     // `"7"` for `7`: some clients take one for the other.
     let readable = line(
@@ -1261,6 +1309,65 @@ fn observe_mode_taints_for_a_sampling_request_it_would_block() {
         "{actions:?}"
     );
     assert_eq!(record.get(), None);
+}
+
+#[test]
+fn observe_mode_taints_for_a_sampling_request_whose_head_it_cant_read() {
+    // Each a sampling request to a lenient client, one that keeps the last
+    // copy of a repeated member or takes `5.0` for `5`, though the gate
+    // can't read what it is from its top-level members.
+    let params = r#""params":{"messages":[],"maxTokens":10}"#;
+    let long_id = "x".repeat(200);
+    let requests = [
+        format!(
+            r#"{{"jsonrpc":"2.0","jsonrpc":"2.0","id":6,"method":"sampling/createMessage",{params}}}"#
+        ),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"ping","method":"sampling/createMessage",{params}}}"#
+        ),
+        format!(r#"{{"jsonrpc":"2.0","id":5.0,"method":"sampling/createMessage",{params}}}"#),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":18446744073709551616,"method":"sampling/createMessage",{params}}}"#
+        ),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{long_id}","method":"sampling/createMessage",{params}}}"#
+        ),
+    ];
+    let notification = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
+    for request in &requests {
+        assert_eq!(jsonrpc::head(request.as_bytes()), None, "{request}");
+        // Alone, alone in a batch, and in a batch after a readable message.
+        for frame in [
+            format!("{request}\n"),
+            format!("[{request}]\n"),
+            format!("[{notification},{request}]\n"),
+        ] {
+            // Nothing is waiting, so nothing else would taint the session.
+            let record = Arc::new(Record::default());
+            let (mut gate, log) = sharing_gate(OBSERVE, &record);
+            assert_eq!(
+                gate.from_server(frame.as_bytes()),
+                vec![Action::ToClient(frame.clone().into_bytes())]
+            );
+            assert_eq!(log.last().would, Some(audit::Verdict::Drop), "{frame}");
+            assert_eq!(record.get().as_deref(), Some(SAMPLING_TAINT), "{frame}");
+        }
+    }
+
+    // Not one that names another method, or names it only in what it
+    // carries.
+    for frame in [
+        "{\"jsonrpc\":\"2.0\",\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"roots/list\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":5.0,\"result\":{\"method\":\"sampling/createMessage\"}}\n",
+    ] {
+        let record = Arc::new(Record::default());
+        let (mut gate, _) = sharing_gate(OBSERVE, &record);
+        assert_eq!(
+            gate.from_server(frame.as_bytes()),
+            vec![Action::ToClient(frame.as_bytes().to_vec())]
+        );
+        assert_eq!(record.get(), None, "{frame}");
+    }
 }
 
 #[test]
@@ -1399,11 +1506,23 @@ fn answer_with(gate: &mut Gate, id: u64, answer: &[u8]) -> Vec<Action> {
     gate.from_server(answer)
 }
 
+/// The gateway's credential base64-encoded, as a resource's blob could hold
+/// it: `TOKEN=opaque-token-1234567`.
+const ENCODED_CREDENTIAL: &str = "VE9LRU49b3BhcXVlLXRva2VuLTEyMzQ1Njc=";
+
+/// A tool result's content block holding a resource whose blob is `blob`.
+fn resource_block(blob: &str) -> String {
+    format!(
+        r#"{{"type":"resource","resource":{{"uri":"file:///x","mimeType":"text/plain","blob":"{blob}"}}}}"#
+    )
+}
+
 fn assert_no_credential(actions: &[Action]) {
     for action in actions {
         let (Action::ToClient(bytes) | Action::ToServer(bytes)) = action;
         let text = jsonrpc::unescaped(bytes);
         assert!(!text.contains(CREDENTIAL), "{text}");
+        assert!(!text.contains(ENCODED_CREDENTIAL), "{text}");
     }
 }
 
@@ -1579,6 +1698,118 @@ fn observe_mode_stops_the_gateways_credential_in_an_answer_it_cant_read() {
 
         let recorded = serde_json::to_string(&log.events()).unwrap();
         assert!(!recorded.contains(CREDENTIAL), "{recorded}");
+    }
+}
+
+#[test]
+fn the_gateways_credential_is_never_looked_for_by_reading_more_than_a_message_may_cost() {
+    // A repeated key stops classifying before the rows, which would take
+    // over 80 MB to read in full, are counted: the message isn't read, so
+    // the client gets an error in its place.
+    let rows = vec![r#"{"id":1,"name":"x"}"#; 80_000].join(",");
+    let (mut gate, log) = credential_gate(OBSERVE);
+    for (id, block) in [
+        (10, format!(r#"{{"type":"text","text":"{CREDENTIAL}"}}"#)),
+        (11, resource_block(ENCODED_CREDENTIAL)),
+        // A blob that could hold it, which only reading it would show.
+        (12, resource_block("aGk=")),
+    ] {
+        let answer = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"x\":0,\"x\":0,\"content\":[{block}],\"structuredContent\":{{\"rows\":[{rows}]}}}}}}\n"
+        );
+        assert!(matches!(
+            classify(answer.as_bytes()),
+            Err(ParseError::Json(_))
+        ));
+        let actions = answer_with(&mut gate, id, answer.as_bytes());
+        assert_no_credential(&actions);
+        let reply = only_to_client(&actions);
+        assert_eq!(reply["id"], id);
+        assert_eq!(reply["result"]["isError"], true);
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("the gateway's credential"), "{text}");
+        assert_eq!(log.last().verdict, Some(audit::Verdict::Block));
+    }
+}
+
+#[test]
+fn observe_mode_stops_the_gateways_credential_encoded_in_a_resource_blob() {
+    let encoded = resource_block(ENCODED_CREDENTIAL);
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let rows = vec![r#"{"id":1,"name":"x"}"#; 80_000].join(",");
+    for redact in ["", "[secrets]\nredact_responses = false\n"] {
+        let (mut gate, log) = credential_gate(&format!("{OBSERVE}{redact}"));
+
+        // Not readable at all (nested too deeply, or too large to check):
+        // the client gets an error in its place.
+        for (id, rest) in [
+            (10, format!(r#""_meta":{{"deep":{deep}}}"#)),
+            (11, format!(r#""structuredContent":{{"rows":[{rows}]}}"#)),
+        ] {
+            let answer = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{encoded}],{rest}}}}}\n"
+            );
+            let actions = answer_with(&mut gate, id, answer.as_bytes());
+            assert_no_credential(&actions);
+            let reply = only_to_client(&actions);
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply["result"]["isError"], true);
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("a resource blob that could hold the gateway's credential"),
+                "{text}"
+            );
+            let event = log.last();
+            assert_eq!(event.verdict, Some(audit::Verdict::Block));
+            assert!(
+                event
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("gateway's credential"),
+                "{event:?}"
+            );
+            assert!(!gate.pending.contains_key(&id.to_string()));
+        }
+
+        // Held only by a copy of a repeated key that reading the message
+        // leaves out, and a client could read instead: written again
+        // without it.
+        let repeated_blob = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":{{\"content\":[{{\"type\":\"resource\",\"resource\":{{\"uri\":\"file:///x\",\"blob\":\"{ENCODED_CREDENTIAL}\",\"blob\":\"aGk=\"}}}}]}}}}\n"
+        );
+        let actions = answer_with(&mut gate, 12, repeated_blob.as_bytes());
+        assert_no_credential(&actions);
+        assert_eq!(
+            only_to_client(&actions)["result"]["content"][0]["resource"]["blob"],
+            "aGk="
+        );
+        let repeated_content = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{{\"content\":[{encoded}],\"content\":[]}}}}\n"
+        );
+        let actions = answer_with(&mut gate, 13, repeated_content.as_bytes());
+        assert_no_credential(&actions);
+        assert_eq!(only_to_client(&actions)["result"]["content"], json!([]));
+        let event = log.last();
+        assert_eq!(event.verdict, Some(audit::Verdict::Modify));
+        assert_eq!(event.would, Some(audit::Verdict::Drop));
+        assert!(
+            matches!(event.changes.as_slice(), [change] if change.contains("gateway's credential")),
+            "{:?}",
+            event.changes
+        );
+
+        // One that can be read, holding nothing, passes byte for byte.
+        let clean = line(json!({"jsonrpc": "2.0", "id": 14, "result": {
+            "content": [{"type": "resource", "resource": {"uri": "file:///x", "blob": "aGk="}}]}}));
+        assert_eq!(
+            answer_with(&mut gate, 14, &clean),
+            vec![Action::ToClient(clean.clone())]
+        );
+
+        let recorded = serde_json::to_string(&log.events()).unwrap();
+        assert!(!recorded.contains(CREDENTIAL), "{recorded}");
+        assert!(!recorded.contains(ENCODED_CREDENTIAL), "{recorded}");
     }
 }
 
