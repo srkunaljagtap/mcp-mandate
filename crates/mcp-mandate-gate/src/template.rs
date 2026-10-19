@@ -40,11 +40,15 @@
 //!   one or drive after it (a file URI may have its drive there:
 //!   `file://localhost/C:/Users`). Inside a host, with more of the host's
 //!   own text after it (`https://api-{region}.example.com`,
-//!   `https://{tenant}.example.com`), it holds no `@`, `/`, `\`, `?`, `#`
-//!   or `:`, as written or percent-decoded. After the host's `:`
+//!   `https://{tenant}.example.com`), it holds only letters and digits
+//!   (`münchen` too), `-`, `.` and `_`: URL parsers differ on what else
+//!   ends a host (Node's legacy `url.parse` ends it at `;`, `|` or `%`), so
+//!   percent-encoded host text is refused too. After the host's `:`
 //!   (`https://localhost:{port}/api`) it is a port number. A variable that
-//!   is the whole host (`https://{host}/api`) already lets the model choose
-//!   it, as `https://{+url}` does, so only the rules above apply to it.
+//!   is the whole host, alone or with only a port after it
+//!   (`https://{host}/api`, `http://{host}:{port}/mcp`), already lets the
+//!   model choose it, as `https://{+url}` does, so only the rules above
+//!   apply to it (an IPv6 address such as `[::1]` too).
 //!   Other schemes have no host: a server may serve `docs://page-{+p}` or
 //!   `docs://{+path}` from a folder, so `docs://page-/etc/passwd` and
 //!   `docs:///etc/passwd` are refused.
@@ -82,7 +86,7 @@ enum Place {
     /// drive right after that.
     Path { drive: bool },
     /// Inside a host, with more of the host's own text after it
-    /// (`https://api-{region}.example.com`): nothing that ends the host.
+    /// (`https://api-{region}.example.com`): only what a host name holds.
     Host,
     /// After the host's `:` (`https://localhost:{port}`): a port number.
     Port,
@@ -96,10 +100,24 @@ const HOST_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "file"];
 /// too: URL parsers read it as `/` in these schemes).
 const AFTER_HOST: &[char] = &['/', '\\', '?', '#'];
 
-/// What a variable inside a host may not hold, as written or
-/// percent-decoded: each would end the host there (`/`, `\`, `?`, `#`),
-/// start a port (`:`), or make what came before it a user name (`@`).
-const ENDS_HOST: &[char] = &['@', '/', '\\', '?', '#', ':'];
+/// Whether a variable inside a host may hold `c`: a letter or a digit
+/// (`münchen` too), `-`, `.` or `_`, as a host name does. URL parsers
+/// differ on what else ends a host: all of them end it at `/`, `?` or `#`,
+/// many at `\`, most at `:` (a port) or `@` (making what came before it a
+/// user name), and Node's legacy `url.parse` at `%`, `;`, `'`, `"`, `<`,
+/// `>`, `^`, `` ` ``, `{`, `|` and `}` too. As `%` isn't one, neither is
+/// any percent-encoded text, so decoding it can add nothing.
+fn in_host_name(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '.' | '_')
+}
+
+/// Whether `text`, a host's own text after a variable that has none
+/// before it, is only a port: `:`, then digits (or none, where a variable
+/// fills it: `{host}:{port}`).
+fn only_port(text: &str) -> bool {
+    text.strip_prefix(':')
+        .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+}
 
 impl Place {
     /// Where the variable whose `{}` starts at `at` in `literal` (the
@@ -132,12 +150,14 @@ impl Place {
         }
         // The variable is in the host: what the template has after it
         // there decides what it is.
-        let rest = &after[..after.find(AFTER_HOST).unwrap_or(after.len())];
-        if !rest.replace("{}", "").is_empty() {
-            Self::Host
-        } else if host.is_empty() {
-            // The whole host, which the model already chooses.
+        let rest = after[..after.find(AFTER_HOST).unwrap_or(after.len())].replace("{}", "");
+        if host.is_empty() && (rest.is_empty() || only_port(&rest)) {
+            // The whole host, perhaps with a port after it, which the model
+            // already chooses (`[::1]` too). A user name isn't one:
+            // `https://{+user}:{pass}@example.com` names its host.
             Self::Inside
+        } else if !rest.is_empty() {
+            Self::Host
         } else if host.ends_with(':') {
             Self::Port
         } else {
@@ -198,7 +218,7 @@ impl Misfit {
                 "a variable starts with `/` or `\\`, or makes a segment that starts with a drive such as `C:` or an empty `//` segment, which could reach outside the template"
             }
             Self::Host => {
-                "a variable could change the URI's host: right after the host it must be empty or start with `/`, within the host it can't hold `@`, `/`, `\\`, `?`, `#` or `:`, and after the host's `:` it must be a port number"
+                "a variable could change the URI's host: right after the host it must be empty or start with `/`, within the host it can hold only letters, digits, `-`, `.` and `_` (nothing percent-encoded), and after the host's `:` it must be a port number"
             }
         }
     }
@@ -454,11 +474,13 @@ fn fits_place(raw: &str, place: Place) -> Result<(), Misfit> {
             None if raw.is_empty() => return Ok(()),
             None => return Err(Misfit::Host),
         },
+        // Inside a host: only what a host name holds, which leaves out
+        // `%`, so percent-decoding it changes nothing.
         Place::Host => {
-            return if raw.contains(ENDS_HOST) || percent_decode(raw).contains(ENDS_HOST) {
-                Err(Misfit::Host)
-            } else {
+            return if raw.chars().all(in_host_name) {
                 Ok(())
+            } else {
+                Err(Misfit::Host)
             };
         }
         Place::Port => {
@@ -1070,6 +1092,106 @@ mod tests {
         ] {
             assert!(Template::parse(template).matches(uri), "{template} {uri}");
         }
+    }
+
+    #[test]
+    fn inside_a_host_a_variable_holds_only_a_host_names_characters() {
+        // Node's legacy `url.parse` ends a host at each of these (at the
+        // `%` of `%2e` or `%00` too), so a server that uses it reads the
+        // first three hosts as `evil.example`.
+        for (template, uri) in [
+            (
+                "https://{tenant}.example.com/v1",
+                "https://evil.example;.example.com/v1",
+            ),
+            (
+                "https://{tenant}.example.com/v1",
+                "https://evil.example%2e.example.com/v1",
+            ),
+            (
+                "https://{tenant}.example.com/v1",
+                "https://evil.example|.example.com/v1",
+            ),
+            (
+                "https://{tenant}.example.com/v1",
+                "https://x%00.example.com/v1",
+            ),
+            (
+                "https://api-{region}.example.com/v1",
+                "https://api-x'.example.com/v1",
+            ),
+            (
+                "https://api-{+region}.example.com/v1",
+                "https://api-x%2Fevil.example.com/v1",
+            ),
+        ] {
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::Host),
+                "{template} {uri}"
+            );
+        }
+        // Letters in any script, digits, `-`, `.` and `_` are fine.
+        for (template, uri) in [
+            (
+                "https://{tenant}.example.com/v1",
+                "https://münchen.example.com/v1",
+            ),
+            (
+                "https://api-{region}.example.com/v1",
+                "https://api-us-east-1.example.com/v1",
+            ),
+            (
+                "https://{tenant}.example.com/v1",
+                "https://eu_west.acme.example.com/v1",
+            ),
+        ] {
+            assert!(Template::parse(template).matches(uri), "{template} {uri}");
+        }
+    }
+
+    #[test]
+    fn a_whole_host_with_only_a_port_after_it_is_the_models_to_choose() {
+        // No host text before the variable and only a port after it: the
+        // model chooses the host, an IPv6 address too.
+        for (template, uri) in [
+            ("http://{host}:{port}/mcp", "http://[::1]:8080/mcp"),
+            ("http://{host}:{port}/mcp", "http://localhost:8080/mcp"),
+            ("https://{host}:8443/api", "https://[::1]:8443/api"),
+            (
+                "https://{host}:{port}{+path}",
+                "https://[::1]:8443/v1/items",
+            ),
+        ] {
+            assert!(Template::parse(template).matches(uri), "{template} {uri}");
+        }
+        // Still within a host when the template names more of it after
+        // the variable, and a user name before `@` isn't a port.
+        for (template, uri) in [
+            (
+                "https://{tenant}.example.com/v1",
+                "https://[::1].example.com/v1",
+            ),
+            (
+                "https://{host}:8443.example.com/api",
+                "https://[::1]:8443.example.com/api",
+            ),
+            (
+                "https://{+user}:{pass}@example.com/",
+                "https://evil.example/:x@example.com/",
+            ),
+        ] {
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::Host),
+                "{template} {uri}"
+            );
+        }
+        // The port still takes only a number.
+        assert_eq!(
+            Template::parse("http://{host}:{port}/mcp").check("http://[::1]:80@evil.example/mcp"),
+            Err(Misfit::Host)
+        );
     }
 
     #[test]
