@@ -340,12 +340,31 @@ fn keep_lock(record: &Path, lock: &Mutex<File>) -> std::io::Result<()> {
 /// as needed, and the file there is locked instead.
 #[cfg(unix)]
 fn follow_lock(record: &Path, lock: &mut File) -> std::io::Result<()> {
+    let held = lock.metadata();
+    follow_lock_from(record, held, lock)
+}
+
+/// [`follow_lock`], given what reading the held file's metadata gave. A
+/// held file that can't be read (stale, on a network drive, once another
+/// computer removed it) counts as no longer there: giving up instead would
+/// never lock the file there again.
+#[cfg(unix)]
+fn follow_lock_from(
+    record: &Path,
+    held: std::io::Result<fs::Metadata>,
+    lock: &mut File,
+) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let held = lock.metadata()?;
     // Links aren't followed: one in the lock file's place isn't it.
     match fs::symlink_metadata(record.with_extension("lock")) {
-        Ok(found) if found.dev() == held.dev() && found.ino() == held.ino() => return Ok(()),
+        Ok(found)
+            if held
+                .as_ref()
+                .is_ok_and(|held| found.dev() == held.dev() && found.ino() == held.ino()) =>
+        {
+            return Ok(());
+        }
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -360,8 +379,10 @@ fn follow_lock(record: &Path, lock: &mut File) -> std::io::Result<()> {
     Ok(())
 }
 
-/// On Windows the lock file's folder, under `LOCALAPPDATA`, isn't emptied
-/// at logout or by a cleaner of old files, so the lock file is left as it is.
+/// On Windows the lock file can't be removed or renamed while a server holds
+/// it (see [`open_lock`]), and its folder, under `LOCALAPPDATA`, isn't
+/// emptied at logout or by a cleaner of old files, so the lock file is left
+/// as it is.
 #[cfg(not(unix))]
 fn follow_lock(_: &Path, _: &mut File) -> std::io::Result<()> {
     Ok(())
@@ -545,6 +566,19 @@ fn open_lock(record: &Path) -> std::io::Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Others can read and write it while it's open, but not remove or
+        // rename it: by default Windows would remove its name at once,
+        // while servers still hold it, and the next server would make a
+        // new one and clear the running agent's taint. Every server opens
+        // it this way, asking only to read and write it, so they can all
+        // hold it together.
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     }
     no_follow(&mut options).open(record.with_extension("lock"))
 }
@@ -1048,9 +1082,9 @@ mod tests {
     }
 
     /// A lock file removed while the agent runs, alone or with its folder
-    /// (as a runtime folder is at logout, made again at the next login), is
-    /// made and locked again, so a server started afterwards doesn't clear
-    /// the running agent's taint.
+    /// (as a runtime folder is at logout, made again at the next login), or
+    /// replaced by another, is made and locked again, so a server started
+    /// afterwards doesn't clear the running agent's taint.
     #[cfg(unix)]
     #[test]
     fn a_named_server_locks_its_lock_file_again_once_its_removed() {
@@ -1066,6 +1100,37 @@ mod tests {
 
         fs::remove_file(&lock).unwrap();
         assert!(eventually(|| locked(&lock)), "locked again once removed");
+
+        // Removed, and the file it holds can't be read any more (stale, on
+        // a network drive, once another computer removed it): the lock file
+        // is still made and locked again.
+        let mut held = running.lock().unwrap();
+        fs::remove_file(&lock).unwrap();
+        let stale = std::io::Error::from(nix::errno::Errno::ESTALE);
+        follow_lock_from(&path, Err(stale), &mut held).unwrap();
+        assert!(
+            locked(&lock),
+            "locked again though the old one can't be read"
+        );
+        drop(held);
+
+        // Removed, and made again by a server that starts before the keeper
+        // checks: the new file is locked as well, once the keeper does.
+        let paused = running.lock().unwrap();
+        fs::remove_file(&lock).unwrap();
+        drop(AgentTaint::join(path.clone(), CHECK));
+        assert!(!locked(&lock));
+        drop(paused);
+        assert!(
+            eventually(|| locked(&lock)),
+            "locks the file made in its place"
+        );
+        // So once a server that saw the taint puts the record back, a
+        // server starting now keeps it.
+        write_record(&path, "the output of tool `fetch`").unwrap();
+        let next = AgentTaint::join(path.clone(), CHECK);
+        assert_eq!(next.get().as_deref(), Some("the output of tool `fetch`"));
+        drop(next);
 
         // The folder goes and can't be made again for a while (a file is
         // in its place). The keeper waits while it's swapped.
@@ -1095,6 +1160,33 @@ mod tests {
         drop(server);
         drop(next);
         assert!(!locked(&lock));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// On Windows a running server's lock file can't be removed or renamed
+    /// (by hand, with its folder, say), so a server started meanwhile can't
+    /// make a new one and clear the running agent's taint.
+    #[cfg(windows)]
+    #[test]
+    fn a_named_servers_lock_file_stays_while_it_runs() {
+        let folder = folder("held");
+        let path = folder.join("taint-named-test");
+        let lock = path.with_extension("lock");
+        let server = AgentTaint::join(path.clone(), CHECK);
+        assert!(server.running.is_some());
+        server.set("the output of tool `fetch`");
+
+        assert!(fs::remove_file(&lock).is_err());
+        assert!(fs::rename(&lock, folder.join("moved")).is_err());
+        assert!(lock.exists());
+        // A server starting now sees the agent running.
+        let next = AgentTaint::join(path.clone(), CHECK);
+        assert_eq!(next.get().as_deref(), Some("the output of tool `fetch`"));
+
+        // Once none runs, it can be.
+        drop(server);
+        drop(next);
+        fs::remove_file(&lock).unwrap();
         let _ = fs::remove_dir_all(&folder);
     }
 
