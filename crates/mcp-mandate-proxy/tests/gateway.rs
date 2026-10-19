@@ -50,6 +50,8 @@ struct World {
     streams: Arc<AtomicUsize>,
     /// Requests the server is holding unanswered now.
     holding: Arc<AtomicUsize>,
+    /// Gamma's session ends, which calls of `outlast` wait for.
+    ends: Arc<tokio::sync::watch::Sender<usize>>,
     dir: PathBuf,
     client: reqwest::Client,
 }
@@ -162,10 +164,15 @@ fn dump_tool() -> Value {
 ///   (request `r1`, whose answer it takes at once), then sends only
 ///   keep-alives;
 /// - `forget` answers `404`, as a server that forgot the session does,
-///   once two calls of it are waiting: one at once, the other 300 ms later.
+///   once two calls of it are waiting: one at once, the other 300 ms later;
+/// - `outlast` waits until a session is ended, then answers as its `then`
+///   argument says: `fail` with HTTP 500, `stream` on an event stream,
+///   `hang up` by dropping the connection. With `break off`, it starts
+///   answering at once instead, and drops the connection partway through
+///   when the session ends.
 fn gamma_tools() -> Vec<Value> {
     [
-        "flood", "burst", "wait", "linger", "slow", "drone", "ask", "forget",
+        "flood", "burst", "wait", "linger", "slow", "drone", "ask", "forget", "outlast",
     ]
         .iter()
         .map(|name| {
@@ -187,6 +194,9 @@ struct Fake {
     holding: Arc<AtomicUsize>,
     /// Where calls of `forget` wait for each other.
     forgetting: Arc<tokio::sync::Barrier>,
+    /// How many of gamma's sessions were ended; calls of `outlast` wait
+    /// for the next.
+    ends: Arc<tokio::sync::watch::Sender<usize>>,
 }
 
 /// Counts something while it exists.
@@ -247,6 +257,7 @@ async fn mcp_server() -> (String, Fake, Recorder) {
         streams: Arc::default(),
         holding: Arc::default(),
         forgetting: Arc::new(tokio::sync::Barrier::new(2)),
+        ends: Arc::new(tokio::sync::watch::Sender::new(0)),
     };
     let (listener, url) = listen().await;
     let app =
@@ -259,6 +270,7 @@ async fn mcp_server() -> (String, Fake, Recorder) {
                      headers: HeaderMap| async move {
                         record(&fake.seen, format!("/{server}/mcp"), "DELETE", &headers);
                         if server == "gamma" {
+                            fake.ends.send_modify(|ends| *ends += 1);
                             return hold(&fake.holding).await;
                         }
                         StatusCode::OK.into_response()
@@ -391,6 +403,29 @@ async fn serve_mcp(
             }
             StatusCode::NOT_FOUND.into_response()
         }
+        "tools/call" if gamma && tool == "outlast" => {
+            let mut ended = fake.ends.subscribe();
+            let then = &message["params"]["arguments"]["then"];
+            if then == "break off" {
+                let broken = futures_util::stream::once(async move {
+                    let _ = ended.changed().await;
+                    Err::<Bytes, _>(std::io::Error::other("broke off"))
+                });
+                let body = Body::from_stream(broken);
+                return ([(header::CONTENT_TYPE, "application/json")], body).into_response();
+            }
+            let _ = ended.changed().await;
+            match then.as_str() {
+                Some("fail") => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Some("stream") => {
+                    let answer = reply(json!({"content": [{"type": "text", "text": "outlasted"}]}));
+                    event_stream(Body::from(format!("event: message\ndata: {answer}\n\n")))
+                }
+                // Unwinding drops the connection, without the noise of a
+                // panic message.
+                _ => std::panic::resume_unwind(Box::new("hung up")),
+            }
+        }
         "tools/call" if message["params"]["name"] == "whoami" => {
             let auth = headers
                 .get(header::AUTHORIZATION)
@@ -512,6 +547,7 @@ auth = {{ type = "client_credentials", token_url = "{issuer}/token", client_id =
         stolen,
         streams: fake.streams,
         holding: fake.holding,
+        ends: fake.ends,
         dir,
         client,
     }
@@ -1451,7 +1487,7 @@ async fn listing_ends_even_when_the_server_never_confirms_the_end_of_its_session
     let listed = tokio::time::timeout(Duration::from_secs(30), inventory(&config.servers["gamma"]))
         .await
         .expect("the listing ended");
-    assert_eq!(listed.unwrap().tools.len(), 13);
+    assert_eq!(listed.unwrap().tools.len(), 14);
     assert_eq!(world.deletes(), 1);
 }
 
@@ -1776,4 +1812,99 @@ async fn an_answer_whose_token_expires_while_it_is_checked_still_reaches_the_ser
         "it reached the server"
     );
     drop(asking);
+}
+
+#[tokio::test]
+async fn an_answer_too_large_to_check_whose_token_expires_while_it_is_checked_is_still_answered() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    let session = world.initialize("gamma", &token).await;
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    world
+        .post("gamma", Some(&token), Some(&session), list)
+        .await;
+    let ask = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "ask", "arguments": {}}});
+    let mut asking = world.post("gamma", Some(&token), Some(&session), ask).await;
+    let asked: Value = serde_json::from_str(&first_message(&mut asking).await).unwrap();
+    assert_eq!(asked["method"], "roots/list", "{asked}");
+    // The client's answer would take more memory to read than the gate
+    // allows, so the gate answers the server with an error in its place.
+    let objects = vec![r#"{"a":0}"#; 100_000].join(",");
+    let answer = format!(
+        r#"{{"jsonrpc":"2.0","id":{},"result":{{"roots":[{objects}]}}}}"#,
+        asked["id"]
+    );
+    // Sent with a token that has under a second left. The answer's check
+    // can't finish until the audit log is free, by when the token has
+    // expired.
+    just_after_a_whole_second().await;
+    let short_lived = world.token("alice", json!({"exp": now() + 1}));
+    let held = world.hold_log("gamma");
+    let answered = world
+        .client
+        .post(world.url("gamma"))
+        .bearer_auth(&short_lived)
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("mcp-session-id", &session)
+        .body(answer)
+        .send();
+    let free = async {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        held.unlock().unwrap();
+    };
+    let (answered, ()) = tokio::join!(answered, free);
+    // The gate no longer expects an answer to `r1`, and a retry would be
+    // dropped: its answer is sent on rather than refused.
+    assert_eq!(answered.unwrap().status(), 202);
+    assert!(
+        world.seen().iter().any(|seen| seen.method == "(response)"),
+        "the gate's answer reached the server"
+    );
+    drop(asking);
+}
+
+#[tokio::test]
+async fn a_request_whose_session_ends_while_the_server_has_it_is_told_the_session_ended() {
+    let world = world().await;
+    let token = world.token("alice", json!({}));
+    for then in ["fail", "stream", "hang up", "break off"] {
+        let session = world.initialize("gamma", &token).await;
+        let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        world
+            .post("gamma", Some(&token), Some(&session), list)
+            .await;
+        let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "outlast", "arguments": {"then": then}}});
+        let called = world.post("gamma", Some(&token), Some(&session), call);
+        let end = async {
+            wait_until("the call is at the server", || {
+                world.ends.receiver_count() == 1
+            })
+            .await;
+            if then == "break off" {
+                // Long enough for its answer to start arriving here.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            // Gamma never confirms the end of a session, so the gateway's
+            // answer to the client takes a while: it isn't waited for.
+            let ending = world
+                .client
+                .delete(world.url("gamma"))
+                .bearer_auth(&token)
+                .header("mcp-session-id", &session)
+                .send();
+            tokio::spawn(ending).abort_handle()
+        };
+        let (called, ending) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(called, end) })
+                .await
+                .expect("the call was answered");
+        // Not the server's failure, nor an empty stream.
+        assert_eq!(called.status(), 404, "{then}");
+        let text = called.text().await.unwrap();
+        assert!(text.contains("the session ended"), "{then}: {text}");
+        ending.abort();
+    }
 }
