@@ -30,20 +30,30 @@
 //!   template's own text doesn't have (`{a}:{b}` as `C` and `x`).
 //! - Where a variable sits can widen that. Right after `file://` it names
 //!   the whole location (`file:///etc/passwd`), so none of it applies.
-//!   Right after `file:///` the template names the whole filesystem, so the
-//!   variable may start at a drive (`file:///C:/Users`). Right after a host
-//!   (`https://{host}{+path}`, `https://api.example.com{+path}`) it may
-//!   start with the path's own `/`, but not with a second one or a drive
-//!   after it. Any other scheme gets no such leeway: a server may serve
-//!   `docs://{+path}` from a folder, so `docs:///etc/passwd` is refused.
+//!   Where a file URI's path starts (`file:///{+path}`,
+//!   `file://localhost/{+path}`) the template names the whole filesystem,
+//!   so the variable may start at a drive (`file:///C:/Users`).
+//! - Only `http`, `https`, `ws`, `wss` and `file` URIs have a host, and no
+//!   variable can change the one the template's own text names. Right
+//!   after it (`https://api.example.com{+path}`, `https://{host}{+path}`)
+//!   a variable is empty or starts with the path's own `/`, with no second
+//!   one or drive after it (a file URI may have its drive there:
+//!   `file://localhost/C:/Users`). Inside a host, with more of the host's
+//!   own text after it (`https://api-{region}.example.com`,
+//!   `https://{tenant}.example.com`), it holds no `@`, `/`, `\`, `?`, `#`
+//!   or `:`, as written or percent-decoded. After the host's `:`
+//!   (`https://localhost:{port}/api`) it is a port number. A variable that
+//!   is the whole host (`https://{host}/api`) already lets the model choose
+//!   it, as `https://{+url}` does, so only the rules above apply to it.
+//!   Other schemes have no host: a server may serve `docs://page-{+p}` or
+//!   `docs://{+path}` from a folder, so `docs://page-/etc/passwd` and
+//!   `docs:///etc/passwd` are refused.
 //! - `\` separates segments in all of these, as `/` does: some servers
 //!   read it that way.
 //! - A template without variables matches only itself.
 //! - Any other expression (`{#x}`, `{.x}`, `{/x}`, `{;x}`, `{?x}`, `{&x}`)
 //!   matches nothing: the gate can't tell what it would reach, so it fails
 //!   closed.
-
-use std::borrow::Cow;
 
 use mcp_mandate_pin::is_hidden;
 use regex::Regex;
@@ -63,26 +73,75 @@ enum Place {
     /// Right after `file://`, where it names the whole location
     /// (`file:///etc/passwd`): anywhere.
     Location,
-    /// Right after `file:///`, where the template names the whole
+    /// Where a file URI's path starts (`file:///{+path}`,
+    /// `file://localhost/{+path}`), so the template names the whole
     /// filesystem: at a drive too (`file:///C:/Users`).
     Drive,
-    /// Right after a host (`https://{host}{+path}`): at the path's own
-    /// first `/` too.
-    Path,
+    /// Right after a host (`https://api.example.com{+path}`): empty, or
+    /// at the path's own first `/`, and with `drive` (a file URI) at a
+    /// drive right after that.
+    Path { drive: bool },
+    /// Inside a host, with more of the host's own text after it
+    /// (`https://api-{region}.example.com`): nothing that ends the host.
+    Host,
+    /// After the host's `:` (`https://localhost:{port}`): a port number.
+    Port,
 }
 
+/// The schemes whose URIs name a host after `//`, which a variable could
+/// change. A server may serve any other scheme's URIs from a folder.
+const HOST_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "file"];
+
+/// What ends a URI's host: where its path, query or fragment starts (`\`
+/// too: URL parsers read it as `/` in these schemes).
+const AFTER_HOST: &[char] = &['/', '\\', '?', '#'];
+
+/// What a variable inside a host may not hold, as written or
+/// percent-decoded: each would end the host there (`/`, `\`, `?`, `#`),
+/// start a port (`:`), or make what came before it a user name (`@`).
+const ENDS_HOST: &[char] = &['@', '/', '\\', '?', '#', ':'];
+
 impl Place {
-    /// Where a variable sits, from the template's text before it (earlier
-    /// expressions as `{}`).
-    fn after(before: &str) -> Self {
-        if before.eq_ignore_ascii_case("file://") {
-            Self::Location
-        } else if before.eq_ignore_ascii_case("file:///") {
-            Self::Drive
-        } else if ends_at_host(before) {
-            Self::Path
-        } else {
+    /// Where the variable whose `{}` starts at `at` in `literal` (the
+    /// template's text, each expression as `{}`) sits.
+    fn of(literal: &str, at: usize) -> Self {
+        let (before, after) = (&literal[..at], &literal[at + 2..]);
+        // `host` is the text from `://` to the variable.
+        let Some((scheme, host)) = before.split_once("://") else {
+            return Self::Inside;
+        };
+        if !HOST_SCHEMES
+            .iter()
+            .any(|known| scheme.eq_ignore_ascii_case(known))
+        {
+            return Self::Inside;
+        }
+        let file = scheme.eq_ignore_ascii_case("file");
+        if file && host.is_empty() {
+            return Self::Location;
+        }
+        if file
+            && host
+                .strip_suffix('/')
+                .is_some_and(|host| !host.contains(AFTER_HOST))
+        {
+            return Self::Drive;
+        }
+        if host.contains(AFTER_HOST) {
+            return Self::Inside;
+        }
+        // The variable is in the host: what the template has after it
+        // there decides what it is.
+        let rest = &after[..after.find(AFTER_HOST).unwrap_or(after.len())];
+        if !rest.replace("{}", "").is_empty() {
+            Self::Host
+        } else if host.is_empty() {
+            // The whole host, which the model already chooses.
             Self::Inside
+        } else if host.ends_with(':') {
+            Self::Port
+        } else {
+            Self::Path { drive: file }
         }
     }
 }
@@ -119,6 +178,9 @@ pub(crate) enum Misfit {
     /// where its place doesn't allow it, or the URI has an empty segment
     /// or one at a drive that the template's own text doesn't have.
     Root,
+    /// It has the shape, but a variable in or right after the URI's host
+    /// could change that host.
+    Host,
 }
 
 impl Misfit {
@@ -134,6 +196,9 @@ impl Misfit {
             }
             Self::Root => {
                 "a variable starts with `/` or `\\`, or makes a segment that starts with a drive such as `C:` or an empty `//` segment, which could reach outside the template"
+            }
+            Self::Host => {
+                "a variable could change the URI's host: right after the host it must be empty or start with `/`, within the host it can't hold `@`, `/`, `\\`, `?`, `#` or `:`, and after the host's `:` it must be a port number"
             }
         }
     }
@@ -162,12 +227,13 @@ impl Template {
         // The template's text, each expression replaced by `{}`, which
         // can't be part of a dot segment or start a drive.
         let mut literal = String::new();
+        // Each variable, and where its `{}` starts in `literal`.
         let mut variables = Vec::new();
         let mut rest = template;
         while let Some(open) = rest.find('{') {
             source.push_str(&regex::escape(&rest[..open]));
             literal.push_str(&rest[..open]);
-            let place = Place::after(&literal);
+            let at = literal.len();
             literal.push_str("{}");
             let Some(close) = rest[open..].find('}') else {
                 return Self::unsupported();
@@ -181,12 +247,18 @@ impl Template {
                 _ => return Self::unsupported(),
             };
             source.push_str(group);
-            variables.push((variable, place));
+            variables.push((variable, at));
             rest = &rest[open + close + 1..];
         }
         source.push_str(&regex::escape(rest));
         source.push('$');
         literal.push_str(rest);
+        // A variable's place can depend on the text after it too
+        // (`https://api-{region}.example.com`).
+        let variables = variables
+            .into_iter()
+            .map(|(variable, at)| (variable, Place::of(&literal, at)))
+            .collect();
         Self {
             pattern: Regex::new(&source).ok().map(|regex| (regex, variables)),
             dots: dot_segments(&literal, PATH),
@@ -254,36 +326,38 @@ impl Template {
         // A variable that starts at a root replaces the folder a server
         // joins it to (`/etc/passwd`, `C:/Users`), and so does a second
         // parameter after a query delimiter (`?path=x&path=/etc/passwd`)
-        // or a segment at a drive (`docs/C:/Windows`).
-        if variables
-            .iter()
-            .zip(&values)
-            .any(|((_, place), raw)| rooted(raw, *place))
-        {
-            return Err(Misfit::Root);
+        // or a segment at a drive (`docs/C:/Windows`). One in or right
+        // after a host could point the URI elsewhere (`@evil.example`).
+        for ((_, place), raw) in variables.iter().zip(&values) {
+            fits_place(raw, *place)?;
         }
         // Empty segments and drives are counted over the whole URI, like
         // dot segments: a variable can make an empty one at its edge
         // (`{+a}/x` as `dir/`) or by being empty (`{a}/x` as nothing), and
         // a drive next to the template's text (`{a}:{b}` as `C` and `x`).
-        // Only the first variable can sit right after `file://` or
-        // `file:///`.
-        let counted = match (variables.first(), captures.get(1)) {
-            // It names the whole location: left out.
-            (Some((_, Place::Location)), Some(first)) => Cow::Owned(format!(
-                "{}{{}}{}",
-                &uri[..first.start()],
-                &uri[first.end()..]
-            )),
-            // It may start at a drive: `{}` in front keeps that drive from
-            // counting.
-            (Some((_, Place::Drive)), Some(first)) => Cow::Owned(format!(
-                "{}{{}}{}",
-                &uri[..first.start()],
-                &uri[first.start()..]
-            )),
-            _ => Cow::Borrowed(uri),
-        };
+        let mut counted = String::with_capacity(uri.len());
+        let mut copied = 0;
+        for (index, (_, place)) in variables.iter().enumerate() {
+            let Some(value) = captures.get(index + 1) else {
+                continue;
+            };
+            let (start, end) = match place {
+                // It names the whole location: left out.
+                Place::Location => (value.start(), value.end()),
+                // It may start at a drive (`file:///{+path}`), or have one
+                // right after the path's `/` (`file://localhost{+path}`):
+                // `{}` there keeps that drive from counting.
+                Place::Drive => (value.start(), value.start()),
+                Place::Path { drive: true } if value.as_str().starts_with('/') => {
+                    (value.start() + 1, value.start() + 1)
+                }
+                _ => continue,
+            };
+            counted.push_str(&uri[copied..start]);
+            counted.push_str("{}");
+            copied = end;
+        }
+        counted.push_str(&uri[copied..]);
         if at_most(&empty_segments(&counted), &self.empty)
             && at_most(&drives(&counted), &self.drives)
         {
@@ -337,7 +411,7 @@ fn dot_segments(text: &str, separators: &[char]) -> Dots {
 /// How many empty segments (between two separators, and empty once what a
 /// server may trim is taken off) the path of `text` has, before any `?` or
 /// `#`, as written and percent-decoded. A query value may hold `//` (a URL,
-/// say): only its start matters there, which [`rooted`] checks.
+/// say): only its start matters there, which [`fits_place`] checks.
 fn empty_segments(text: &str) -> [usize; 2] {
     let path = text.split(['?', '#']).next().unwrap_or_default();
     let count = |path: &str| {
@@ -363,18 +437,43 @@ fn drives(text: &str) -> [usize; 2] {
     [count(text), count(&percent_decode(text))]
 }
 
-/// Whether a variable's text, as written or percent-decoded, starts
+/// Whether a variable's text fits where it sits: it doesn't change the
+/// URI's host, and as written or percent-decoded it doesn't start
 /// somewhere of its own that its place doesn't allow.
-fn rooted(raw: &str, place: Place) -> bool {
+fn fits_place(raw: &str, place: Place) -> Result<(), Misfit> {
     let (raw, drive) = match place {
         Place::Inside => (raw, false),
-        Place::Location => return false,
+        Place::Location => return Ok(()),
         Place::Drive => (raw, true),
-        // The path's own first `/`; a second one, or a drive after it,
-        // still counts.
-        Place::Path => (raw.strip_prefix('/').unwrap_or(raw), false),
+        // Where the path starts: empty, or at the path's own first `/`.
+        // A second one after it still counts, and so does a drive, except
+        // in a file URI. Anything else would still be host
+        // (`.evil.example`, `:8080`, `@evil.example`).
+        Place::Path { drive } => match raw.strip_prefix('/') {
+            Some(path) => (path, drive),
+            None if raw.is_empty() => return Ok(()),
+            None => return Err(Misfit::Host),
+        },
+        Place::Host => {
+            return if raw.contains(ENDS_HOST) || percent_decode(raw).contains(ENDS_HOST) {
+                Err(Misfit::Host)
+            } else {
+                Ok(())
+            };
+        }
+        Place::Port => {
+            return if raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                Ok(())
+            } else {
+                Err(Misfit::Host)
+            };
+        }
     };
-    starts_at_root(raw, drive) || starts_at_root(&percent_decode(raw), drive)
+    if starts_at_root(raw, drive) || starts_at_root(&percent_decode(raw), drive) {
+        Err(Misfit::Root)
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether `text` starts at a root of its own once what a server may trim
@@ -396,20 +495,6 @@ fn starts_at_root(text: &str, drive: bool) -> bool {
 fn is_drive(text: &str) -> bool {
     let mut chars = text.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next() == Some(':')
-}
-
-/// Whether `text` is a URI scheme, `://` and a host, with no path yet
-/// (`https://api.example.com`, or `https://{}` when a variable is the
-/// host).
-fn ends_at_host(text: &str) -> bool {
-    let Some((scheme, host)) = text.split_once("://") else {
-        return false;
-    };
-    let mut chars = scheme.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        && !host.is_empty()
-        && !host.contains(['/', '\\', '?', '#'])
 }
 
 /// `%XX` sequences decoded (lossily); anything else kept as is.
@@ -839,12 +924,194 @@ mod tests {
                 "https://api.example.com{+path}",
                 "https://api.example.com/%20/etc/passwd",
             ),
+            ("https://{host}{+path}", "https://example.com//etc/passwd"),
+            ("https://{host}{+path}", "https:///etc/passwd"),
+        ] {
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::Root),
+                "{template} {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_web_and_file_uris_have_a_host_to_follow() {
+        // Another scheme's text after `://` is a name, not a host: a server
+        // that serves these from a folder and reads the variable on its own
+        // gets `/etc/passwd`.
+        for (template, uri) in [
+            ("docs://page-{+p}", "docs://page-/etc/passwd"),
+            ("docs://page-{+p}", "docs://page-%2Fetc%2Fpasswd"),
+            ("notes://n{+path}", "notes://n/etc/passwd"),
+            ("docs://{a}{+b}", "docs://x/etc/passwd"),
+        ] {
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::Root),
+                "{template} {uri}"
+            );
+        }
+        assert!(Template::parse("docs://page-{+p}").matches("docs://page-intro/today.md"));
+        // A web or file URI's path starts right after its host.
+        for (template, uri) in [
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com/v1/items",
+            ),
+            ("https://{host}{+path}", "https://example.com/v1/items"),
+            (
+                "http://api.example.com{+path}",
+                "http://api.example.com/v1/items",
+            ),
+            (
+                "wss://stream.example.com{+path}",
+                "wss://stream.example.com/v1/feed",
+            ),
+            (
+                "WS://stream.example.com{+path}",
+                "WS://stream.example.com/v1/feed",
+            ),
+            ("file://localhost{+path}", "file://localhost/etc/passwd"),
+        ] {
+            assert!(Template::parse(template).matches(uri), "{template} {uri}");
+        }
+    }
+
+    #[test]
+    fn no_variable_changes_the_host() {
+        for (template, uri) in [
+            // Right after a host, the path must start: anything else is
+            // still host, a user name (`@`) or a port.
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com@evil.example/x",
+            ),
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com.evil.example/x",
+            ),
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com:8080/x",
+            ),
+            (
+                "https://api.example.com{+path}",
+                "https://api.example.com%40evil.example/x",
+            ),
             (
                 "https://api.example.com{+path}",
                 "https://api.example.com%2Fetc/passwd",
             ),
-            ("https://{host}{+path}", "https://example.com//etc/passwd"),
-            ("https://{host}{+path}", "https:///etc/passwd"),
+            (
+                "https://api.example.com{id}",
+                "https://api.example.com.evil.example",
+            ),
+            ("file://localhost{+path}", "file://localhost.evil.example/x"),
+            // Inside a host, nothing may end it before the template's own
+            // text: Python's `urlsplit` reads the first one's host as
+            // `evil.example`.
+            (
+                "https://{tenant}.example.com/v1",
+                "https://evil.example:443.example.com/v1",
+            ),
+            (
+                "https://{tenant}.example.com/v1",
+                "https://evil.example%3A443.example.com/v1",
+            ),
+            (
+                "https://{+tenant}.example.com/v1",
+                "https://evil.example/.example.com/v1",
+            ),
+            (
+                "https://api-{+region}.example.com/v1",
+                "https://api-x.evil.example\\.example.com/v1",
+            ),
+            (
+                "https://api-{region}.example.com/v1",
+                "https://api-x@evil.example.example.com/v1",
+            ),
+            // After the host's `:`, only a port number.
+            (
+                "https://localhost:{port}/api",
+                "https://localhost:80@evil.example/api",
+            ),
+            (
+                "https://localhost:{port}/api",
+                "https://localhost:80.evil.example/api",
+            ),
+            (
+                "https://api.example.com:{port}{+path}",
+                "https://api.example.com:8443@evil.example/x",
+            ),
+        ] {
+            assert_eq!(
+                Template::parse(template).check(uri),
+                Err(Misfit::Host),
+                "{template} {uri}"
+            );
+        }
+        for (template, uri) in [
+            ("https://api.example.com{+path}", "https://api.example.com"),
+            ("https://api.example.com{+path}", "https://api.example.com/"),
+            (
+                "https://api-{region}.example.com/v1",
+                "https://api-eu.example.com/v1",
+            ),
+            (
+                "https://{tenant}.example.com/v1",
+                "https://eu.acme.example.com/v1",
+            ),
+            ("https://localhost:{port}/api", "https://localhost:8080/api"),
+            ("https://{host}:{port}/api", "https://example.com:8443/api"),
+            // A variable that is the whole host lets the model choose it.
+            ("https://{host}/api", "https://localhost:8080/api"),
+            ("https://{host}/api", "https://user@example.com/api"),
+        ] {
+            assert!(Template::parse(template).matches(uri), "{template} {uri}");
+        }
+    }
+
+    #[test]
+    fn a_file_uri_with_a_host_may_start_its_path_at_a_drive() {
+        // `file://localhost/C:/Users` is a Windows path, as
+        // `file:///C:/Users` is.
+        for (template, uri) in [
+            (
+                "file://localhost/{+path}",
+                "file://localhost/C:/Users/u/notes.txt",
+            ),
+            (
+                "file://localhost{+path}",
+                "file://localhost/C:/Users/u/notes.txt",
+            ),
+            (
+                "file://localhost/{+path}",
+                "file://localhost/home/u/notes.txt",
+            ),
+            ("file://{host}/{+path}", "file:///C:/Users/u/notes.txt"),
+            ("file://{host}{+path}", "file:///C:/Users/u/notes.txt"),
+            (
+                "file://{host}{+path}",
+                "file://localhost/C:/Users/u/notes.txt",
+            ),
+        ] {
+            assert!(Template::parse(template).matches(uri), "{template} {uri}");
+        }
+        // Only one drive, where the path starts, and no `/` or `\` there.
+        for (template, uri) in [
+            ("file://localhost/{+path}", "file://localhost/C:/x/D:/y"),
+            ("file://localhost{+path}", "file://localhost/C:/x/D:/y"),
+            ("file://localhost/{+path}", "file://localhost//etc/passwd"),
+            ("file://localhost{+path}", "file://localhost//etc/passwd"),
+            (
+                "file://localhost/{+path}",
+                "file://localhost/\\\\server\\share\\x",
+            ),
+            (
+                "file://localhost/docs/{+path}",
+                "file://localhost/docs/C:/x",
+            ),
         ] {
             assert_eq!(
                 Template::parse(template).check(uri),

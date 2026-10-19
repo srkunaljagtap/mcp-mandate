@@ -238,7 +238,7 @@
     {
       "id": "template-variable-after-literal-text-climbs",
       "kind": "attack",
-      "about": "A variable that follows literal text (a query string, a name prefix) is filled with `..`, or with a second `path=..` after a query delimiter. The URI as a whole has no `..` segment, but a server that reads the variable on its own (or with a query parser, which drops the empty first `path`) resolves it outside the folder it serves.",
+      "about": "A variable that follows literal text (a query string, a name prefix) is filled with `..`, with a second `path=..` after a query delimiter, or with a path that starts at `/`. The URI as a whole has no `..` segment, but a server that reads the variable on its own (or with a query parser, which drops the empty first `path`) resolves it outside the folder it serves.",
       "pinned": {"resource_templates": [
         {"uriTemplate": "res://files/read?path={+path}", "name": "Files"},
         {"uriTemplate": "docs://page-{+p}", "name": "Pages"},
@@ -250,7 +250,8 @@
         {"from": "client", "send": {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "docs://page-../x"}}, "expect": "block"},
         {"from": "client", "send": {"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "res://get?name=.."}}, "expect": "block"},
         {"from": "client", "send": {"jsonrpc": "2.0", "id": 5, "method": "resources/read", "params": {"uri": "res://files/read?path=&path=../secret.txt"}}, "expect": "block"},
-        {"from": "client", "send": {"jsonrpc": "2.0", "id": 6, "method": "resources/read", "params": {"uri": "res://get?name=x&name=.."}}, "expect": "block"}
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 6, "method": "resources/read", "params": {"uri": "res://get?name=x&name=.."}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 7, "method": "resources/read", "params": {"uri": "docs://page-/etc/passwd"}}, "expect": "block"}
       ]
     },
     {
