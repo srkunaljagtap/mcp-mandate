@@ -55,12 +55,14 @@ const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
 /// and fragment of every URL, wherever it is in an argument
 /// (`name@git+https://…`), the value of a variable (`NAME=value`), of an
 /// option or header named like a secret (`--api-key`, `Authorization:`,
-/// npm's `--//host/:_authToken=`, Windows-style `/token:` and
-/// `/p:Password=`), and anything shaped like a known kind of key. A value
-/// can have spaces, so it is masked up to its closing quote, if it opens
-/// one, or else up to the next option. Split over
-/// arguments, it is followed for as many words as it can have: one after
-/// `--api-key`, two (a scheme and a token) after `Authorization:`.
+/// npm's `--//host/:_authToken=`, Windows-style `/token:`, `/token` and
+/// `/p:Password=`), the whole value of an option that sets a property named
+/// like one (MSBuild's `/p:Configuration=Release;Password=…`), and anything
+/// shaped like a known kind of key. A value can have spaces, so it is
+/// masked up to its closing quote, if it opens one, or else up to the next
+/// option. Split over arguments, it is followed for as many words as it can
+/// have: one after `--api-key`, two (a scheme and a token) after
+/// `Authorization:`.
 #[derive(Debug, Clone)]
 pub struct ServerCommand {
     pub program: OsString,
@@ -168,7 +170,9 @@ fn mask(arg: &str, value: usize, secrets: &SecretDetector) -> (String, usize) {
 /// One word of an argument, with anything that may be a secret masked, and
 /// how far past it a secret it starts goes.
 fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
-    let secret_option = is_option(word) && secret_name(option_name(word));
+    let secret_option = is_option(word)
+        && (secret_name(option_name(word))
+            || split_option(word).is_some_and(|(_, _, value)| secret_property(value)));
     // A URL, wherever it is in the word (`name@git+https://…`), unless it's
     // in a value masked as such (`DATABASE_URL=postgres://…`,
     // `--token:https://…`).
@@ -178,8 +182,9 @@ fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
         (without_credentials(word, url), Run::No)
     } else if let Some((name, separator, value)) = assignment(word) {
         // A variable's value may be anything; an option's or a header's
-        // is a secret when its name says so.
-        if (separator == '=' && !name.starts_with('-')) || secret_name(name) {
+        // is a secret when its name says so, or an option's when it sets a
+        // property that does (`--define=a,token=…`).
+        if (separator == '=' && !name.starts_with('-')) || secret_name(name) || secret_option {
             let shown = if value.is_empty() {
                 format!("{name}{separator}")
             } else {
@@ -194,9 +199,9 @@ fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
         }
     } else if secret_option {
         // An option `assignment` doesn't split: `--token:value`, npm's
-        // `--//host/:_auth=value`, `-p:Password=value`, `/token:value`.
-        // Its value is whatever follows the first separator, or else the
-        // next word.
+        // `--//host/:_auth=value`, `-p:Password=value`, `/token:value`,
+        // `/p:Configuration=Release;Password=value`. Its value is whatever
+        // follows the first separator, or else the next word (`/token`).
         match split_option(word) {
             Some((option, separator, value)) if !value.is_empty() => (
                 format!("{option}{separator}{MASK}"),
@@ -218,18 +223,36 @@ fn secret_run(name: &str, separator: char, value: &str) -> Run {
     // `--token:value` and `/token:value` are options, like `--token=value`,
     // not headers.
     let header = separator == ':' && !name.starts_with(['-', '/']);
+    // A quote can open the value (`PASSWORD='a b'`), or a property's value
+    // in it (MSBuild's `/p:Password="a b"`).
+    if let Some(quote) = open_quote(value) {
+        return Run::Quote(quote);
+    }
     match value.chars().next() {
         // `Authorization:` with its scheme and token after a space.
         None if secret_name(name) && header => Run::Value(2),
         // `--token=` with the value after a space.
         None if secret_name(name) => Run::Value(1),
         None => Run::No,
-        Some(quote @ ('"' | '\'')) if value[1..].contains(quote) => Run::No,
-        Some(quote @ ('"' | '\'')) => Run::Quote(quote),
+        // Quoted, and closed in this word.
+        Some('"' | '\'') => Run::No,
         // `Authorization:Bearer` with the token after it.
         Some(_) if header => Run::Value(1),
         Some(_) => Run::Rest,
     }
+}
+
+/// The quote still open at the end of `text`, if one is.
+fn open_quote(text: &str) -> Option<char> {
+    let mut open = None;
+    for c in text.chars() {
+        match open {
+            None if matches!(c, '"' | '\'') => open = Some(c),
+            Some(quote) if c == quote => open = None,
+            _ => {}
+        }
+    }
+    open
 }
 
 /// Where the first URL in `text` starts, and where its `://` is. A scheme
@@ -303,8 +326,10 @@ fn assignment(word: &str) -> Option<(&str, char, &str)> {
 
 /// Whether `word` is written as an option: it starts with `-`, or, as
 /// Windows programs and MSBuild write them (`/token:value`,
-/// `/p:Name=value`), it is a `/`, a name and then `:` or `=`. An absolute
-/// path such as `/srv/data:ro` has another `/` before any separator.
+/// `/p:Name=value`, `/token value`), it is a `/` and a name, then `:` or
+/// `=` or nothing more. An absolute path such as `/srv/data:ro` has another
+/// `/` before any separator, and a top-level file such as `/keys.txt` a `.`
+/// (a name on its own starts with a letter and has no `.`).
 fn is_option(word: &str) -> bool {
     if word.starts_with('-') {
         return true;
@@ -312,10 +337,32 @@ fn is_option(word: &str) -> bool {
     let Some(rest) = word.strip_prefix('/') else {
         return false;
     };
-    let name = rest
+    let end = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
         .unwrap_or(rest.len());
-    name > 0 && rest[name..].starts_with([':', '='])
+    let (name, after) = rest.split_at(end);
+    let alone = after.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && !name.contains('.');
+    !name.is_empty() && (after.starts_with([':', '=']) || alone)
+}
+
+/// Whether `value` sets a property named like a secret: MSBuild's `-p:` and
+/// `/p:` take a list of them, `Name=value` separated by `;` or `,`, and
+/// only the first name is in the option's own. A name is letters, digits,
+/// `_`, `-` and `.`, so a URL's query (`?api_key=…`) isn't taken for one.
+fn secret_property(value: &str) -> bool {
+    value
+        .split([';', ','])
+        .filter_map(|property| property.split_once('='))
+        .map(|(name, _)| name.trim_start_matches(['"', '\'']))
+        .any(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                && secret_name(name)
+        })
 }
 
 /// The part of an option word that names it: up to its first `=`, or its
@@ -1294,10 +1341,23 @@ mod tests {
             shown("server.exe", &["/token:https://host/abcdef1234", "/srv"]),
             "server.exe /token:*** /srv"
         );
+        // With the value as the next argument.
+        assert_eq!(
+            shown("server.exe", &["/ApiKey", "abcdef1234", "/srv"]),
+            "server.exe /ApiKey *** /srv"
+        );
+        assert_eq!(
+            shown("server.exe", &["/token", "abcdef1234"]),
+            "server.exe /token ***"
+        );
         // Other options are shown.
         assert_eq!(
             shown("dotnet", &["build", "/p:Configuration=Release"]),
             "dotnet build /p:Configuration=Release"
+        );
+        assert_eq!(
+            shown("server.exe", &["/verbose", "/srv", "/keys.txt", "/srv"]),
+            "server.exe /verbose /srv /keys.txt /srv"
         );
         // An absolute path has a second `/` before any separator, so it
         // isn't taken for an option, whatever its folders are called.
@@ -1314,6 +1374,87 @@ mod tests {
                 ]
             ),
             "docker run -v /srv/data:ro -v /srv/tokens:/tokens:ro image"
+        );
+        assert_eq!(
+            shown("server", &["--root", "/srv/tokens", "/srv"]),
+            "server --root /srv/tokens /srv"
+        );
+    }
+
+    #[test]
+    fn masks_an_option_that_sets_a_secret_property_among_others() {
+        // MSBuild takes a list of properties, separated by `;` or `,`.
+        assert_eq!(
+            shown(
+                "dotnet",
+                &[
+                    "run",
+                    "/p:Configuration=Release;ApiToken=abcdef1234567",
+                    "server.csproj"
+                ]
+            ),
+            "dotnet run /p:*** server.csproj"
+        );
+        assert_eq!(
+            shown(
+                "dotnet",
+                &["run", "/p:Configuration=Release;Password=s3cret"]
+            ),
+            "dotnet run /p:***"
+        );
+        assert_eq!(
+            shown("dotnet", &["run", "-p:A=1,Token=abc", "server.csproj"]),
+            "dotnet run -p:*** server.csproj"
+        );
+        assert_eq!(
+            shown("server", &["--define=a,token=abc", "/srv"]),
+            "server --define=*** /srv"
+        );
+        // A list with no secret in it is shown, and so is a URL's query
+        // with a name like one, apart from the query itself.
+        assert_eq!(
+            shown(
+                "dotnet",
+                &["build", "/p:Configuration=Release;Platform=x64"]
+            ),
+            "dotnet build /p:Configuration=Release;Platform=x64"
+        );
+        assert_eq!(
+            shown("server", &["--url=https://keys.example.com/?api_key=abc"]),
+            "server --url=https://keys.example.com/"
+        );
+    }
+
+    #[test]
+    fn masks_a_quoted_property_value_up_to_its_closing_quote() {
+        // The quote opens after the property's name, not after `/p:`.
+        assert_eq!(
+            shown(
+                "sh",
+                &[
+                    "-c",
+                    "dotnet run /p:Password=\"correct -horse\" server.csproj"
+                ]
+            ),
+            "sh -c dotnet run /p:*** ***\" server.csproj"
+        );
+        assert_eq!(
+            shown(
+                "sh",
+                &[
+                    "-c",
+                    "dotnet run -p:A=1;Password='correct -horse' server.csproj"
+                ]
+            ),
+            "sh -c dotnet run -p:*** ***' server.csproj"
+        );
+        // Closed in the same word, it ends there.
+        assert_eq!(
+            shown(
+                "sh",
+                &["-c", "dotnet run /p:Password=\"s3cret\" server.csproj"]
+            ),
+            "sh -c dotnet run /p:***\" server.csproj"
         );
     }
 

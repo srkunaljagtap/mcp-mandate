@@ -274,6 +274,11 @@ fn warn_if_exposed(what: &str, path: &Path) {
     {
         use std::os::unix::fs::MetadataExt;
         let me = nix::unistd::geteuid().as_raw();
+        // Read only if a group may be private, and then once for both.
+        let accounts = std::cell::OnceCell::new();
+        let private_group = |uid: u32, gid: u32| {
+            owners_private_group(uid, gid, || accounts.get_or_init(Accounts::read).as_ref())
+        };
         let exposure_of = |path: &Path| {
             let metadata = std::fs::metadata(path).ok()?;
             exposure(
@@ -281,7 +286,7 @@ fn warn_if_exposed(what: &str, path: &Path) {
                 metadata.uid(),
                 metadata.gid(),
                 me,
-                owners_private_group,
+                private_group,
             )
         };
         match exposure_of(&full) {
@@ -365,20 +370,91 @@ fn writable_by_others(
 
 /// Whether group `gid` is user `uid`'s private group, as the system's user
 /// and group lists describe them. One that can't be looked up isn't.
+/// `accounts` gives the local lists, which are read only when needed.
 #[cfg(unix)]
-fn owners_private_group(uid: u32, gid: u32) -> bool {
+fn owners_private_group<'a>(
+    uid: u32,
+    gid: u32,
+    accounts: impl FnOnce() -> Option<&'a Accounts>,
+) -> bool {
     use nix::unistd::{Gid, Group, Uid, User};
     if gid != uid {
         return false; // without looking anything up
     }
     let user = User::from_uid(Uid::from_raw(uid)).ok().flatten();
     let group = Group::from_gid(Gid::from_raw(gid)).ok().flatten();
-    match (user, group) {
-        (Some(user), Some(group)) => {
-            is_private_group(uid, &user.name, gid, &group.name, &group.mem)
-        }
-        _ => false,
+    let (Some(user), Some(group)) = (user, group) else {
+        return false;
+    };
+    is_private_group(uid, &user.name, gid, &group.name, &group.mem)
+        // Others can be in it without its entry listing them.
+        && accounts().is_some_and(|accounts| !accounts.share(uid, &user.name, gid))
+}
+
+/// The text of the local lists of users and groups.
+#[cfg(unix)]
+struct Accounts {
+    /// Lines of `name:password:uid:gid:…`, as in `/etc/passwd`.
+    users: String,
+    /// Lines of `name:password:gid:member,…`, as in `/etc/group`.
+    groups: String,
+}
+
+#[cfg(unix)]
+impl Accounts {
+    /// Reads `/etc/passwd` and `/etc/group`, and the lists of system users
+    /// and groups that nss-altfiles keeps in `/usr/lib` (as Fedora's atomic
+    /// editions do) where there are any. None if one can't be read. Users
+    /// and groups that only a directory service such as LDAP lists aren't
+    /// in them.
+    fn read() -> Option<Self> {
+        let read = |path: &str, extra: &str| {
+            let mut text = std::fs::read_to_string(path).ok()?;
+            match std::fs::read_to_string(extra) {
+                Ok(more) => {
+                    text.push('\n');
+                    text.push_str(&more);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+            Some(text)
+        };
+        Some(Self {
+            users: read("/etc/passwd", "/usr/lib/passwd")?,
+            groups: read("/etc/group", "/usr/lib/group")?,
+        })
     }
+
+    /// Whether anyone but user `uid` (named `user`) can be in group `gid`
+    /// without the group's entry listing them: another user whose primary
+    /// group it is (`usermod -g`), or another entry with the same id (as
+    /// `groupadd -o` adds), whose members the system puts in it too. Only
+    /// an entry named like the user and listing no members is its own.
+    fn share(&self, uid: u32, user: &str, gid: u32) -> bool {
+        let primary = entries(&self.users).any(|fields| match fields[..] {
+            [_, _, id, group, ..] => {
+                id.parse::<u32>() != Ok(uid) && group.parse::<u32>() == Ok(gid)
+            }
+            _ => false,
+        });
+        let other_entry = entries(&self.groups).any(|fields| match fields[..] {
+            [name, _, id, ref members @ ..] => {
+                id.parse::<u32>() == Ok(gid)
+                    && (name != user || members.iter().any(|member| !member.is_empty()))
+            }
+            _ => false,
+        });
+        primary || other_entry
+    }
+}
+
+/// The fields of each entry in a list of users or groups. A line that
+/// isn't one (macOS's comments) has too few to match.
+#[cfg(unix)]
+fn entries(list: &str) -> impl Iterator<Item = Vec<&str>> {
+    list.lines()
+        .map(|line| line.split(':').map(str::trim).collect())
 }
 
 /// Whether a group with this id, name and member list is the private group
@@ -1170,7 +1246,55 @@ mod tests {
         assert!(!is_private_group(1000, "alice", 1001, "alice", &[]));
         // Ids no user or group has can't be looked up, so they don't count.
         let unknown = 3_999_999_999;
-        assert!(!owners_private_group(unknown, unknown));
+        assert!(!owners_private_group(unknown, unknown, || None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_is_shared_by_its_primary_users_and_other_entries_with_its_id() {
+        let accounts = |users: &str, groups: &str| Accounts {
+            users: users.to_owned(),
+            groups: groups.to_owned(),
+        };
+        let users = "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n";
+        let groups = "root:x:0:\nwheel:x:10:alice\nalice:x:1000:\n";
+        assert!(!accounts(users, groups).share(1000, "alice", 1000));
+        // Another user whose primary group it is: `usermod -g alice bob`.
+        let bob = format!("{users}bob:x:1001:1000::/home/bob:/bin/bash\n");
+        assert!(accounts(&bob, groups).share(1000, "alice", 1000));
+        // Another entry with its id, `groupadd -o -g 1000 team`, with or
+        // without members, or a second one of its own that lists some.
+        for extra in ["team:x:1000:bob", "team:x:1000:", "alice:x:1000:bob"] {
+            let groups = format!("{groups}{extra}\n");
+            assert!(
+                accounts(users, &groups).share(1000, "alice", 1000),
+                "{extra}"
+            );
+        }
+        // root's group where other system users have it as their primary
+        // group, as on Fedora.
+        let fedora = format!("{users}sync:x:5:0:sync:/sbin:/bin/sync\n");
+        assert!(accounts(&fedora, groups).share(0, "root", 0));
+        assert!(!accounts(users, groups).share(0, "root", 0));
+        // Another name for the same user isn't another user, and other
+        // groups and macOS's comments don't count.
+        let users = format!("##\n# User Database\n##\n{users}toor:x:0:0::/root:/bin/sh\n");
+        assert!(!accounts(&users, groups).share(0, "root", 0));
+        assert!(!accounts(&users, groups).share(1000, "alice", 1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_isnt_private_without_the_local_lists_or_when_they_share_it() {
+        // Whatever the system says about the current user's group, these
+        // lists make it not private.
+        let me = nix::unistd::geteuid().as_raw();
+        assert!(!owners_private_group(me, me, || None));
+        let shared = Accounts {
+            users: format!("other:x:{}:{me}::/:/bin/sh\n", me.wrapping_add(1)),
+            groups: String::new(),
+        };
+        assert!(!owners_private_group(me, me, || Some(&shared)));
     }
 
     #[cfg(unix)]
