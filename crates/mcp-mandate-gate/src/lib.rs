@@ -1417,7 +1417,7 @@ impl Gate {
             let text = jsonrpc::unescaped(&message);
             (
                 self.credentials.find(&text).is_some(),
-                text.contains("\"blob\""),
+                names_key(&text, "blob"),
             )
         };
         if !named && !blob {
@@ -1785,6 +1785,19 @@ fn reply_for(method: &str) -> Reply {
 fn without_line_ending(frame: &[u8]) -> &[u8] {
     let frame = frame.strip_suffix(b"\n").unwrap_or(frame);
     frame.strip_suffix(b"\r").unwrap_or(frame)
+}
+
+/// Whether a message, as [`jsonrpc::unescaped`] writes it out, could have a
+/// member named `key`: the name in quotes, then a colon, with only the
+/// whitespace JSON allows between. The same name as a value, or in a
+/// string, doesn't count unless a colon follows it there too.
+fn names_key(text: &str, key: &str) -> bool {
+    let quoted = format!("\"{key}\"");
+    text.match_indices(&quoted).any(|(at, _)| {
+        text[at + quoted.len()..]
+            .trim_start_matches([' ', '\t', '\n', '\r'])
+            .starts_with(':')
+    })
 }
 
 /// `text`, cut to at most `max` bytes (at a character boundary), with "…"
