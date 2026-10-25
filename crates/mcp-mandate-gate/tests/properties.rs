@@ -23,7 +23,11 @@ impl Recorder for Discard {
 }
 
 fn gate(observe: bool) -> Gate {
-    let mode = if observe { "mode = \"observe\"\n" } else { "" };
+    let mode = if observe {
+        "mode = \"observe\"\n"
+    } else {
+        "mode = \"enforce\"\n"
+    };
     let policy = Policy::parse(
         &format!("{mode}[[tools]]\nmatch = \"*\"\naction = \"allow\"\n"),
         Path::new("."),

@@ -1,6 +1,7 @@
 //! Spotting secrets in text and in JSON messages.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use base64::Engine;
@@ -100,6 +101,9 @@ pub struct SecretDetector {
     patterns: Vec<SecretPattern>,
     /// How many of `patterns`, at the end, are exact strings.
     literals: usize,
+    /// Whether a field named like a secret (`password`, `api_key`) counts
+    /// as one whatever its value.
+    named_fields: bool,
 }
 
 impl Default for SecretDetector {
@@ -116,7 +120,24 @@ impl SecretDetector {
         Self {
             patterns,
             literals: 0,
+            named_fields: true,
         }
+    }
+
+    /// A detector that knows no secret until exact strings are added: no
+    /// built-in patterns, and no field counts as one for its name. For
+    /// secrets known exactly, looked for apart from the rest.
+    pub fn empty() -> Self {
+        Self {
+            patterns: Vec::new(),
+            literals: 0,
+            named_fields: false,
+        }
+    }
+
+    /// Whether it finds nothing at all, so looking can be skipped.
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty() && !self.named_fields
     }
 
     /// The kind of the first secret found in `text`.
@@ -149,9 +170,11 @@ impl SecretDetector {
     /// Replaces every exact string added or set before with `literals`,
     /// reported as `name`: for a secret that changes, such as a renewed
     /// token, so the old ones don't pile up. Short strings are skipped, as
-    /// [`add_literal`](Self::add_literal) skips them. Nothing is rebuilt
-    /// when the strings are the ones already set, so this is cheap to call
-    /// before every message.
+    /// [`add_literal`](Self::add_literal) skips them. They're found with one
+    /// pattern, so each text is searched once however many there are; where
+    /// two start at the same place, the longer is redacted whole. Nothing is
+    /// rebuilt when the strings are the ones already set, so this is cheap
+    /// to call before every message.
     pub fn set_literals(&mut self, name: &str, literals: &[String]) {
         let mut wanted: Vec<String> = Vec::new();
         for literal in literals {
@@ -160,17 +183,33 @@ impl SecretDetector {
                 wanted.push(escaped);
             }
         }
+        // The longest first: of the alternatives that match at one place,
+        // the first listed is taken.
+        wanted.sort_by_key(|escaped| std::cmp::Reverse(escaped.len()));
+        let combined = wanted.join("|");
         let kept = self.patterns.len() - self.literals;
         let current = &self.patterns[kept..];
-        let unchanged = current.len() == wanted.len()
-            && current.iter().zip(&wanted).all(|(pattern, escaped)| {
-                pattern.name == name && pattern.regex.as_str() == escaped
-            });
+        let sources: Vec<&str> = current
+            .iter()
+            .map(|pattern| pattern.regex.as_str())
+            .collect();
+        // Set already, as one pattern or (if that was too large) one each.
+        let unchanged = current.iter().all(|pattern| pattern.name == name)
+            && (sources == [combined.as_str()] || sources.iter().eq(wanted.iter()));
         if unchanged {
             return;
         }
         self.patterns.truncate(kept);
         self.literals = 0;
+        if wanted.is_empty() {
+            return;
+        }
+        if let Ok(pattern) = SecretPattern::new(name, &combined) {
+            self.patterns.push(pattern);
+            self.literals = 1;
+            return;
+        }
+        // Too large to compile as one: one pattern each.
         for escaped in wanted {
             if let Ok(pattern) = SecretPattern::new(name, &escaped) {
                 self.patterns.push(pattern);
@@ -214,7 +253,7 @@ impl SecretDetector {
                     }
                     if let Some(kind) = self.find(key) {
                         *found = Some(kind.to_owned());
-                    } else if secret_field(key, item) {
+                    } else if self.named_fields && secret_field(key, item) {
                         *found = Some("secret-field".to_owned());
                     } else if skip_binary && binary == Some(key.as_str()) {
                         *found = self.blob_secret(key, item);
@@ -274,9 +313,12 @@ impl SecretDetector {
                 .for_each(|item| self.redact_value(item, kinds)),
             Value::Object(map) => {
                 let binary = binary_field(map);
+                // The next number to try for each key that's taken, so
+                // numbering many keys that redact alike stays quick.
+                let mut next_number: HashMap<String, u64> = HashMap::new();
                 // Keys can't be changed in place, so the map is rebuilt.
                 for (mut key, mut item) in std::mem::take(map) {
-                    if secret_field(&key, &item) {
+                    if self.named_fields && secret_field(&key, &item) {
                         self.redact_field(&mut item, kinds);
                         kinds.push("secret-field".to_owned());
                     } else if binary == Some(key.as_str()) {
@@ -294,10 +336,13 @@ impl SecretDetector {
                     // Two keys can redact to the same text: number the later
                     // ones rather than lose them.
                     if map.contains_key(&key) {
-                        key = (2..)
-                            .map(|n| format!("{key} #{n}"))
-                            .find(|numbered| !map.contains_key(numbered))
+                        let next = next_number.entry(key.clone()).or_insert(2);
+                        let (n, numbered) = (*next..)
+                            .map(|n| (n, format!("{key} #{n}")))
+                            .find(|(_, numbered)| !map.contains_key(numbered))
                             .expect("some number is free");
+                        *next = n + 1;
+                        key = numbered;
                     }
                     map.insert(key, item);
                 }
@@ -452,8 +497,16 @@ mod tests {
             "github_pat_11ABCDEFG0123456789_abcdefghijklmnop",
         ),
         ("slack-token", "xoxb-1234567890-abcdefghij"),
-        ("google-api-key", "AIzaSyA-abcdefghijklmnopqrstuvwxyz01234"),
-        ("stripe-key", "sk_live_abcdefghijklmnopqrstuvwx"),
+        // Built from pieces, so secret scanners reading this file don't
+        // take these fake keys for real ones.
+        (
+            "google-api-key",
+            concat!("AIza", "SyA-abcdefghijklmnopqrstuvwxyz01234"),
+        ),
+        (
+            "stripe-key",
+            concat!("sk_", "live_abcdefghijklmnopqrstuvwx"),
+        ),
         (
             "jwt",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",
@@ -642,6 +695,59 @@ mod tests {
     }
 
     #[test]
+    fn numbers_many_keys_that_redact_alike_quickly() {
+        let detector = SecretDetector::default();
+        let count = 20_000;
+        let mut message = Value::Object(
+            (0..count)
+                .map(|n| (format!("AKIA{n:016}"), json!(n)))
+                .collect(),
+        );
+        let started = std::time::Instant::now();
+        detector.redact_json(&mut message);
+        let took = started.elapsed();
+        let keys = message.as_object().unwrap();
+        assert_eq!(keys.len(), count);
+        assert!(keys.contains_key(&format!("[REDACTED: aws-access-key-id] #{count}")));
+        assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    }
+
+    #[test]
+    fn numbering_skips_numbers_already_taken() {
+        let detector = SecretDetector::default();
+        let token = |c: &str| format!("ghp_{}", c.repeat(36));
+        let mut message = json!({
+            "[REDACTED: github-token] #2": 0,
+            token("a"): 1,
+            token("b"): 2,
+            token("c"): 3
+        });
+        detector.redact_json(&mut message);
+        assert_eq!(
+            message,
+            json!({
+                "[REDACTED: github-token]": 1,
+                "[REDACTED: github-token] #2": 0,
+                "[REDACTED: github-token] #3": 2,
+                "[REDACTED: github-token] #4": 3
+            })
+        );
+    }
+
+    #[test]
+    fn takes_quoted_text_after_a_secret_name_as_a_secret() {
+        let detector = SecretDetector::default();
+        // A quoted value is taken whole, so a passphrase with spaces is
+        // caught, and so is prose in quotes after such a name.
+        assert_eq!(
+            detector.find(r#"const PASSWORD_PROMPT = "Enter your password";"#),
+            Some("secret-assignment")
+        );
+        // An unquoted value stops at the first space.
+        assert_eq!(detector.find("Password: must be 12 characters"), None);
+    }
+
+    #[test]
     fn treats_fields_named_like_secrets_as_secrets() {
         let detector = SecretDetector::default();
         let mut message = json!({"config": {"db_password": "correct-horse", "apiKey": "zq8f3kq9z2m1", "name": "production"}});
@@ -717,8 +823,8 @@ mod tests {
         }
         assert_eq!(
             detector.patterns.len(),
-            built_in + 2,
-            "the latest token's two forms, and nothing else"
+            built_in + 1,
+            "the latest token's two forms, in one pattern, and nothing else"
         );
         assert_eq!(
             detector.find("echo: opaque-token-99"),
@@ -730,6 +836,66 @@ mod tests {
         assert!(!text.contains("opaque-token-99"), "{text}");
         detector.set_literals("gateway-credential", &[]);
         assert_eq!(detector.patterns.len(), built_in);
+    }
+
+    #[test]
+    fn an_empty_detector_finds_only_the_exact_strings_it_is_given() {
+        let mut detector = SecretDetector::empty();
+        assert!(detector.is_empty());
+        assert!(!SecretDetector::default().is_empty());
+        let mut message = json!({"password": "correct-horse", "text": "AKIAIOSFODNN7EXAMPLE"});
+        assert_eq!(detector.find_in_response(&message), None);
+        assert!(detector.redact_json(&mut message).is_empty());
+
+        detector.set_literals("gateway-credential", &["opaque-token-1234567".to_owned()]);
+        assert!(!detector.is_empty());
+        let mut message = json!({
+            "password": "correct-horse",
+            "text": "AKIAIOSFODNN7EXAMPLE and opaque-token-1234567",
+            "contents": [{"uri": "file:///.env", "blob": STANDARD.encode("TOKEN=opaque-token-1234567")}]
+        });
+        assert_eq!(
+            detector.redact_json(&mut message),
+            ["gateway-credential", "gateway-credential"]
+        );
+        assert_eq!(message["password"], "correct-horse");
+        assert_eq!(
+            message["text"],
+            "AKIAIOSFODNN7EXAMPLE and [REDACTED: gateway-credential]"
+        );
+        let blob = message["contents"][0]["blob"].as_str().unwrap();
+        assert_eq!(
+            STANDARD.decode(blob).unwrap(),
+            b"[REDACTED: gateway-credential]"
+        );
+
+        detector.set_literals("gateway-credential", &[]);
+        assert!(detector.is_empty());
+    }
+
+    #[test]
+    fn many_exact_strings_are_searched_for_at_once() {
+        let mut detector = SecretDetector::default();
+        let built_in = detector.patterns.len();
+        let mut set = vec!["client-secret".to_owned()];
+        for n in 0..16 {
+            set.push(format!("Bearer opaque-token-{n}"));
+            set.push(format!("opaque-token-{n}"));
+        }
+        // Starts where another does, and goes on past it.
+        set.push("client-secret-and-more".to_owned());
+        detector.set_literals("gateway-credential", &set);
+        assert_eq!(detector.patterns.len(), built_in + 1, "one pattern");
+        for literal in &set {
+            let text = format!("echo: {literal}.");
+            assert_eq!(
+                detector.find(&text),
+                Some("gateway-credential"),
+                "{literal}"
+            );
+            let (redacted, _) = detector.redact_text(&text).unwrap();
+            assert_eq!(redacted, "echo: [REDACTED: gateway-credential].");
+        }
     }
 
     #[test]

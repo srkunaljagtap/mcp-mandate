@@ -23,8 +23,8 @@ mod upstream;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -35,9 +35,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::StreamExt;
 use mcp_mandate_audit::{self as audit, Log, Recorder};
-use mcp_mandate_gate::jsonrpc::{Message, classify};
+use mcp_mandate_gate::jsonrpc::{self, Message, ParseError, classify};
 use mcp_mandate_gate::{Action, Gate};
 use mcp_mandate_pin::Inventory;
+use mcp_mandate_policy::{Mode, Policy};
+use mcp_mandate_taint::{SecretDetector, SecretPattern};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
@@ -66,7 +68,8 @@ const IDLE_SESSION: Duration = Duration::from_secs(30 * 60);
 /// How long listing a server's inventory may take.
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a server gets to take the gate's answer to one of its
-/// requests, and to end a session.
+/// requests (and at least as long for a client's answer or notification),
+/// and to end a session.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often an event stream to a client gets a keep-alive comment: writing
@@ -97,6 +100,9 @@ struct App {
     upstreams: BTreeMap<String, Upstream>,
     /// Each server's audit log, opened once.
     logs: BTreeMap<String, Log>,
+    /// What each server's policy takes for a secret, for what the gate
+    /// doesn't see (an event's id).
+    secrets: BTreeMap<String, Mutex<SecretDetector>>,
     sessions: Sessions,
     taints: Arc<CallerTaints>,
 }
@@ -155,11 +161,22 @@ pub async fn serve(
     for server in config.servers.values() {
         logs.insert(server.name.clone(), Log::open(&server.policy.audit_log)?);
     }
+    let secrets = config
+        .servers
+        .values()
+        .map(|server| {
+            (
+                server.name.clone(),
+                Mutex::new(secret_detector(&server.policy)),
+            )
+        })
+        .collect();
     let app = Arc::new(App {
         config,
         identity,
         upstreams,
         logs,
+        secrets,
         sessions: Sessions::default(),
         taints: Arc::default(),
     });
@@ -172,6 +189,14 @@ pub async fn serve(
         servers = app.config.servers.len(),
         "the gateway is serving"
     );
+    for (name, server) in &app.config.servers {
+        if server.policy.mode == Mode::Observe {
+            warn!(
+                server = name.as_str(),
+                "observe mode: decisions are logged, but nothing is blocked or hidden; add mode = \"enforce\" to the server's policy to enforce it"
+            );
+        }
+    }
     let router = router(Arc::clone(&app));
     tls::serve(listener, tls, router, shutdown).await;
     sweeper.abort();
@@ -246,10 +271,7 @@ async fn admit(app: &App, name: &str, headers: &HeaderMap) -> Result<Caller, Res
             return Err((StatusCode::FORBIDDEN, "this origin isn't allowed").into_response());
         }
     }
-    let metadata = format!(
-        "{}/.well-known/oauth-protected-resource/servers/{name}/mcp",
-        app.config.public_url
-    );
+    let metadata = metadata_url(app, name);
     let Some(token) = bearer(headers) else {
         return Err(unauthorized(&metadata, false));
     };
@@ -274,6 +296,25 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     let (scheme, token) = value.split_once(' ')?;
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+/// Where the OAuth protected-resource metadata for server `name` is.
+fn metadata_url(app: &App, name: &str) -> String {
+    format!(
+        "{}/.well-known/oauth-protected-resource/servers/{name}/mcp",
+        app.config.public_url
+    )
+}
+
+/// The answer to a request whose token expired before the request was
+/// checked or sent: the same as to a token expired on arrival, so the
+/// client gets a fresh one.
+fn expired_token(app: &App, name: &str) -> Response {
+    info!(
+        server = name,
+        "refused a request: its token expired before it was sent"
+    );
+    unauthorized(&metadata_url(app, name), true)
 }
 
 fn unauthorized(metadata: &str, invalid: bool) -> Response {
@@ -319,25 +360,26 @@ fn find_session(
 
 /// Opens a session for `caller` on server `name`: its own gate, recording
 /// to the server's audit log. If the log can't be written, nothing opens.
+/// The session closes again unless it's [kept](Opening::keep).
+///
+/// Run it as a task of its own: once the session's start is recorded, the
+/// session must be built, so that its end is recorded too, even if the
+/// client leaves meanwhile.
 // The error is the HTTP response to send back; one is built per refused request.
 #[allow(clippy::result_large_err)]
-async fn open_session(
-    app: &Arc<App>,
-    name: &str,
-    caller: &Caller,
-) -> Result<Arc<Session>, Response> {
-    let server = &app.config.servers[name];
+async fn open_session(app: Arc<App>, name: String, caller: Caller) -> Result<Opening, Response> {
+    let server = &app.config.servers[&name];
     let unavailable =
         |problem: &str| (StatusCode::SERVICE_UNAVAILABLE, problem.to_owned()).into_response();
     // All of a server's sessions record through one open file, which may
     // have to wait for its lock: not on a thread that serves requests.
-    let mut log = app.logs[name].new_session();
-    let start = session_start(app, server, caller);
+    let mut log = app.logs[&name].new_session();
+    let start = session_start(&app, server, &caller);
     let recorded = tokio::task::spawn_blocking(move || log.record(&start).map(|()| log)).await;
     let log = match recorded {
         Ok(Ok(log)) => log,
         Ok(Err(failure)) => {
-            error!(server = name, error = %describe(&failure), "couldn't open a session: the audit log can't be written");
+            error!(server = name.as_str(), error = %describe(&failure), "couldn't open a session: the audit log can't be written");
             return Err(unavailable(
                 "the audit log can't be written, so no session can open",
             ));
@@ -348,14 +390,17 @@ async fn open_session(
         .with_shared_taint(Arc::new(app.taints.for_caller(&caller.subject)));
     // If the server ever echoes the gateway's own credential, the caller
     // mustn't get it. Kept current before every check, as tokens renew.
-    gate.set_secret_literals(&app.upstreams[name].credential_strings());
-    let session = Arc::new(Session::new(name, caller.clone(), gate));
-    if app.sessions.insert(Arc::clone(&session)).is_err() {
-        close_session(app, &session);
+    gate.set_secret_literals(&app.upstreams[&name].credential_strings());
+    let opening = Opening {
+        session: Arc::new(Session::new(&name, caller.clone(), gate)),
+        app: Arc::clone(&app),
+        kept: false,
+    };
+    if app.sessions.insert(Arc::clone(&opening.session)).is_err() {
         return Err(unavailable("too many open sessions"));
     }
-    info!(server = name, caller = %caller.subject, "opened a session");
-    Ok(session)
+    info!(server = name.as_str(), caller = %caller.subject, "opened a session");
+    Ok(opening)
 }
 
 fn session_start(app: &App, server: &ServerConfig, caller: &Caller) -> audit::Event {
@@ -400,7 +445,8 @@ fn close_session(app: &Arc<App>, session: &Arc<Session>) -> Option<JoinHandle<()
 
 /// Closes a session that `initialize` opened unless its reply goes back to
 /// the client: a client that never got the session's id can't use it or
-/// end it. That includes a client that left while waiting.
+/// end it. That includes a client that left while waiting, or while the
+/// session was opening.
 struct Opening {
     app: Arc<App>,
     session: Arc<Session>,
@@ -442,9 +488,9 @@ async fn post_message(
         None
     };
     // Counted before the body is read, so a session can't have any number
-    // of bodies arriving, or requests waiting, at once.
-    let in_flight = match existing.as_ref().map(|session| session.start_request()) {
-        Some(None) => return too_many("this session already has its most requests in flight"),
+    // of bodies arriving at once.
+    let arriving = match existing.as_ref().map(|session| session.start_message()) {
+        Some(None) => return too_many("this session already has its most messages arriving"),
         Some(permit) => permit,
         None => None,
     };
@@ -452,23 +498,39 @@ async fn post_message(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let (initialize, request_id) = match classify(&body) {
+    // The client's answers to the server and its notifications aren't
+    // requests: they get through however many requests are in flight, so
+    // the client can always answer or cancel those.
+    let Some((message, request)) = read_message(body.clone()).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let (initialize, request_id) = match message {
         Ok(Message::Request { id, method }) => (method == "initialize", Some(id)),
         _ => (false, None),
     };
     let (session, in_flight, opening) = match existing {
-        Some(session) => (session, in_flight, None),
+        Some(session) if request => {
+            drop(arriving);
+            match session.start_request() {
+                Some(in_flight) => (session, Some(in_flight), None),
+                None => {
+                    return too_many("this session already has its most requests in flight");
+                }
+            }
+        }
+        Some(session) => (session, arriving, None),
         None if initialize => {
-            let session = match open_session(&app, &name, &caller).await {
-                Ok(session) => session,
-                Err(response) => return response,
+            // A task of its own, which the client leaving can't stop
+            // halfway.
+            let opened =
+                tokio::spawn(open_session(Arc::clone(&app), name.clone(), caller.clone())).await;
+            let opening = match opened {
+                Ok(Ok(opening)) => opening,
+                Ok(Err(response)) => return response,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             };
+            let session = Arc::clone(&opening.session);
             let in_flight = session.start_request();
-            let opening = Opening {
-                app: Arc::clone(&app),
-                session: Arc::clone(&session),
-                kept: false,
-            };
             (session, in_flight, Some(opening))
         }
         None => {
@@ -480,10 +542,15 @@ async fn post_message(
         }
     };
 
+    // Nothing outlives the token it came with: a request whose token
+    // expired while its body arrived or it waited its turn isn't checked...
+    let deadline = token_deadline(&caller);
+    if passed(deadline) {
+        return expired_token(&app, &name);
+    }
     let Some(actions) = gate_check(&app, &session, move |gate| gate.from_client(&body)).await
     else {
-        close_session(&app, &session);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return check_failed(&app, &session);
     };
     let (answers, forward) = split(actions);
     let Some(forward) = forward.into_iter().next() else {
@@ -495,20 +562,62 @@ async fn post_message(
             None => accepted(id),
         };
     };
+    // ...one whose token expired while it was checked isn't sent, and one
+    // still waiting for its answer when the token expires is given up on.
+    // The client's answers and notifications aren't requests: nothing waits
+    // on them, and the gate has taken them in (an answer it passed, or
+    // answered in the client's place as too large to check, is no longer
+    // awaited, so a retry would be dropped). Once passed, they're sent, and
+    // the server gets at least as long to take one as the gate's own
+    // answers.
+    let deadline = if request {
+        if passed(deadline) {
+            abandon(&session, request_id.as_ref()).await;
+            return expired_token(&app, &name);
+        }
+        deadline
+    } else {
+        deadline.map(|deadline| deadline.max(Instant::now() + ANSWER_TIMEOUT))
+    };
 
     let protocol = protocol_version(&headers);
     let upstream = &app.upstreams[&name];
-    let response = match upstream
-        .post(forward, session.upstream_id().as_deref(), protocol.as_ref())
-        .await
-    {
-        Ok(response) => response,
-        Err(failure) => {
+    // Nothing more passes through a session that closed while this was
+    // checked. Its id is read first: a session the server forgot is closed
+    // before its id is cleared, so a message that finds no id here finds
+    // the session closed too, rather than going to the server without one.
+    let upstream_id = session.upstream_id();
+    if session.is_closed() {
+        return session_ended();
+    }
+    let sent = upstream.post(forward, upstream_id.as_deref(), protocol.as_ref());
+    let response = match within(deadline, sent).await {
+        Some(Ok(response)) => response,
+        Some(Err(failure)) => {
+            // The client ended the session, or the gateway is stopping:
+            // the server may have dropped the message with it.
+            if session.is_closed() {
+                return session_ended();
+            }
             warn!(server = name, error = %describe(&failure), "couldn't reach the MCP server");
             abandon(&session, request_id.as_ref()).await;
             return (StatusCode::BAD_GATEWAY, "couldn't reach the MCP server").into_response();
         }
+        None => {
+            abandon(&session, request_id.as_ref()).await;
+            return token_expired();
+        }
     };
+    if response.status() == reqwest::StatusCode::NOT_FOUND && upstream_id.is_some() {
+        // The server forgot the session: the client must start over. That
+        // goes for every message sent with the session's id, not only the
+        // first to hear of it. Closed before its id is cleared (see above);
+        // the id goes so the server isn't asked to end a session it no
+        // longer has.
+        close_session(&app, &session);
+        session.set_upstream_id(None);
+        return (StatusCode::NOT_FOUND, "the MCP server ended the session").into_response();
+    }
     if opening.is_some() {
         let upstream_id = response
             .headers()
@@ -524,6 +633,7 @@ async fn post_message(
         protocol,
         request_id,
         in_flight,
+        deadline,
     )
     .await;
     if let Some(opening) = opening
@@ -532,6 +642,74 @@ async fn post_message(
         opening.keep();
     }
     reply
+}
+
+/// Works out what kind of message a client sent, and whether it's a
+/// request (anything but an answer to the server or a notification), on a
+/// thread where blocking is fine, once it's its [turn](session::turn): a
+/// body may be large. A message the gate can't read in full is taken for
+/// what its top-level members say, as the gate takes it: an answer too
+/// large to check still answers the server's request. `None` if that went
+/// wrong.
+async fn read_message(body: Bytes) -> Option<(Result<Message, ParseError>, bool)> {
+    let turn = session::turn().await;
+    tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        let message = classify(&body);
+        let request = match &message {
+            Ok(message) => is_request(message),
+            Err(_) => jsonrpc::head(&body).is_none_or(|head| is_request(&head)),
+        };
+        (message, request)
+    })
+    .await
+    .ok()
+}
+
+fn is_request(message: &Message) -> bool {
+    !matches!(
+        message,
+        Message::Response { .. } | Message::Notification { .. }
+    )
+}
+
+/// Runs `work` until `deadline`, if there is one: `None` if the deadline
+/// comes first. Work whose deadline has passed already isn't started: a
+/// timeout runs its work once before it looks at the time, which could
+/// send a request that's then given up on.
+async fn within<T>(deadline: Option<Instant>, work: impl Future<Output = T>) -> Option<T> {
+    if passed(deadline) {
+        return None;
+    }
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, work).await.ok(),
+        None => Some(work.await),
+    }
+}
+
+/// Whether `deadline`, if there is one, has passed.
+fn passed(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| deadline <= Instant::now())
+}
+
+/// The answer to a message, or to a request for the server's stream, whose
+/// session closed while it waited (the server forgot the session, the
+/// client ended it, or the gateway is stopping): `404`, as for any session
+/// that's gone, so the client starts over.
+fn session_ended() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "the session ended; send initialize first",
+    )
+        .into_response()
+}
+
+fn token_expired() -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        "the token this request was sent with expired before the MCP server answered",
+    )
+        .into_response()
 }
 
 /// Runs `check` with the session's gate, after making sure the gate knows
@@ -551,6 +729,46 @@ async fn gate_check<T: Send + 'static>(
         .await
 }
 
+/// The answer to a request whose check didn't run: its session
+/// [ended](session_ended) while it waited, or a check panicked, and the
+/// session, now unusable, closes.
+fn check_failed(app: &Arc<App>, session: &Arc<Session>) -> Response {
+    if session.is_closed() {
+        return session_ended();
+    }
+    close_session(app, session);
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+/// Whether `text`, which the gate doesn't see, holds a secret: any form of
+/// the gateway's credential for `server`, or anything its policy takes for
+/// a secret.
+fn holds_secret(app: &App, server: &str, text: &str) -> bool {
+    let credentials = app.upstreams[server].credential_strings();
+    match app.secrets[server].lock() {
+        Ok(mut detector) => {
+            detector.set_literals("gateway-credential", &credentials);
+            detector.find(text).is_some()
+        }
+        // Fail closed.
+        Err(_) => true,
+    }
+}
+
+/// The built-in secret patterns, and `policy`'s own.
+fn secret_detector(policy: &Policy) -> SecretDetector {
+    let custom = policy
+        .secrets
+        .patterns
+        .iter()
+        .map(|(name, regex)| SecretPattern {
+            name: name.clone(),
+            regex: regex.clone(),
+        })
+        .collect();
+    SecretDetector::new(custom)
+}
+
 /// Forgets a request that won't be answered through the gate, so it doesn't
 /// stay pending (and in memory) forever.
 async fn abandon(session: &Session, request_id: Option<&Value>) {
@@ -560,8 +778,8 @@ async fn abandon(session: &Session, request_id: Option<&Value>) {
 }
 
 /// Sends the server's reply back to the client, every message through the
-/// gate: a single JSON message, or an event stream. The request stays
-/// counted `in_flight` until its reply is done.
+/// gate: a single JSON message, or an event stream. The client's message
+/// stays counted by `in_flight` until its reply is done, or `deadline`.
 async fn relay(
     app: Arc<App>,
     session: Arc<Session>,
@@ -569,18 +787,17 @@ async fn relay(
     protocol: Option<HeaderValue>,
     request_id: Option<Value>,
     in_flight: Option<OwnedSemaphorePermit>,
+    deadline: Option<Instant>,
 ) -> Response {
+    // Whatever the server's reply, nothing more passes through a session
+    // that closed while it waited for it.
+    if session.is_closed() {
+        return session_ended();
+    }
     let status = response.status();
     if status == reqwest::StatusCode::ACCEPTED {
         // An answer to a request may still come, on the server's stream.
         return accepted(Some(&session.id));
-    }
-    if status == reqwest::StatusCode::NOT_FOUND && session.upstream_id().is_some() {
-        // The server forgot the session (so there's none to end there): the
-        // client must start over.
-        session.set_upstream_id(None);
-        close_session(&app, &session);
-        return (StatusCode::NOT_FOUND, "the MCP server ended the session").into_response();
     }
     if !status.is_success() {
         warn!(server = %session.server, %status, "the MCP server answered with an error status");
@@ -593,12 +810,16 @@ async fn relay(
     }
     if is_event_stream(response.headers()) {
         return stream(
-            app, session, response, protocol, request_id, in_flight, None,
+            app, session, response, protocol, request_id, in_flight, deadline,
         );
     }
-    let body = match read_limited(response).await {
-        Ok(body) => body,
-        Err(problem) => {
+    let body = match within(deadline, read_limited(response)).await {
+        Some(Ok(body)) => body,
+        Some(Err(problem)) => {
+            // Or one that closed while the reply arrived.
+            if session.is_closed() {
+                return session_ended();
+            }
             warn!(server = %session.server, %problem, "couldn't read the MCP server's reply");
             abandon(&session, request_id.as_ref()).await;
             return (
@@ -607,15 +828,18 @@ async fn relay(
             )
                 .into_response();
         }
+        None => {
+            abandon(&session, request_id.as_ref()).await;
+            return token_expired();
+        }
     };
     let Some(actions) = gate_check(&app, &session, move |gate| gate.from_server(&body)).await
     else {
-        close_session(&app, &session);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return check_failed(&app, &session);
     };
     let (answers, to_server) = split(actions);
     for message in to_server {
-        answer_server(&app, &session, message, protocol.clone());
+        answer_server(&app, &session, message, protocol.clone()).await;
     }
     match answers.into_iter().next() {
         Some(answer) => json_reply(answer, Some(&session.id)),
@@ -723,25 +947,35 @@ async fn relay_events(
             }
             // A session with a live stream isn't idle.
             session.touch();
-            let answer = request_id.is_some_and(|wanted| {
-                matches!(classify(&event.data), Ok(Message::Response { id, .. }) if id == *wanted)
-            });
+            // The gate never sees the id, which goes to the client as it
+            // is: one holding a secret is dropped.
+            let id = event
+                .id
+                .filter(|id| !holds_secret(app, &session.server, id));
             let data = event.data;
-            let Some(actions) = gate_check(app, session, move |gate| gate.from_server(&data)).await
-            else {
+            // Whether it's the answer is worked out with the check, where
+            // reading a large message holds no thread that serves requests.
+            let wanted = request_id.filter(|_| !*answered).cloned();
+            let checked = gate_check(app, session, move |gate| {
+                let answer = wanted.is_some_and(|wanted| {
+                    matches!(classify(&data), Ok(Message::Response { id, .. }) if id == wanted)
+                });
+                (answer, gate.from_server(&data))
+            });
+            let Some((answer, actions)) = checked.await else {
                 return;
             };
             *answered |= answer;
             for action in actions {
                 match action {
                     Action::ToClient(message) => {
-                        let event = sse::encode(event.id.as_deref(), &message);
+                        let event = sse::encode(id.as_deref(), &message);
                         if sender.send(Bytes::from(event)).await.is_err() {
                             return; // the client left; dropping the stream closes the server's too
                         }
                     }
                     Action::ToServer(message) => {
-                        answer_server(app, session, message, protocol.cloned());
+                        answer_server(app, session, message, protocol.cloned()).await;
                     }
                 }
             }
@@ -749,19 +983,17 @@ async fn relay_events(
     }
 }
 
-/// Sends the gate's answer to a server request back to the server. Every
-/// such answer is a refusal, so when the server already has too many
-/// waiting to be sent, it gets no more.
-fn answer_server(
+/// Sends the gate's answer to a server request back to the server. Only a
+/// few are sent at once per session; until one is done, this waits, and so
+/// does the stream that brought the request: a server flooding requests
+/// slows only itself, and a burst of them is still answered in full.
+async fn answer_server(
     app: &Arc<App>,
     session: &Arc<Session>,
     message: Vec<u8>,
     protocol: Option<HeaderValue>,
 ) {
-    let Some(slot) = session.start_answer() else {
-        warn!(server = %session.server, "didn't answer a request of the MCP server: too many answers are still being sent");
-        return;
-    };
+    let slot = session.start_answer().await;
     let app = Arc::clone(app);
     let session = Arc::clone(session);
     tokio::spawn(async move {
@@ -798,53 +1030,88 @@ async fn open_stream(
     let Some(slot) = session.open_stream() else {
         return too_many("this session already has its most server streams open");
     };
+    // It lasts no longer than the token it was opened with: a caller whose
+    // token has expired, or who was disabled, stops getting messages. Nor
+    // is it opened at the server once that token has expired.
+    let deadline = token_deadline(&caller);
+    if passed(deadline) {
+        return expired_token(&app, &name);
+    }
     let protocol = protocol_version(&headers);
     let upstream = &app.upstreams[&name];
-    let request = match upstream
-        .request(
-            reqwest::Method::GET,
-            "text/event-stream",
-            session.upstream_id().as_deref(),
-            protocol.as_ref(),
-        )
-        .await
-    {
-        Ok(request) => request,
-        Err(failure) => {
+    // Its id is read before the session is checked, as for a message: a
+    // session the server forgot is closed before its id is cleared, so its
+    // stream isn't asked for without the id (see `post_message`).
+    let upstream_id = session.upstream_id();
+    let request = upstream.request(
+        reqwest::Method::GET,
+        "text/event-stream",
+        upstream_id.as_deref(),
+        protocol.as_ref(),
+    );
+    let request = match within(deadline, request).await {
+        Some(Ok(request)) => request,
+        Some(Err(failure)) => {
             warn!(server = name, error = %describe(&failure), "couldn't get a credential for the MCP server");
             return StatusCode::BAD_GATEWAY.into_response();
         }
+        None => return token_expired(),
     };
     let request = match headers.get("last-event-id").filter(|id| id.len() <= 256) {
         Some(id) => request.header("last-event-id", id.clone()),
         None => request,
     };
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(failure) => {
+    // Nothing is asked of the server for a session that closed meanwhile.
+    if session.is_closed() {
+        return session_ended();
+    }
+    let response = match within(deadline, request.send()).await {
+        Some(Ok(response)) => response,
+        Some(Err(failure)) => {
+            // The client ended the session, or the gateway is stopping:
+            // the server may have dropped the stream with it.
+            if session.is_closed() {
+                return session_ended();
+            }
             warn!(server = name, error = %failure.without_url(), "couldn't reach the MCP server");
             return StatusCode::BAD_GATEWAY.into_response();
         }
+        None => return token_expired(),
     };
+    // Whatever the server's answer, no stream opens for a session that
+    // closed while it was asked (a server refuses one for the session the
+    // gateway just ended there).
+    if session.is_closed() {
+        return session_ended();
+    }
+    if response.status() == reqwest::StatusCode::NOT_FOUND && upstream_id.is_some() {
+        if !session.has_streamed() {
+            // A server that never opened a stream may serve no `GET` at
+            // all, and many answer one with `404` rather than `405`
+            // (Express's default): the session goes on over `POST`, which
+            // finds out if the server forgot it.
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        // The server forgot the session (see `post_message`): a client that
+        // only listens learns here that it must start over.
+        close_session(&app, &session);
+        session.set_upstream_id(None);
+        return (StatusCode::NOT_FOUND, "the MCP server ended the session").into_response();
+    }
     if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     if !response.status().is_success() || !is_event_stream(response.headers()) {
         return StatusCode::BAD_GATEWAY.into_response();
     }
-    // It lasts no longer than the token it was opened with: a caller whose
-    // token has expired, or who was disabled, stops getting messages.
-    let deadline = token_deadline(&caller);
+    session.note_streamed();
     stream(app, session, response, protocol, None, Some(slot), deadline)
 }
 
 /// When `caller`'s token expires, as an instant; `None` if it's too far
 /// off to represent.
 fn token_deadline(caller: &Caller) -> Option<Instant> {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    Instant::now().checked_add(Duration::from_secs(caller.expires.saturating_sub(now)))
+    Instant::now().checked_add(caller.time_left()?)
 }
 
 /// Ends a session (`DELETE`).
@@ -1050,17 +1317,17 @@ impl Rpc for HttpRpc<'_> {
         }
         let bad_reply = || ProxyError::BadReply(method.to_owned());
         let message = if is_event_stream(response.headers()) {
-            self.find_in_stream(response, id)
+            self.find_in_stream(response, method, id)
                 .await?
                 .ok_or_else(bad_reply)?
         } else {
             let body = read_limited(response).await.map_err(|_| bad_reply())?;
-            serde_json::from_slice::<Value>(&body).map_err(|_| bad_reply())?
+            inventory::read_reply(method, &body)?.ok_or_else(bad_reply)?
         };
         if message.get("id") != Some(&json!(id)) {
             return Err(bad_reply());
         }
-        let result = result_of(method, &message)?;
+        let result = result_of(method, message)?;
         if method == "initialize" {
             let version = result
                 .get("protocolVersion")
@@ -1098,6 +1365,7 @@ impl HttpRpc<'_> {
     async fn find_in_stream(
         &self,
         response: reqwest::Response,
+        method: &str,
         id: u64,
     ) -> Result<Option<Value>, ProxyError> {
         let mut parser = sse::Parser::new(MAX_MESSAGE_BYTES);
@@ -1107,7 +1375,7 @@ impl HttpRpc<'_> {
                 .push(&chunk?)
                 .map_err(|_| ProxyError::BadReply("a streamed reply".to_owned()))?;
             for event in events {
-                let Ok(message) = serde_json::from_slice::<Value>(&event.data) else {
+                let Some(message) = inventory::read_reply(method, &event.data)? else {
                     continue;
                 };
                 if message.get("method").is_some() {
@@ -1136,6 +1404,8 @@ impl HttpRpc<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     #[tokio::test(start_paused = true)]
@@ -1166,5 +1436,71 @@ mod tests {
             read_body(&HeaderMap::new(), fits).await.unwrap().len(),
             MAX_REQUEST_BYTES
         );
+    }
+
+    #[tokio::test]
+    async fn a_clients_message_is_read_only_in_its_turn() {
+        let ping = Bytes::from_static(br#"{"jsonrpc": "2.0", "id": 1, "method": "ping"}"#);
+        // Every turn is taken (as by checks in sessions of any caller)...
+        let all = session::all_turns().await;
+        let waiting = tokio::time::timeout(Duration::from_millis(200), read_message(ping.clone()));
+        assert!(waiting.await.is_err(), "it was read out of turn");
+        // ...and once one is free, it's read.
+        drop(all);
+        let read = tokio::time::timeout(Duration::from_secs(5), read_message(ping))
+            .await
+            .expect("read once a turn is free");
+        assert!(
+            matches!(read, Some((Ok(Message::Request { .. }), true))),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_too_large_to_check_is_still_an_answer() {
+        // Each small object costs as much memory as hundreds of numbers.
+        let objects = vec![r#"{"a":0}"#; 100_000].join(",");
+        let answer = format!(r#"{{"jsonrpc":"2.0","id":"r1","result":{{"roots":[{objects}]}}}}"#);
+        let notification = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"x":[{objects}]}}}}"#
+        );
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"x":[{objects}]}}}}"#
+        );
+        for (text, request) in [(answer, false), (notification, false), (call, true)] {
+            let read = read_message(Bytes::from(text)).await;
+            assert!(
+                matches!(read, Some((Err(ParseError::TooManyValues), read_as)) if read_as == request),
+                "{read:?}"
+            );
+        }
+        // One that doesn't say what it is counts as a request.
+        let read = read_message(Bytes::from_static(b"[1, 2]")).await;
+        assert!(matches!(read, Some((Err(_), true))), "{read:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_past_its_deadline_is_given_up_on() {
+        let soon = Some(Instant::now() + Duration::from_secs(1));
+        assert_eq!(within(soon, async { 7 }).await, Some(7));
+        assert_eq!(within(soon, std::future::pending::<()>()).await, None);
+        assert_eq!(within(None, async { 7 }).await, Some(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_whose_deadline_has_passed_isnt_started() {
+        let started = Arc::new(AtomicBool::new(false));
+        let work = {
+            let started = Arc::clone(&started);
+            async move {
+                started.store(true, Ordering::SeqCst);
+                7
+            }
+        };
+        assert_eq!(within(Some(Instant::now()), work).await, None);
+        assert!(!started.load(Ordering::SeqCst), "it was started");
+        assert!(passed(Some(Instant::now())));
+        assert!(!passed(Some(Instant::now() + Duration::from_secs(1))));
+        assert!(!passed(None));
     }
 }

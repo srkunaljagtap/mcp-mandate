@@ -91,6 +91,78 @@ fn reports_a_server_that_cannot_be_found() {
 }
 
 #[test]
+fn never_logs_a_token_in_the_servers_package() {
+    let policy = empty_policy("package-token");
+    for (package, shown) in [
+        (
+            "git+https://oauth2:T0ken5ecret@gitlab.example/org/server.git",
+            "git+https://***@gitlab.example/org/server.git",
+        ),
+        // npm's `name@url`.
+        (
+            "server@git+https://oauth2:T0ken5ecret@gitlab.example/org/server.git",
+            "server@git+https://***@gitlab.example/org/server.git",
+        ),
+        (
+            "server@https://deploy:T0ken5ecret@npm.example/server.tgz",
+            "server@https://***@npm.example/server.tgz",
+        ),
+    ] {
+        let done = run(
+            &[
+                "run",
+                "--policy",
+                &policy,
+                "--",
+                "mcp-mandate-test-no-such-folder/npx",
+                "-y",
+                package,
+            ],
+            &[],
+            b"",
+        );
+
+        assert!(done.stderr.contains(shown), "{}", done.stderr);
+        assert!(done.stderr.contains("no pinned version"), "{}", done.stderr);
+        assert!(!done.stderr.contains("T0ken5ecret"), "{}", done.stderr);
+    }
+}
+
+#[test]
+fn never_logs_a_token_in_the_server_command() {
+    let policy = empty_policy("command-token");
+    // `Authorization: Bearer <token>` as a client that doesn't quote spaces
+    // passes it; `sh -c` ignores the arguments after its script.
+    let done = run(
+        &[
+            "run",
+            "--policy",
+            &policy,
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+            "sh",
+            "--header",
+            "Authorization:",
+            "Bearer",
+            "T0ken5ecret",
+        ],
+        &[],
+        b"",
+    );
+
+    assert!(done.status.success(), "{}", done.stderr);
+    assert!(
+        done.stderr
+            .contains("sh -c exit 0 sh --header Authorization: *** ***"),
+        "{}",
+        done.stderr
+    );
+    assert!(!done.stderr.contains("T0ken5ecret"), "{}", done.stderr);
+}
+
+#[test]
 fn requires_a_policy() {
     let done = run(&["run", "--", "cat"], &[], PING);
 

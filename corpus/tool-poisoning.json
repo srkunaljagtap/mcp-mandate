@@ -236,6 +236,54 @@
       ]
     },
     {
+      "id": "template-variable-after-literal-text-climbs",
+      "kind": "attack",
+      "about": "A variable that follows literal text (a query string, a name prefix) is filled with `..`, with a second `path=..` after a query delimiter, or with a path that starts at `/`. The URI as a whole has no `..` segment, but a server that reads the variable on its own (or with a query parser, which drops the empty first `path`) resolves it outside the folder it serves.",
+      "pinned": {"resource_templates": [
+        {"uriTemplate": "res://files/read?path={+path}", "name": "Files"},
+        {"uriTemplate": "docs://page-{+p}", "name": "Pages"},
+        {"uriTemplate": "res://get?name={name}", "name": "Named"}
+      ]},
+      "steps": [
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "res://files/read?path=../secret.txt"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "res://files/read?path=notes/%2e%2e/%2e%2e/secret.txt"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "docs://page-../x"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "res://get?name=.."}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 5, "method": "resources/read", "params": {"uri": "res://files/read?path=&path=../secret.txt"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 6, "method": "resources/read", "params": {"uri": "res://get?name=x&name=.."}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 7, "method": "resources/read", "params": {"uri": "docs://page-/etc/passwd"}}, "expect": "block"}
+      ]
+    },
+    {
+      "id": "template-variable-with-a-control-character",
+      "kind": "attack",
+      "about": "A tab inside `..`, or a space after it, isn't a dot segment as written. URL parsers remove tabs and line breaks, and trim spaces and control characters at either end, before they resolve the path, so the server reads the parent folder. A server that trims text (Python's `strip`) also trims a no-break space or a Unicode control character such as NEL.",
+      "pinned": {"resource_templates": [
+        {"uriTemplate": "file:///home/u/project/{+path}", "name": "Project"},
+        {"uriTemplate": "file:///docs/{name}", "name": "Docs"}
+      ]},
+      "steps": [
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "file:///home/u/project/.\t./.ssh/id_rsa"}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "file:///docs/.. "}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "file:///docs/\u0000.."}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "file:///docs/.. "}}, "expect": "block"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 5, "method": "resources/read", "params": {"uri": "file:///docs/..\u0085"}}, "expect": "block"}
+      ]
+    },
+    {
+      "id": "template-reads-after-literal-text",
+      "kind": "benign",
+      "about": "Reads through a template whose variable follows a query string pass, and so do names with an encoded space.",
+      "pinned": {"resource_templates": [
+        {"uriTemplate": "res://files/read?path={+path}", "name": "Files"},
+        {"uriTemplate": "file:///docs/{name}", "name": "Docs"}
+      ]},
+      "steps": [
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "res://files/read?path=notes/today.md"}}, "expect": "forward"},
+        {"from": "client", "send": {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "file:///docs/My%20Notes.md"}}, "expect": "forward"}
+      ]
+    },
+    {
       "id": "template-reads-inside-it",
       "kind": "benign",
       "about": "Reads that stay inside approved templates pass, including nested paths for `{+path}` and names that start with a dot.",

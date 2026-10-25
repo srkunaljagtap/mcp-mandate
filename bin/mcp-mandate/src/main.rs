@@ -27,7 +27,7 @@ use tracing_subscriber::fmt::format::Writer;
 #[command(
     name = "mcp-mandate",
     version,
-    about = "A security gate between AI agents and their MCP tools"
+    about = "Scout reviews MCP servers before you trust them, a hash-chained audit log records every decision, and a security gate checks every call between AI agents and their MCP tools"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -226,7 +226,9 @@ fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error
     };
     info!(policy = %path.display(), mode = mode_name(policy.mode), "loaded policy");
     if policy.mode == Mode::Observe {
-        warn!("observe mode: decisions are logged, but nothing is blocked or hidden");
+        warn!(
+            "observe mode: decisions are logged, but nothing is blocked or hidden; set mode = \"enforce\" in the policy to enforce it"
+        );
     }
     let mut log = Log::open(&policy.audit_log)?;
     log.record(&session_start(
@@ -252,9 +254,9 @@ fn load_gate(path: &Path, command: &ServerCommand) -> Result<Gate, Box<dyn Error
 
 /// Warns when a file that configures the gate sits where the agent or a
 /// server could rewrite it: inside the folder the server runs in (the
-/// agent's own file tools reach it without passing the gate), or writable by
-/// other users, or in a folder they can write to. Whoever can edit these
-/// files decides what the gate allows.
+/// agent's own file tools reach it without passing the gate), or owned or
+/// writable by other users, or in a folder they own or can write to.
+/// Whoever can edit these files decides what the gate allows.
 fn warn_if_exposed(what: &str, path: &Path) {
     let Ok(full) = std::fs::canonicalize(path) else {
         return; // loading it reports the problem
@@ -270,23 +272,198 @@ fn warn_if_exposed(what: &str, path: &Path) {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode =
-            |path: &Path| std::fs::metadata(path).map(|metadata| metadata.permissions().mode());
-        if mode(&full).is_ok_and(|mode| mode & 0o022 != 0) {
-            warn!(file = %path.display(), "the {what} is writable by other users");
+        use std::os::unix::fs::MetadataExt;
+        let me = nix::unistd::geteuid().as_raw();
+        // Read only if a group may be private, and then once for both.
+        let accounts = std::cell::OnceCell::new();
+        let private_group = |uid: u32, gid: u32| {
+            owners_private_group(uid, gid, || accounts.get_or_init(Accounts::read).as_ref())
+        };
+        let exposure_of = |path: &Path| {
+            let metadata = std::fs::metadata(path).ok()?;
+            exposure(
+                metadata.mode(),
+                metadata.uid(),
+                metadata.gid(),
+                me,
+                private_group,
+            )
+        };
+        match exposure_of(&full) {
+            Some(Exposure::Owner) => warn!(
+                file = %path.display(),
+                "the {what} belongs to another user, who can change it"
+            ),
+            Some(Exposure::Writers) => warn!(
+                file = %path.display(),
+                "the {what} is writable by other users"
+            ),
+            None => {}
         }
-        // Whoever can write to a folder can replace the files in it, unless
-        // it has the sticky bit (as /tmp does).
-        if let Some(folder) = full.parent()
-            && mode(folder).is_ok_and(|mode| mode & 0o022 != 0 && mode & 0o1000 == 0)
-        {
-            warn!(
+        // Whoever can write to a folder can replace the files in it.
+        match full.parent().and_then(exposure_of) {
+            Some(Exposure::Owner) => warn!(
+                file = %path.display(),
+                "the {what}'s folder belongs to another user, who can replace the file"
+            ),
+            Some(Exposure::Writers) => warn!(
                 file = %path.display(),
                 "the {what}'s folder is writable by other users, who can replace the file"
-            );
+            ),
+            None => {}
         }
     }
+}
+
+/// What lets users other than the current one and root change a file or
+/// folder, if anything.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exposure {
+    /// Another user owns it, so they can change it whatever its mode says
+    /// and, if it's a folder, replace the files in it.
+    Owner,
+    /// Its mode lets other users write to it.
+    Writers,
+}
+
+/// What lets users other than `me` (the current user) and root change a
+/// file or folder with this mode, owner and group, if anything. Others who
+/// can write to a folder with the sticky bit (as /tmp has) can add files to
+/// it, but not replace yours, so that doesn't count. `private_group` says
+/// whether a group (the second id) is a user's (the first) private group.
+#[cfg(unix)]
+fn exposure(
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    me: u32,
+    private_group: impl FnOnce(u32, u32) -> bool,
+) -> Option<Exposure> {
+    const FILE_TYPE: u32 = 0o170000;
+    const FOLDER: u32 = 0o040000;
+    const STICKY: u32 = 0o1000;
+    let sticky_folder = mode & FILE_TYPE == FOLDER && mode & STICKY != 0;
+    if uid != me && uid != 0 {
+        Some(Exposure::Owner)
+    } else if writable_by_others(mode, uid, gid, private_group) && !sticky_folder {
+        Some(Exposure::Writers)
+    } else {
+        None
+    }
+}
+
+/// Whether a file or folder with this mode, owner and group can be written
+/// by users other than its owner. Group write doesn't count when the group
+/// is the owner's own private group (as `private_group` says), on systems
+/// that give each user one (Fedora, Ubuntu), whose umask makes new files and
+/// folders group-writable. The permission bits are all it reads, not ACLs.
+#[cfg(unix)]
+fn writable_by_others(
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    private_group: impl FnOnce(u32, u32) -> bool,
+) -> bool {
+    mode & 0o002 != 0 || (mode & 0o020 != 0 && !private_group(uid, gid))
+}
+
+/// Whether group `gid` is user `uid`'s private group, as the system's user
+/// and group lists describe them. One that can't be looked up isn't.
+/// `accounts` gives the local lists, which are read only when needed.
+#[cfg(unix)]
+fn owners_private_group<'a>(
+    uid: u32,
+    gid: u32,
+    accounts: impl FnOnce() -> Option<&'a Accounts>,
+) -> bool {
+    use nix::unistd::{Gid, Group, Uid, User};
+    if gid != uid {
+        return false; // without looking anything up
+    }
+    let user = User::from_uid(Uid::from_raw(uid)).ok().flatten();
+    let group = Group::from_gid(Gid::from_raw(gid)).ok().flatten();
+    let (Some(user), Some(group)) = (user, group) else {
+        return false;
+    };
+    is_private_group(uid, &user.name, gid, &group.name, &group.mem)
+        // Others can be in it without its entry listing them.
+        && accounts().is_some_and(|accounts| !accounts.share(uid, &user.name, gid))
+}
+
+/// The text of the local lists of users and groups.
+#[cfg(unix)]
+struct Accounts {
+    /// Lines of `name:password:uid:gid:…`, as in `/etc/passwd`.
+    users: String,
+    /// Lines of `name:password:gid:member,…`, as in `/etc/group`.
+    groups: String,
+}
+
+#[cfg(unix)]
+impl Accounts {
+    /// Reads `/etc/passwd` and `/etc/group`, and the lists of system users
+    /// and groups that nss-altfiles keeps in `/usr/lib` (as Fedora's atomic
+    /// editions do) where there are any. None if one can't be read. Users
+    /// and groups that only a directory service such as LDAP lists aren't
+    /// in them.
+    fn read() -> Option<Self> {
+        let read = |path: &str, extra: &str| {
+            let mut text = std::fs::read_to_string(path).ok()?;
+            match std::fs::read_to_string(extra) {
+                Ok(more) => {
+                    text.push('\n');
+                    text.push_str(&more);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+            Some(text)
+        };
+        Some(Self {
+            users: read("/etc/passwd", "/usr/lib/passwd")?,
+            groups: read("/etc/group", "/usr/lib/group")?,
+        })
+    }
+
+    /// Whether anyone but user `uid` (named `user`) can be in group `gid`
+    /// without the group's entry listing them: another user whose primary
+    /// group it is (`usermod -g`), or another entry with the same id (as
+    /// `groupadd -o` adds), whose members the system puts in it too. Only
+    /// an entry named like the user and listing no members is its own.
+    fn share(&self, uid: u32, user: &str, gid: u32) -> bool {
+        let primary = entries(&self.users).any(|fields| match fields[..] {
+            [_, _, id, group, ..] => {
+                id.parse::<u32>() != Ok(uid) && group.parse::<u32>() == Ok(gid)
+            }
+            _ => false,
+        });
+        let other_entry = entries(&self.groups).any(|fields| match fields[..] {
+            [name, _, id, ref members @ ..] => {
+                id.parse::<u32>() == Ok(gid)
+                    && (name != user || members.iter().any(|member| !member.is_empty()))
+            }
+            _ => false,
+        });
+        primary || other_entry
+    }
+}
+
+/// The fields of each entry in a list of users or groups. A line that
+/// isn't one (macOS's comments) has too few to match.
+#[cfg(unix)]
+fn entries(list: &str) -> impl Iterator<Item = Vec<&str>> {
+    list.lines()
+        .map(|line| line.split(':').map(str::trim).collect())
+}
+
+/// Whether a group with this id, name and member list is the private group
+/// of the user with this id and name: it has the user's id and name, and
+/// lists no members (the user is in it as their primary group). Its id
+/// alone doesn't say so, as a shared group can have the same number.
+#[cfg(unix)]
+fn is_private_group(uid: u32, user: &str, gid: u32, group: &str, members: &[String]) -> bool {
+    gid == uid && group == user && members.is_empty()
 }
 
 /// Whether `file` is inside `here`, the folder the server runs in. Not when
@@ -485,7 +662,9 @@ fn write_output(out: &Path, text: &str, force: bool) -> std::io::Result<()> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         // Readable and writable only by you, like the audit log, whatever
-        // the umask: whoever can edit a pins file approves what's in it.
+        // the umask: whoever can edit a pins file approves what's in it, and
+        // both files name the server by its command, masked only where a
+        // secret in it has a recognizable shape.
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(path)?;
@@ -698,6 +877,8 @@ fn warn_if_unpinned(command: &ServerCommand) {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     if let Some(package) = unpinned_package(&program, &args) {
+        // The package can be a URL with a token in it.
+        let package = stdio::masked(&package);
         warn!(
             %package,
             "the server's package has no pinned version: its launcher fetches the newest release on every run, so its code can change while its tool descriptions don't. Pin a version, e.g. `{package}@1.2.3`"
@@ -921,6 +1102,20 @@ mod tests {
     }
 
     #[test]
+    fn the_help_describes_scout_the_audit_log_and_the_gate_in_order() {
+        let about = Cli::command().get_about().unwrap().to_string();
+        let at = |part: &str| {
+            about
+                .find(part)
+                .unwrap_or_else(|| panic!("{part}: {about}"))
+        };
+        assert!(
+            at("Scout") < at("audit log") && at("audit log") < at("gate"),
+            "{about}"
+        );
+    }
+
+    #[test]
     fn run_takes_a_policy_and_the_server_command_after_double_dash() {
         let cli = Cli::try_parse_from([
             "mcp-mandate",
@@ -1008,6 +1203,121 @@ mod tests {
         assert!(!inside(&home, &policy));
         assert!(!inside(&root, &policy));
         assert!(!inside(&project, &home.join(".config").join("policy.toml")));
+    }
+
+    /// Groups as a system with user-private groups has them: every group
+    /// whose id is a user's is that user's own.
+    #[cfg(unix)]
+    fn same_id(uid: u32, gid: u32) -> bool {
+        uid == gid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_write_counts_unless_the_group_is_the_owners_own() {
+        // A user-private group (umask 002): only the owner is in it.
+        assert!(!writable_by_others(0o40775, 1000, 1000, same_id));
+        assert!(!writable_by_others(0o100664, 1000, 1000, same_id));
+        // A shared group, such as `users` or macOS's `staff`.
+        assert!(writable_by_others(0o40775, 1000, 100, same_id));
+        assert!(writable_by_others(0o40775, 501, 20, same_id));
+        // A shared group that happens to have the owner's id.
+        assert!(writable_by_others(0o40775, 1000, 1000, |_, _| false));
+        // Anyone, whatever the group.
+        assert!(writable_by_others(0o100646, 1000, 1000, same_id));
+        assert!(!writable_by_others(0o40755, 1000, 100, same_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_group_named_like_its_user_and_with_no_members_is_private() {
+        assert!(is_private_group(1000, "alice", 1000, "alice", &[]));
+        // A shared group with the same id as a user.
+        assert!(!is_private_group(1000, "alice", 1000, "team", &[]));
+        // One that lists members, who can write what the group can.
+        assert!(!is_private_group(
+            1000,
+            "alice",
+            1000,
+            "alice",
+            &["bob".to_owned()]
+        ));
+        // Named like the user, but another group.
+        assert!(!is_private_group(1000, "alice", 1001, "alice", &[]));
+        // Ids no user or group has can't be looked up, so they don't count.
+        let unknown = 3_999_999_999;
+        assert!(!owners_private_group(unknown, unknown, || None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_is_shared_by_its_primary_users_and_other_entries_with_its_id() {
+        let accounts = |users: &str, groups: &str| Accounts {
+            users: users.to_owned(),
+            groups: groups.to_owned(),
+        };
+        let users = "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n";
+        let groups = "root:x:0:\nwheel:x:10:alice\nalice:x:1000:\n";
+        assert!(!accounts(users, groups).share(1000, "alice", 1000));
+        // Another user whose primary group it is: `usermod -g alice bob`.
+        let bob = format!("{users}bob:x:1001:1000::/home/bob:/bin/bash\n");
+        assert!(accounts(&bob, groups).share(1000, "alice", 1000));
+        // Another entry with its id, `groupadd -o -g 1000 team`, with or
+        // without members, or a second one of its own that lists some.
+        for extra in ["team:x:1000:bob", "team:x:1000:", "alice:x:1000:bob"] {
+            let groups = format!("{groups}{extra}\n");
+            assert!(
+                accounts(users, &groups).share(1000, "alice", 1000),
+                "{extra}"
+            );
+        }
+        // root's group where other system users have it as their primary
+        // group, as on Fedora.
+        let fedora = format!("{users}sync:x:5:0:sync:/sbin:/bin/sync\n");
+        assert!(accounts(&fedora, groups).share(0, "root", 0));
+        assert!(!accounts(users, groups).share(0, "root", 0));
+        // Another name for the same user isn't another user, and other
+        // groups and macOS's comments don't count.
+        let users = format!("##\n# User Database\n##\n{users}toor:x:0:0::/root:/bin/sh\n");
+        assert!(!accounts(&users, groups).share(0, "root", 0));
+        assert!(!accounts(&users, groups).share(1000, "alice", 1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_isnt_private_without_the_local_lists_or_when_they_share_it() {
+        // Whatever the system says about the current user's group, these
+        // lists make it not private.
+        let me = nix::unistd::geteuid().as_raw();
+        assert!(!owners_private_group(me, me, || None));
+        let shared = Accounts {
+            users: format!("other:x:{}:{me}::/:/bin/sh\n", me.wrapping_add(1)),
+            groups: String::new(),
+        };
+        assert!(!owners_private_group(me, me, || Some(&shared)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_users_file_or_folder_is_exposed_whatever_its_mode() {
+        let me = 1000;
+        let exposure = |mode, uid, gid, me| exposure(mode, uid, gid, me, same_id);
+        // Another user can change what they own, and replace what's in a
+        // folder they own, sticky bit or not.
+        assert_eq!(exposure(0o100600, 1001, 1001, me), Some(Exposure::Owner));
+        assert_eq!(exposure(0o40755, 1001, 1001, me), Some(Exposure::Owner));
+        assert_eq!(exposure(0o41777, 1001, 1001, me), Some(Exposure::Owner));
+        // A user can change their own file when root runs mcp-mandate.
+        assert_eq!(exposure(0o100644, 1000, 1000, 0), Some(Exposure::Owner));
+        // Yours and root's are exposed only when others can write to them.
+        assert_eq!(exposure(0o100644, me, me, me), None);
+        assert_eq!(exposure(0o40755, 0, 0, me), None);
+        assert_eq!(exposure(0o100666, 0, 0, me), Some(Exposure::Writers));
+        assert_eq!(exposure(0o40777, me, me, me), Some(Exposure::Writers));
+        // Others can add files to /tmp, but not replace yours.
+        assert_eq!(exposure(0o41777, 0, 0, me), None);
+        // The sticky bit means nothing on a file.
+        assert_eq!(exposure(0o101666, me, me, me), Some(Exposure::Writers));
     }
 
     #[test]
@@ -1106,15 +1416,18 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Private whatever the umask, a replaced file included.
-            let mode = std::fs::metadata(&out).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+            let mode_of =
+                |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            // A file created as usual gets 0o666 less the umask.
+            std::fs::write(dir.join("usual"), "").unwrap();
+            let umasked = mode_of(&dir.join("usual"));
+            // Only you can read or write it whatever the umask, a replaced
+            // file included.
             write_output(&dir.join("new.toml"), "one", false).unwrap();
-            let mode = std::fs::metadata(dir.join("new.toml"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+            for path in [out.clone(), dir.join("new.toml")] {
+                let mode = mode_of(&path);
+                assert_eq!(mode, 0o600 & umasked, "{mode:o}, umask leaves {umasked:o}");
+            }
 
             let target = dir.join("elsewhere");
             let link = dir.join("link.toml");

@@ -27,7 +27,7 @@ Each file is one class of attack:
     "id": "aws-key-in-tool-result",
     "kind": "attack",
     "about": "What the attacker tries, and why it matters.",
-    "policy": "TOML policy text (default: allow every tool)",
+    "policy": "TOML policy text (default: allow every tool, in enforce mode)",
     "pinned": {"tools": [], "prompts": [], "resources": [], "resource_templates": [], "instructions": "..."},
     "skip_listing": false,
     "steps": [
@@ -40,6 +40,9 @@ Each file is one class of attack:
 ```
 
 - `kind`: `attack`, `benign` or `known-gap`.
+- `policy` runs in `enforce` mode unless it names a mode itself
+  (`mode = "observe"`), although a policy file on its own starts in
+  `observe` mode.
 - `pinned`: what was approved. Unless `skip_listing` is true, the session
   first lists each pinned kind and the server answers with exactly what was
   pinned, so the case starts with everything approved and checked.

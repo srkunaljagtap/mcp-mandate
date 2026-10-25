@@ -1,32 +1,13 @@
 //! Handling text written by the server: finding characters meant to hide
 //! things, and making it safe to print.
 
-/// Whether `c` is invisible or changes text direction: zero-width
-/// characters, direction overrides, Unicode "tag" characters and variation
-/// selectors. They can hide instructions from a person reading a
-/// description while the model still reads them.
+/// Whether `c` is invisible or changes how text around it shows: zero-width
+/// characters, direction overrides, Unicode "tag" characters, variation
+/// selectors and the like. They can hide instructions from a person reading
+/// a description while the model still reads them. The same characters the
+/// pins file writes as escapes, so what Scout flags is what you'd see there.
 pub(crate) fn is_hidden(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{034F}'
-            | '\u{061C}'
-            | '\u{115F}'
-            | '\u{1160}'
-            | '\u{17B4}'
-            | '\u{17B5}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{3164}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{FEFF}'
-            | '\u{FFA0}'
-            | '\u{E0000}'..='\u{E007F}'
-            | '\u{E0100}'..='\u{E01EF}'
-    )
+    mcp_mandate_pin::is_hidden(c)
 }
 
 /// The terminal control characters in `text`: escapes, backspace, a
@@ -75,6 +56,12 @@ mod tests {
         assert_eq!(printable("\u{1b}[2J", 10), "\\u{1b}[2J");
         assert_eq!(printable("x\u{200B}y", 10), "x\\u{200b}y");
         assert_eq!(printable("\u{E0041}", 10), "\\u{e0041}");
+        // Every character that shows as nothing or steers layout, such as
+        // a Mongolian variation selector or a musical format character.
+        assert_eq!(
+            printable("a\u{180B}b\u{1D173}c\u{FFF0}", 10),
+            "a\\u{180b}b\\u{1d173}c\\u{fff0}"
+        );
     }
 
     #[test]

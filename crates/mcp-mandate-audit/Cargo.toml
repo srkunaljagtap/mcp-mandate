@@ -20,5 +20,9 @@ proptest.workspace = true
 # O_NOFOLLOW, so the log never writes through a planted symlink.
 nix.workspace = true
 
+[target.'cfg(not(unix))'.dependencies]
+# The open file's volume and file index, to notice the log being replaced.
+same-file.workspace = true
+
 [lints]
 workspace = true

@@ -15,8 +15,18 @@ use crate::ProxyError;
 
 pub const SESSION_HEADER: &str = "mcp-session-id";
 pub const PROTOCOL_HEADER: &str = "mcp-protocol-version";
-/// Longest a fetched access token is used, whatever its `expires_in` says.
+/// How long a fetched access token is taken to last when deciding how long
+/// to send it: as its `expires_in` says, but at most a day, and five
+/// minutes without one.
 const MAX_TOKEN_SECONDS: u64 = 24 * 3600;
+const DEFAULT_TOKEN_SECONDS: u64 = 300;
+/// A token stays among the [credential strings](Upstream::credential_strings)
+/// for as long as it may be valid, long after it's last sent: until its
+/// `expires_in` (at most a year), or for a day without one...
+const MAX_SECRET_SECONDS: u64 = 365 * 24 * 3600;
+const UNKNOWN_SECRET_SECONDS: u64 = 24 * 3600;
+/// ...and only the newest this many tokens do, so they don't pile up.
+const MAX_LISTED_TOKENS: usize = 16;
 /// A token is renewed this long before it expires, so it never expires
 /// mid-request...
 const RENEW_EARLY: Duration = Duration::from_secs(30);
@@ -67,9 +77,24 @@ struct ClientCredentials {
 struct Tokens {
     /// The token to send, and when to stop sending it.
     current: Option<(HeaderValue, Instant)>,
-    /// Every token handed out that hasn't expired, with when it does:
-    /// a request may be carrying any of them.
+    /// The tokens handed out that may still be valid, oldest first, with
+    /// until when each stays secret: a request or stream may be carrying
+    /// any of them, and a server may echo one later.
     issued: Vec<(HeaderValue, Instant)>,
+}
+
+impl Tokens {
+    /// Makes `token`, which the token endpoint says lasts `expires_in`
+    /// seconds, the one to send, and lists it for as long as it may be
+    /// valid.
+    fn issue(&mut self, token: HeaderValue, expires_in: Option<u64>, now: Instant) {
+        let (send_for, secret_for) = lifetimes(expires_in);
+        self.current = Some((token.clone(), now + send_for));
+        self.issued.retain(|(_, until)| now < *until);
+        self.issued.push((token, now + secret_for.max(send_for)));
+        let excess = self.issued.len().saturating_sub(MAX_LISTED_TOKENS);
+        self.issued.drain(..excess);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -199,9 +224,10 @@ impl Upstream {
 
     /// Every form of the credential the gateway uses for this server right
     /// now (the header value, the token after its scheme, the client
-    /// secret, every access token that may still be in use), so a server
+    /// secret, every access token that may still be valid), so a server
     /// echoing it back can't hand it to a caller. A token is listed from
-    /// before it's first sent until it expires.
+    /// before it's first sent until it expires, or for a day when the
+    /// token endpoint didn't say; only the newest few are.
     pub fn credential_strings(&self) -> Vec<String> {
         match &self.credential {
             Credential::None => Vec::new(),
@@ -228,12 +254,19 @@ impl Upstream {
     }
 }
 
-/// A credential header's value, and the token after its scheme (`Bearer`,
-/// `token`, `SSWS`, in any case): a server may echo either.
+/// A credential header's value, as sent and without the whitespace around
+/// it (as a server reads it), and the token after its scheme (`Bearer`,
+/// `token`, `SSWS`, in any case): a server may echo any of them. (Read as
+/// text even if it isn't ASCII, rather than not at all.)
 fn credential_forms(value: &HeaderValue) -> Vec<String> {
-    let value = value.to_str().unwrap_or_default();
+    let value = String::from_utf8_lossy(value.as_bytes());
+    let value = value.as_ref();
     let mut forms = vec![value.to_owned()];
-    if let Some((scheme, token)) = value.split_once(' ')
+    let trimmed = value.trim();
+    if trimmed != value && !trimmed.is_empty() {
+        forms.push(trimmed.to_owned());
+    }
+    if let Some((scheme, token)) = trimmed.split_once(' ')
         && !scheme.is_empty()
         && scheme
             .bytes()
@@ -243,6 +276,21 @@ fn credential_forms(value: &HeaderValue) -> Vec<String> {
         forms.push(token.trim().to_owned());
     }
     forms
+}
+
+/// For a token the token endpoint says lasts `expires_in` seconds: how long
+/// it's sent before it's renewed, and how long it may be valid.
+fn lifetimes(expires_in: Option<u64>) -> (Duration, Duration) {
+    let lifetime = expires_in
+        .unwrap_or(DEFAULT_TOKEN_SECONDS)
+        .min(MAX_TOKEN_SECONDS);
+    let valid = expires_in
+        .unwrap_or(UNKNOWN_SECRET_SECONDS)
+        .min(MAX_SECRET_SECONDS);
+    (
+        use_for(Duration::from_secs(lifetime)),
+        Duration::from_secs(valid),
+    )
 }
 
 /// How long a token that lasts `lifetime` is sent before it's renewed.
@@ -268,15 +316,9 @@ impl ClientCredentials {
         if let Some(token) = self.current() {
             return Ok(token);
         }
-        let (token, lifetime) = self.fetch(http).await?;
-        let now = Instant::now();
-        let renew = use_for(lifetime);
-        let mut tokens = self.tokens();
-        tokens.current = Some((token.clone(), now + renew));
-        tokens.issued.retain(|(_, expires)| now < *expires);
-        tokens
-            .issued
-            .push((token.clone(), now + lifetime.max(renew)));
+        let (token, expires_in) = self.fetch(http).await?;
+        self.tokens()
+            .issue(token.clone(), expires_in, Instant::now());
         Ok(token)
     }
 
@@ -295,12 +337,12 @@ impl ClientCredentials {
         self.tokens.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Fetches a new token: the `Authorization` value, and how long it
-    /// lasts (at most a day, whatever the endpoint claims).
+    /// Fetches a new token: the `Authorization` value, and how many
+    /// seconds the endpoint says it lasts, if it says.
     async fn fetch(
         &self,
         http: &reqwest::Client,
-    ) -> Result<(HeaderValue, Duration), CredentialError> {
+    ) -> Result<(HeaderValue, Option<u64>), CredentialError> {
         let mut form = vec![
             ("grant_type", "client_credentials"),
             ("resource", self.resource.as_str()),
@@ -336,14 +378,15 @@ impl ClientCredentials {
             .as_deref()
             .is_none_or(|kind| kind.eq_ignore_ascii_case("bearer"));
         let access_token = reply.access_token.unwrap_or_default();
-        if !bearer || access_token.is_empty() {
+        // ASCII, as a bearer token is: a server may read other bytes in a
+        // header as some other text than this, and echo that.
+        if !bearer || access_token.is_empty() || !access_token.is_ascii() {
             return Err(CredentialError::Invalid);
         }
         let mut token = HeaderValue::from_str(&format!("Bearer {access_token}"))
             .map_err(|_| CredentialError::Invalid)?;
         token.set_sensitive(true);
-        let lifetime = Duration::from_secs(reply.expires_in.unwrap_or(300).min(MAX_TOKEN_SECONDS));
-        Ok((token, lifetime))
+        Ok((token, reply.expires_in))
     }
 }
 
@@ -420,6 +463,45 @@ mod tests {
     }
 
     #[test]
+    fn a_token_stays_secret_for_as_long_as_it_may_be_valid() {
+        let hours = |hours: u64| Duration::from_secs(hours * 3600);
+        assert_eq!(lifetimes(Some(3600)), (Duration::from_secs(3570), hours(1)));
+        // Without `expires_in`, it's sent for five minutes, but may be
+        // valid for much longer.
+        assert_eq!(lifetimes(None), (Duration::from_secs(270), hours(24)));
+        // Sent for a day at most, but valid for as long as it says.
+        assert_eq!(
+            lifetimes(Some(30 * 24 * 3600)),
+            (hours(24) - RENEW_EARLY, hours(30 * 24))
+        );
+        assert_eq!(lifetimes(Some(u64::MAX)).1, hours(365 * 24));
+    }
+
+    #[test]
+    fn tokens_renewed_often_are_kept_secret_but_only_the_newest() {
+        let token = |n: usize| HeaderValue::from_str(&format!("Bearer opaque-{n}")).unwrap();
+        let start = Instant::now();
+        let mut tokens = Tokens::default();
+        tokens.issue(token(0), None, start);
+        // An hour on, it's long been renewed, but it's still secret.
+        let later = start + Duration::from_secs(3600);
+        tokens.issue(token(1), None, later);
+        assert_eq!(tokens.current.as_ref().unwrap().0, token(1));
+        assert!(
+            tokens
+                .issued
+                .iter()
+                .any(|(listed, until)| *listed == token(0) && later < *until)
+        );
+        for n in 2..40 {
+            tokens.issue(token(n), Some(3600), later);
+        }
+        assert_eq!(tokens.issued.len(), MAX_LISTED_TOKENS);
+        assert_eq!(tokens.issued.last().unwrap().0, token(39));
+        assert!(!tokens.issued.iter().any(|(listed, _)| *listed == token(0)));
+    }
+
+    #[test]
     fn the_token_after_any_scheme_is_a_credential_too() {
         let forms = |value: &str| credential_forms(&HeaderValue::from_str(value).unwrap());
         assert_eq!(
@@ -431,6 +513,26 @@ mod tests {
             ["bearer opaque-1234", "opaque-1234"]
         );
         assert_eq!(forms("opaque-1234"), ["opaque-1234"]);
+        let not_ascii = HeaderValue::from_bytes("Token pässwort-1234".as_bytes()).unwrap();
+        assert_eq!(
+            credential_forms(&not_ascii),
+            ["Token pässwort-1234", "pässwort-1234"]
+        );
+    }
+
+    #[test]
+    fn a_credential_is_listed_without_the_whitespace_around_it_too() {
+        // A server strips it from a header's value, and may echo the rest.
+        let forms = |value: &str| credential_forms(&HeaderValue::from_str(value).unwrap());
+        assert_eq!(forms("opaque-1234 "), ["opaque-1234 ", "opaque-1234"]);
+        assert_eq!(
+            forms(" SSWS opaque-1234"),
+            [" SSWS opaque-1234", "SSWS opaque-1234", "opaque-1234"]
+        );
+        assert_eq!(
+            forms("Bearer opaque-1234 "),
+            ["Bearer opaque-1234 ", "Bearer opaque-1234", "opaque-1234"]
+        );
     }
 
     /// A token endpoint, slow to answer, handing out a new token each time.
@@ -518,6 +620,9 @@ mod tests {
         let error = client_credentials(url).token(&http).await.unwrap_err();
         assert!(matches!(error, CredentialError::Malformed), "{error}");
         let (url, _) = token_endpoint(r#"{"token_type": "Bearer"}"#).await;
+        let error = client_credentials(url).token(&http).await.unwrap_err();
+        assert!(matches!(error, CredentialError::Invalid), "{error}");
+        let (url, _) = token_endpoint(r#"{"access_token": "pässwort-token-1"}"#).await;
         let error = client_credentials(url).token(&http).await.unwrap_err();
         assert!(matches!(error, CredentialError::Invalid), "{error}");
         let huge = format!(

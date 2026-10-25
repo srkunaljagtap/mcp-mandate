@@ -52,6 +52,7 @@ fn hides_changed_and_unapproved_tools_and_blocks_their_calls() {
         "gate.policy.toml",
         &format!(
             r#"
+            mode = "enforce"
             pins = "{}"
 
             [[tools]]
@@ -139,7 +140,8 @@ fn pin_records_what_the_server_offers_and_will_not_overwrite_it_silently() {
     let _ = std::fs::remove_file(&out);
     let out_arg = out.display().to_string();
 
-    // The arguments after the script (which ignores them) hold a password.
+    // The arguments after the script (which ignores them) hold passwords
+    // and tokens.
     let done = run(
         &[
             "pin",
@@ -150,6 +152,13 @@ fn pin_records_what_the_server_offers_and_will_not_overwrite_it_silently() {
             "-c",
             &script,
             "postgresql://app:S3cret@db/prod",
+            "--header",
+            "Authorization:Bearer T0ken5ecret",
+            "srv@git+https://oauth2:T0ken5ecret@gitlab.example/org/srv.git",
+            "--header",
+            "Authorization:",
+            "Bearer",
+            "T0ken5ecret",
         ],
         &envs,
         b"",
@@ -162,10 +171,13 @@ fn pin_records_what_the_server_offers_and_will_not_overwrite_it_silently() {
         done.stderr
     );
     assert!(!done.stderr.contains("S3cret"), "{}", done.stderr);
+    assert!(!done.stderr.contains("T0ken5ecret"), "{}", done.stderr);
 
     let pins = Pins::load(&out).unwrap();
     assert!(
-        pins.server.ends_with(" postgresql://***@db/prod"),
+        pins.server.ends_with(
+            " postgresql://***@db/prod --header Authorization:*** *** srv@git+https://***@gitlab.example/org/srv.git --header Authorization: *** ***"
+        ),
         "{}",
         pins.server
     );
@@ -216,7 +228,7 @@ fn read_email_then_exfiltrate_is_held_and_planted_keys_are_redacted() {
     let policy = temp_file(
         "exfil.policy.toml",
         &format!(
-            "pins = \"{}\"\n[[tools]]\nmatch = \"*_email\"\naction = \"allow\"\n",
+            "mode = \"enforce\"\npins = \"{}\"\n[[tools]]\nmatch = \"*_email\"\naction = \"allow\"\n",
             pins.display()
         ),
     );
@@ -276,7 +288,7 @@ fn every_decision_is_chained_into_the_audit_log_and_verify_catches_an_edit() {
     let policy = temp_file(
         "audit.policy.toml",
         &format!(
-            "pins = \"{}\"\n\n[[tools]]\nmatch = \"echo\"\naction = \"allow\"\n",
+            "mode = \"enforce\"\npins = \"{}\"\n\n[[tools]]\nmatch = \"echo\"\naction = \"allow\"\n",
             pins.display()
         ),
     );
@@ -410,7 +422,7 @@ fn cross_server_taint(agent: Option<&str>) -> String {
         let policy = temp_file(
             &format!("cross-{variant}-{name}.policy.toml"),
             &format!(
-                "pins = \"{}\"\n[[tools]]\nmatch = \"*\"\naction = \"allow\"\n",
+                "mode = \"enforce\"\npins = \"{}\"\n[[tools]]\nmatch = \"*\"\naction = \"allow\"\n",
                 pins.display()
             ),
         );

@@ -12,16 +12,24 @@
 //! while that process runs. A named agent's stays while any of its servers
 //! runs: each holds a shared lock on `<record>.lock` for its life, and a
 //! server that finds no other one running starts the agent afresh, clearing
-//! the record an earlier session left.
+//! the record an earlier session left. Every server that has seen the taint
+//! keeps the record in place meanwhile: it puts it back if something
+//! removes it, and touches it now and then so cleaners of old files leave
+//! it alone. Each of a named agent's servers touches the lock file the same
+//! way, so it isn't removed while they hold it, and makes and locks it again
+//! if it's removed anyway.
 //!
-//! The file lives in a folder only this user can use. If that can't be set
+//! The file lives in a folder only this user can use, checked again before
+//! every write, and is never written through a link. If that can't be set
 //! up safely, or the agent can't be identified, each server keeps its own
 //! taint, with a warning.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, FileTimes, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use mcp_mandate_gate::SharedTaint;
@@ -30,6 +38,13 @@ use tracing::{info, warn};
 
 /// Records of agents that are gone are removed once untouched this long.
 const STALE: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How often a server that has seen the taint checks that its record is
+/// still there.
+const CHECK: Duration = Duration::from_secs(60);
+/// How long a record (or a named agent's lock file) goes untouched before
+/// such a server touches it. The runtime folder's rules let a cleaner
+/// remove files untouched for 6 hours.
+const TOUCH: Duration = Duration::from_secs(3600);
 
 /// Programs that suggest mcp-mandate was started through a shell rather
 /// than by the agent itself.
@@ -50,9 +65,18 @@ pub struct AgentTaint {
     path: PathBuf,
     /// The taint this process has seen. It stays for the process's life,
     /// and puts the record back if something removes it meanwhile.
-    seen: OnceLock<String>,
-    /// For a named agent: the shared lock that shows this server is running.
-    _running: Option<File>,
+    seen: Arc<OnceLock<String>>,
+    /// How often the record is checked once the taint has been seen (and,
+    /// for a named agent, the lock file from the start).
+    check: Duration,
+    /// Keeps the record in place once the taint has been seen, and a named
+    /// agent's lock file in place and from looking old. Declared before
+    /// `running` so it stops before this server counts as stopped.
+    keeper: OnceLock<Keeper>,
+    /// For a named agent: the lock file this server holds a shared lock on
+    /// to show it's running. Replaced if that file is removed (see
+    /// [`keep_lock`]).
+    running: Option<Arc<Mutex<File>>>,
 }
 
 impl AgentTaint {
@@ -72,52 +96,91 @@ impl AgentTaint {
         let folder = private_folder()?;
         remove_stale(&folder);
         let path = folder.join(format!("taint-{agent}"));
-        let running = if named { join_named(&path) } else { None };
+        let taint = if named {
+            Self::join(path, CHECK)
+        } else {
+            Self::at(path)
+        };
         info!("taint is shared with the agent's other servers");
-        Some(Self {
-            _running: running,
-            ..Self::at(path)
-        })
+        Some(taint)
     }
 
     fn at(path: PathBuf) -> Self {
         Self {
             path,
-            seen: OnceLock::new(),
-            _running: None,
+            seen: Arc::default(),
+            check: CHECK,
+            keeper: OnceLock::new(),
+            running: None,
         }
     }
 
-    /// Writes the record aside, then renames it into place, so a reader
-    /// never sees half of it. If that fails, makes the folder again
-    /// (something may have removed it) and tries once more.
-    fn write(&self, source: &str) {
-        let attempt = || {
-            let temporary = self
-                .path
-                .with_extension(format!("{}.tmp", std::process::id()));
-            let written =
-                write_private(&temporary, source).and_then(|()| fs::rename(&temporary, &self.path));
-            if written.is_err() {
-                let _ = fs::remove_file(&temporary);
-            }
-            written
+    /// One of a named agent's servers, whose record is at `path`: marked as
+    /// running for its life, and keeping that mark in place and from
+    /// looking old (its lock file is checked every `check`).
+    fn join(path: PathBuf, check: Duration) -> Self {
+        let running = join_named(&path).map(|lock| Arc::new(Mutex::new(lock)));
+        let taint = Self {
+            running,
+            check,
+            ..Self::at(path)
         };
-        let mut written = attempt();
-        if written.is_err()
-            && let Some(folder) = self.path.parent()
-            && make_private(folder).is_ok()
-        {
-            written = attempt();
+        if taint.running.is_some() {
+            taint.keep_running();
+            taint.keep();
         }
-        if let Err(error) = written {
+        taint
+    }
+
+    fn write(&self, source: &str) {
+        if let Err(error) = write_record(&self.path, source) {
             warn!(%error, "couldn't share the taint with the agent's other servers");
+        }
+    }
+
+    /// Remembers the taint for the rest of this process's life and, the
+    /// first time, starts keeping its record in place.
+    fn saw(&self, source: &str) {
+        if self.seen.set(source.to_owned()).is_ok() {
+            self.keep();
+        }
+    }
+
+    /// Starts keeping the record in place (once the taint has been seen)
+    /// and this server's lock file from looking old, unless that's being
+    /// done already.
+    fn keep(&self) {
+        if self.keeper.get().is_some() {
+            return;
+        }
+        match Keeper::start(
+            self.path.clone(),
+            Arc::clone(&self.seen),
+            self.running.clone(),
+            self.check,
+        ) {
+            Ok(keeper) => {
+                let _ = self.keeper.set(keeper);
+            }
+            Err(error) => {
+                warn!(%error, "couldn't start keeping the agent's taint in place; if its files are removed, the agent's other servers may not see it");
+            }
+        }
+    }
+
+    /// Touches this server's lock file if it looks old, and locks it again
+    /// if it's been removed: done whenever the record is checked, besides
+    /// by the keeper (which warns if it can't).
+    fn keep_running(&self) {
+        if let Some(lock) = &self.running {
+            let _ = keep_lock(&self.path, lock);
         }
     }
 }
 
 impl SharedTaint for AgentTaint {
     fn get(&self) -> Option<String> {
+        self.keep_running();
         let recorded = match fs::read_to_string(&self.path) {
             Ok(source) if !source.is_empty() => Some(source),
             Ok(_) => None,
@@ -129,12 +192,14 @@ impl SharedTaint for AgentTaint {
         };
         match recorded {
             Some(source) => {
-                let _ = self.seen.set(source.clone());
+                self.saw(&source);
                 Some(source)
             }
             None => {
                 // Removed while the agent still runs (by hand, or by a
                 // cleaner of temporary files): put it back for the others.
+                // Still counts here even if it can't be: `reshare` tells
+                // the gate whether it's shared.
                 let seen = self.seen.get()?;
                 self.write(seen);
                 Some(seen.clone())
@@ -142,10 +207,224 @@ impl SharedTaint for AgentTaint {
         }
     }
 
-    fn set(&self, source: &str) {
-        let _ = self.seen.set(source.to_owned());
-        self.write(source);
+    fn set(&self, source: &str) -> bool {
+        self.saw(source);
+        self.keep_running();
+        match write_record(&self.path, source) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "couldn't share the taint with the agent's other servers");
+                false
+            }
+        }
     }
+
+    fn reshare(&self, source: &str) -> bool {
+        self.saw(source);
+        self.keep_running();
+        match keep_record(&self.path, source) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "couldn't put the taint back where the agent's other servers read it");
+                false
+            }
+        }
+    }
+}
+
+/// A thread that, until dropped, keeps a named agent's lock file and, once
+/// the taint has been seen, its record in place: it puts either back if
+/// it's gone, and touches either once it's been untouched for [`TOUCH`].
+/// So a record that couldn't be written at first (a full disk, say) is
+/// written as soon as it can be. The lock file is seen to first, so a
+/// server started meanwhile doesn't clear the record put back.
+struct Keeper {
+    stop: mpsc::Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Keeper {
+    fn start(
+        path: PathBuf,
+        seen: Arc<OnceLock<String>>,
+        lock: Option<Arc<Mutex<File>>>,
+        check: Duration,
+    ) -> std::io::Result<Self> {
+        let (stop, stopped) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("taint keeper".to_owned())
+            .spawn(move || {
+                let (mut lock_failing, mut record_failing) = (false, false);
+                while stopped.recv_timeout(check) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    if let Some(lock) = &lock {
+                        report(
+                            keep_lock(&path, lock),
+                            &mut lock_failing,
+                            "couldn't keep this server marked as running; a later server of the agent may clear its taint",
+                        );
+                    }
+                    if let Some(source) = seen.get() {
+                        report(
+                            keep_record(&path, source),
+                            &mut record_failing,
+                            "couldn't keep the taint shared with the agent's other servers",
+                        );
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+/// Warns about the first of a run of failures.
+fn report(result: std::io::Result<()>, failing: &mut bool, problem: &str) {
+    match result {
+        Ok(()) => *failing = false,
+        Err(error) => {
+            if !*failing {
+                warn!(%error, "{problem}");
+            }
+            *failing = true;
+        }
+    }
+}
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Puts the record back if it's gone, empty or not a plain file, and
+/// touches it if it's been untouched for [`TOUCH`].
+fn keep_record(path: &Path, source: &str) -> std::io::Result<()> {
+    // Links aren't followed: a record is only ever a file.
+    let modified = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => metadata.modified()?,
+        Ok(_) => return write_record(path, source),
+        Err(error) if error.kind() == ErrorKind::NotFound => return write_record(path, source),
+        Err(error) => return Err(error),
+    };
+    if untouched(modified) {
+        touch(&no_follow(File::options().write(true)).open(path)?)?;
+    }
+    Ok(())
+}
+
+/// Keeps the lock file next to a named agent's `record` showing this server
+/// is running. It's touched, through the handle this server holds it by, if
+/// it's been untouched for [`TOUCH`]: otherwise a cleaner of old files could
+/// remove it while the agent runs, and the next server, finding it unlocked,
+/// would clear the agent's taint. If it's removed anyway, it's made and
+/// locked again (see [`follow_lock`]).
+fn keep_lock(record: &Path, lock: &Mutex<File>) -> std::io::Result<()> {
+    // A panic while it was held can't have left the file half replaced.
+    let mut lock = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    follow_lock(record, &mut lock)?;
+    if untouched(lock.metadata()?.modified()?) {
+        touch(&lock)?;
+    }
+    Ok(())
+}
+
+/// Makes sure `lock` is the file a server starting now finds next to
+/// `record`. A lock on a file no longer there shows no later server that
+/// this one runs: if it's been removed (with its folder, say, as a runtime
+/// folder is at logout) or replaced, the folder and the file are made again
+/// as needed, and the file there is locked instead.
+#[cfg(unix)]
+fn follow_lock(record: &Path, lock: &mut File) -> std::io::Result<()> {
+    let held = lock.metadata();
+    follow_lock_from(record, held, lock)
+}
+
+/// [`follow_lock`], given what reading the held file's metadata gave. A
+/// held file that can't be read (stale, on a network drive, once another
+/// computer removed it) counts as no longer there: giving up instead would
+/// never lock the file there again.
+#[cfg(unix)]
+fn follow_lock_from(
+    record: &Path,
+    held: std::io::Result<fs::Metadata>,
+    lock: &mut File,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Links aren't followed: one in the lock file's place isn't it.
+    match fs::symlink_metadata(record.with_extension("lock")) {
+        Ok(found)
+            if held
+                .as_ref()
+                .is_ok_and(|held| found.dev() == held.dev() && found.ino() == held.ino()) =>
+        {
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(folder) = record.parent() {
+        make_private(folder).map_err(std::io::Error::other)?;
+    }
+    let found = open_lock(record)?;
+    found.lock_shared()?;
+    *lock = found;
+    info!("the agent's lock file was removed; this server is marked as running again");
+    Ok(())
+}
+
+/// On Windows the lock file can't be removed or renamed while a server holds
+/// it (see [`open_lock`]), and its folder, under `LOCALAPPDATA`, isn't
+/// emptied at logout or by a cleaner of old files, so the lock file is left
+/// as it is.
+#[cfg(not(unix))]
+fn follow_lock(_: &Path, _: &mut File) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Whether something last modified at `modified` has gone untouched for
+/// longer than [`TOUCH`].
+fn untouched(modified: SystemTime) -> bool {
+    SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age > TOUCH)
+}
+
+fn touch(file: &File) -> std::io::Result<()> {
+    let now = SystemTime::now();
+    file.set_times(FileTimes::new().set_accessed(now).set_modified(now))
+}
+
+/// Writes a record aside, then renames it into place, so a reader never
+/// sees half of it. The folder is checked first, and made again if
+/// something removed it: in a shared temporary folder, another user could
+/// have made one in its place. A failed write is tried once more.
+fn write_record(path: &Path, source: &str) -> std::io::Result<()> {
+    // Each write gets its own temporary file: a keeper may write while
+    // another thread of this process does.
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
+    let attempt = || {
+        if let Some(folder) = path.parent() {
+            make_private(folder).map_err(std::io::Error::other)?;
+        }
+        let temporary = path.with_extension(format!(
+            "{}-{}.tmp",
+            std::process::id(),
+            WRITES.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = write_private(&temporary, source).and_then(|()| fs::rename(&temporary, path));
+        if written.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        written
+    };
+    attempt().or_else(|_| attempt())
 }
 
 /// The process that started this one, as `<pid>-<start time>`.
@@ -159,7 +438,7 @@ fn parent_agent() -> Option<String> {
         let process = system.process(parent)?;
         Some((
             parent.as_u32(),
-            process.start_time(),
+            started(&system, parent)?,
             process.name().to_string_lossy().into_owned(),
         ))
     })();
@@ -183,15 +462,47 @@ fn agent_running(agent: &str) -> bool {
     let Some((pid, start)) = agent.split_once('-') else {
         return false;
     };
-    let (Ok(pid), Ok(start)) = (pid.parse::<u32>(), start.parse::<u64>()) else {
+    let Ok(pid) = pid.parse::<u32>() else {
         return false;
     };
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
     refresh(&mut system, pid);
+    started(&system, pid).is_some_and(|started| started == start)
+}
+
+/// When `pid` started, as part of a record's name: it stays the same for
+/// the process's life, and a later process given the same id gets another.
+#[cfg(not(target_os = "linux"))]
+fn started(system: &System, pid: Pid) -> Option<String> {
     system
         .process(pid)
-        .is_some_and(|process| process.start_time() == start)
+        .map(|process| process.start_time().to_string())
+}
+
+/// On Linux, sysinfo's start time is the boot time plus the time since
+/// boot, and the boot time it reads moves whenever the clock is set (after
+/// a suspend, say), so the same process could later read as another. The
+/// time since boot, in clock ticks, doesn't move; the boot's id tells it
+/// from a process that started as long after a later boot.
+#[cfg(target_os = "linux")]
+fn started(_: &System, pid: Pid) -> Option<String> {
+    let ticks = start_ticks(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?;
+    Some(
+        match fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+            Ok(boot) => format!("{ticks}-{}", boot.trim()),
+            Err(_) => ticks.to_string(),
+        },
+    )
+}
+
+/// The start time (field 22) in a `/proc/<pid>/stat` line. The program's
+/// name (field 2) can hold spaces and parentheses, so fields are counted
+/// from the last `)`.
+#[cfg(any(target_os = "linux", test))]
+fn start_ticks(stat: &str) -> Option<u64> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields.split_whitespace().nth(19)?.parse().ok()
 }
 
 fn refresh(system: &mut System, pid: Pid) {
@@ -256,7 +567,20 @@ fn open_lock(record: &Path) -> std::io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(record.with_extension("lock"))
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Others can read and write it while it's open, but not remove or
+        // rename it: by default Windows would remove its name at once,
+        // while servers still hold it, and the next server would make a
+        // new one and clear the running agent's taint. Every server opens
+        // it this way, asking only to read and write it, so they can all
+        // hold it together.
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    no_follow(&mut options).open(record.with_extension("lock"))
 }
 
 /// A folder only this user can read or write, made if needed.
@@ -272,7 +596,18 @@ fn private_folder() -> Option<PathBuf> {
     let mut problems = Vec::new();
     for folder in candidates {
         match make_private(&folder) {
-            Ok(()) => return Some(folder),
+            Ok(()) => {
+                // Servers of the agent that can use a better folder share
+                // there instead, without this one.
+                if !problems.is_empty() {
+                    warn!(
+                        folder = %folder.display(),
+                        "{}; taint is shared only with the agent's servers that use this same folder",
+                        problems.join("; ")
+                    );
+                }
+                return Some(folder);
+            }
             Err(problem) => problems.push(problem),
         }
     }
@@ -360,15 +695,31 @@ fn make_private(folder: &Path) -> Result<(), String> {
     }
 }
 
+/// Writes `text` to a new file at `path` that only this user can read. If
+/// anything is already there, even a link, nothing is written: each
+/// temporary file's name is used once, so something else put it there.
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(text.as_bytes())
+    no_follow(&mut options)
+        .open(path)?
+        .write_all(text.as_bytes())
+}
+
+/// Opens a file without following a link in its place, where the system
+/// allows it.
+fn no_follow(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+    }
+    options
 }
 
 /// Removes what agents that are gone left behind, once untouched for
@@ -418,14 +769,14 @@ fn remove_unless_running(record: &Path) {
 mod tests {
     use super::*;
 
-    /// A folder for one test's records.
+    /// A private folder for one test's records.
     fn folder(test: &str) -> PathBuf {
         let folder = std::env::temp_dir().join(format!(
             "mcp-mandate-agent-taint-{}-{test}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&folder);
-        fs::create_dir_all(&folder).unwrap();
+        make_private(&folder).unwrap();
         folder
     }
 
@@ -449,6 +800,25 @@ mod tests {
         assert_eq!(second.get(), None);
         first.set("the output of tool `fetch`");
         assert_eq!(second.get().as_deref(), Some("the output of tool `fetch`"));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_record_that_cant_be_written_is_reported() {
+        let folder = folder("unwritable");
+        let written = AgentTaint::at(folder.join("taint-test"));
+        assert!(written.set("the output of tool `fetch`"));
+        drop(written);
+
+        // A file where the record's folder should be: neither writing the
+        // record nor making the folder again can work.
+        let blocked = folder.join("blocked");
+        fs::write(&blocked, "").unwrap();
+        let taint = AgentTaint::at(blocked.join("taint-test"));
+        assert!(!taint.set("the output of tool `fetch`"));
+        // This server still counts as tainted.
+        assert!(taint.get().is_some());
+        drop(taint);
         let _ = fs::remove_dir_all(&folder);
     }
 
@@ -479,15 +849,152 @@ mod tests {
     }
 
     #[test]
+    fn a_record_that_cant_be_put_back_is_reported() {
+        let folder = folder("lost");
+        let records = folder.join("records");
+        let path = records.join("taint-test");
+        let taint = AgentTaint::at(path.clone());
+        assert!(taint.set("the output of tool `fetch`"));
+        assert!(taint.reshare("the output of tool `fetch`"));
+
+        // The record's folder goes, and can't be made again (a file is in
+        // its place): this server still counts as tainted, but its taint
+        // isn't shared.
+        fs::remove_dir_all(&records).unwrap();
+        fs::write(&records, "").unwrap();
+        assert!(taint.get().is_some());
+        assert!(!taint.reshare("the output of tool `fetch`"));
+
+        // Once it can be, the record is put back.
+        fs::remove_file(&records).unwrap();
+        assert!(taint.reshare("the output of tool `fetch`"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "the output of tool `fetch`"
+        );
+        drop(taint);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// Whether `path` was touched less than [`TOUCH`] ago.
+    fn recent(path: &Path) -> bool {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age < TOUCH))
+    }
+
+    /// Whether `condition` holds within 10 seconds.
+    fn eventually(condition: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[test]
+    fn a_server_that_saw_the_taint_keeps_its_record() {
+        let folder = folder("kept");
+        let path = folder.join("taint-test");
+        let reader = AgentTaint {
+            check: Duration::from_millis(10),
+            ..AgentTaint::at(path.clone())
+        };
+        reader.set("the output of tool `fetch`");
+
+        // Removed: put back without waiting for a server to ask for it.
+        fs::remove_file(&path).unwrap();
+        assert!(eventually(|| path.exists()), "the record is put back");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "the output of tool `fetch`"
+        );
+
+        // Old: touched, so cleaners of old files leave it alone.
+        age(&path);
+        assert!(eventually(|| recent(&path)), "the record is touched");
+
+        // Once the server stops, so does keeping the record.
+        drop(reader);
+        fs::remove_file(&path).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// Something else at a record's or a temporary file's name, such as a
+    /// link to another of this user's files, is never written through.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_is_never_written_through_a_link() {
+        let folder = folder("link");
+        let target = folder.join("target");
+        fs::write(&target, "keep").unwrap();
+        let temporary = folder.join("taint-test.1-0.tmp");
+        std::os::unix::fs::symlink(&target, &temporary).unwrap();
+        assert!(write_private(&temporary, "the output of tool `fetch`").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+
+        // A record that's a link is replaced by a file.
+        let record = folder.join("taint-test");
+        std::os::unix::fs::symlink(&target, &record).unwrap();
+        keep_record(&record, "the output of tool `fetch`").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+        assert!(fs::symlink_metadata(&record).unwrap().is_file());
+        assert_eq!(
+            fs::read_to_string(&record).unwrap(),
+            "the output of tool `fetch`"
+        );
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// The folder is checked before every write: one another user could
+    /// use isn't written to.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_is_written_only_in_a_private_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = folder("open-write");
+        let open = folder.join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(write_record(&open.join("taint-test"), "the output of tool `fetch`").is_err());
+        assert_eq!(fs::read_dir(&open).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn the_start_time_is_read_after_the_programs_name() {
+        let stat = "1234 (my (odd) name) S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 100";
+        assert_eq!(start_ticks(stat), Some(98765));
+        assert_eq!(start_ticks("1234 (short) S 1"), None);
+    }
+
+    /// The agent's start time can't move with the clock, or its record
+    /// would later count as another agent's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_start_time_counts_from_boot() {
+        let me = sysinfo::get_current_pid().unwrap();
+        let ticks = start_ticks(&fs::read_to_string("/proc/self/stat").unwrap()).unwrap();
+        let start = started(&System::new(), me).unwrap();
+        assert!(start.starts_with(&format!("{ticks}-")), "{start}");
+        assert!(agent_running(&format!("{me}-{start}")));
+    }
+
+    #[test]
     fn a_running_agents_record_is_kept_however_old() {
         let folder = folder("stale");
         let me = sysinfo::get_current_pid().unwrap();
         let mut system = System::new();
         refresh(&mut system, me);
-        let start = system.process(me).unwrap().start_time();
+        let start = started(&system, me).unwrap();
         let running = folder.join(format!("taint-{}-{start}", me.as_u32()));
-        let recycled = folder.join(format!("taint-{}-{}", me.as_u32(), start + 1));
-        let fresh_gone = folder.join(format!("taint-{}-{}", me.as_u32(), start + 2));
+        let recycled = folder.join(format!("taint-{}-1{start}", me.as_u32()));
+        let fresh_gone = folder.join(format!("taint-{}-2{start}", me.as_u32()));
         let left = folder.join("taint-1-0.123.tmp");
         for path in [&running, &recycled, &fresh_gone, &left] {
             fs::write(path, "the output of tool `fetch`").unwrap();
@@ -511,19 +1018,13 @@ mod tests {
     fn a_named_agents_taint_lasts_while_any_of_its_servers_runs() {
         let folder = folder("named");
         let path = folder.join("taint-named-test");
-        let first = AgentTaint {
-            _running: join_named(&path),
-            ..AgentTaint::at(path.clone())
-        };
-        assert!(first._running.is_some());
+        let first = AgentTaint::join(path.clone(), CHECK);
+        assert!(first.running.is_some());
         first.set("the output of tool `fetch`");
 
         // A second server joins while the first runs: the taint holds,
         // however old, and cleanup leaves it alone.
-        let second = AgentTaint {
-            _running: join_named(&path),
-            ..AgentTaint::at(path.clone())
-        };
+        let second = AgentTaint::join(path.clone(), CHECK);
         age(&path);
         remove_stale(&folder);
         assert!(second.get().is_some());
@@ -533,10 +1034,7 @@ mod tests {
 
         // Once none runs, the next session starts clean.
         drop(second);
-        let next = AgentTaint {
-            _running: join_named(&path),
-            ..AgentTaint::at(path.clone())
-        };
+        let next = AgentTaint::join(path.clone(), CHECK);
         assert_eq!(next.get(), None);
         next.set("the output of tool `fetch`");
         drop(next);
@@ -545,6 +1043,163 @@ mod tests {
         age(&path);
         remove_stale(&folder);
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// A cleaner of old files that removed the lock file while servers hold
+    /// it would let the next server clear the running agent's taint.
+    #[test]
+    fn a_named_server_keeps_its_lock_file_from_looking_old() {
+        let folder = folder("lock");
+        let path = folder.join("taint-named-test");
+        let lock = path.with_extension("lock");
+
+        // Touched whenever the record is checked.
+        let server = AgentTaint::join(path.clone(), CHECK);
+        age(&lock);
+        assert_eq!(server.get(), None);
+        assert!(recent(&lock), "touched when the record is checked");
+        drop(server);
+
+        // And meanwhile, though this server hasn't seen the taint.
+        let server = AgentTaint::join(path.clone(), Duration::from_millis(10));
+        assert!(server.running.is_some());
+        age(&lock);
+        assert!(eventually(|| recent(&lock)), "touched while it runs");
+
+        // Once the server stops, so does touching it.
+        drop(server);
+        age(&lock);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!recent(&lock));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// Whether a running server holds the lock file at `path`.
+    #[cfg(unix)]
+    fn locked(path: &Path) -> bool {
+        File::open(path).is_ok_and(|file| matches!(file.try_lock(), Err(TryLockError::WouldBlock)))
+    }
+
+    /// A lock file removed while the agent runs, alone or with its folder
+    /// (as a runtime folder is at logout, made again at the next login), or
+    /// replaced by another, is made and locked again, so a server started
+    /// afterwards doesn't clear the running agent's taint.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_server_locks_its_lock_file_again_once_its_removed() {
+        let folder = folder("relock");
+        let records = folder.join("records");
+        make_private(&records).unwrap();
+        let path = records.join("taint-named-test");
+        let lock = path.with_extension("lock");
+        // It hasn't seen the taint, so only its lock keeps the record.
+        let server = AgentTaint::join(path.clone(), Duration::from_millis(10));
+        let running = server.running.as_ref().unwrap();
+        assert!(locked(&lock));
+
+        fs::remove_file(&lock).unwrap();
+        assert!(eventually(|| locked(&lock)), "locked again once removed");
+
+        // Removed, and the file it holds can't be read any more (stale, on
+        // a network drive, once another computer removed it): the lock file
+        // is still made and locked again.
+        let mut held = running.lock().unwrap();
+        fs::remove_file(&lock).unwrap();
+        let stale = std::io::Error::from(nix::errno::Errno::ESTALE);
+        follow_lock_from(&path, Err(stale), &mut held).unwrap();
+        assert!(
+            locked(&lock),
+            "locked again though the old one can't be read"
+        );
+
+        // Replaced, and the file it holds can't be read: another computer
+        // removed it and a server started there made a new one. That new
+        // file is locked.
+        fs::remove_file(&lock).unwrap();
+        fs::write(&lock, "").unwrap();
+        assert!(!locked(&lock));
+        let stale = std::io::Error::from(nix::errno::Errno::ESTALE);
+        follow_lock_from(&path, Err(stale), &mut held).unwrap();
+        assert!(
+            locked(&lock),
+            "locks the file in its place though the old one can't be read"
+        );
+        drop(held);
+
+        // Removed, and made again by a server that starts before the keeper
+        // checks: the new file is locked as well, once the keeper does.
+        let paused = running.lock().unwrap();
+        fs::remove_file(&lock).unwrap();
+        drop(AgentTaint::join(path.clone(), CHECK));
+        assert!(!locked(&lock));
+        drop(paused);
+        assert!(
+            eventually(|| locked(&lock)),
+            "locks the file made in its place"
+        );
+        // So once a server that saw the taint puts the record back, a
+        // server starting now keeps it.
+        write_record(&path, "the output of tool `fetch`").unwrap();
+        let next = AgentTaint::join(path.clone(), CHECK);
+        assert_eq!(next.get().as_deref(), Some("the output of tool `fetch`"));
+        drop(next);
+
+        // The folder goes and can't be made again for a while (a file is
+        // in its place). The keeper waits while it's swapped.
+        let paused = running.lock().unwrap();
+        fs::remove_dir_all(&records).unwrap();
+        fs::write(&records, "").unwrap();
+        drop(paused);
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Then it's made again, and a server that saw the taint puts the
+        // record back.
+        let paused = running.lock().unwrap();
+        fs::remove_file(&records).unwrap();
+        make_private(&records).unwrap();
+        write_record(&path, "the output of tool `fetch`").unwrap();
+        drop(paused);
+        assert!(
+            eventually(|| locked(&lock)),
+            "locked again once its folder is back"
+        );
+
+        // A server starting now sees the agent running.
+        let next = AgentTaint::join(path.clone(), CHECK);
+        assert_eq!(next.get().as_deref(), Some("the output of tool `fetch`"));
+
+        // No lock is left behind once they stop.
+        drop(server);
+        drop(next);
+        assert!(!locked(&lock));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// On Windows a running server's lock file can't be removed or renamed
+    /// (by hand, with its folder, say), so a server started meanwhile can't
+    /// make a new one and clear the running agent's taint.
+    #[cfg(windows)]
+    #[test]
+    fn a_named_servers_lock_file_stays_while_it_runs() {
+        let folder = folder("held");
+        let path = folder.join("taint-named-test");
+        let lock = path.with_extension("lock");
+        let server = AgentTaint::join(path.clone(), CHECK);
+        assert!(server.running.is_some());
+        server.set("the output of tool `fetch`");
+
+        assert!(fs::remove_file(&lock).is_err());
+        assert!(fs::rename(&lock, folder.join("moved")).is_err());
+        assert!(lock.exists());
+        // A server starting now sees the agent running.
+        let next = AgentTaint::join(path.clone(), CHECK);
+        assert_eq!(next.get().as_deref(), Some("the output of tool `fetch`"));
+
+        // Once none runs, it can be.
+        drop(server);
+        drop(next);
+        fs::remove_file(&lock).unwrap();
         let _ = fs::remove_dir_all(&folder);
     }
 
