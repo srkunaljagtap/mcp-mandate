@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
       # A dated nightly, so a run can be repeated exactly.
       - run: rustup toolchain install nightly-2026-10-01 --profile minimal
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-fuzz@0.13.2
       # Fails if fuzz/Cargo.lock is out of date, so only the reviewed
