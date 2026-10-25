@@ -1085,6 +1085,13 @@ async fn open_stream(
         return session_ended();
     }
     if response.status() == reqwest::StatusCode::NOT_FOUND && upstream_id.is_some() {
+        if !session.has_streamed() {
+            // A server that never opened a stream may serve no `GET` at
+            // all, and many answer one with `404` rather than `405`
+            // (Express's default): the session goes on over `POST`, which
+            // finds out if the server forgot it.
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
         // The server forgot the session (see `post_message`): a client that
         // only listens learns here that it must start over.
         close_session(&app, &session);
@@ -1097,6 +1104,7 @@ async fn open_stream(
     if !response.status().is_success() || !is_event_stream(response.headers()) {
         return StatusCode::BAD_GATEWAY.into_response();
     }
+    session.note_streamed();
     stream(app, session, response, protocol, None, Some(slot), deadline)
 }
 

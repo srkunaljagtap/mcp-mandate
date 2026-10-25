@@ -264,16 +264,44 @@ mcp-mandate audit verify policy.audit.jsonl
   must name a pinned resource or fit a pinned template: `{name}` fills one
   path segment and `{+path}` several. No variable (alone, next to another,
   next to a dot, or after literal text such as `?path=`) can make a `.` or
-  `..` segment, plain or percent-encoded, that the template's own text
-  doesn't have, and no variable can hold a `.` or `..` between query
-  delimiters (`&`, `;`, `=`): `?path=&path=../secret.txt` is refused,
-  because a query parser reads it as a second `path`. No variable can hold
-  a space or another whitespace or control character unencoded, ASCII or
-  not (a tab, a no-break space, NEL), because URL parsers drop or trim
-  some of those (`.<tab>.` would be read as `..`), and so do servers that
-  trim text; percent-encode them (`%20`). A read refused for one of these
-  reasons says so and names the template it otherwise fits. Other template
-  operators match nothing.
+  `..` segment that the template's own text doesn't have, and no variable
+  can hold a `.` or `..` between query delimiters (`&`, `;`, `=`):
+  `?path=&path=../secret.txt` is refused, because a query parser reads it
+  as a second `path`. No variable can start with `/` or `\`, at its start
+  or after a query delimiter (`?path=x&path=/etc/passwd`), and no segment
+  of a variable can start with a drive such as `C:` (`docs/C:/Windows`),
+  because a server that joins it to a folder would read that path instead.
+  Nor can the variables make an empty segment (`//`) in the path, or a
+  segment that starts with a drive, that the template's own text doesn't
+  have. Right after `file://` a variable names the whole location and may
+  start anywhere (`file:///etc/passwd`), and where a file URI's path
+  starts (`file:///{+path}`, `file://localhost/{+path}`) it may start with
+  a drive (`file:///C:/Users/u/notes.txt`). Only `http`, `https`, `ws`,
+  `wss` and `file` URIs have a host, and no variable can change the host a
+  template names. Right after the host (`https://api.example.com{+path}`)
+  a variable must be empty or start with the path's own `/`, after which
+  the rules above apply (a file URI may have a drive there), so
+  `@evil.example/x` and `.evil.example/x` are refused. Inside a host, with
+  more of it after (`https://{tenant}.example.com`), a variable can hold
+  only letters and digits (`münchen` too), `-`, `.` and `_`, because URL
+  parsers differ on what else ends a host (Node's legacy `url.parse` ends
+  it at `;`, `|` or `%`), so percent-encoded host text is refused there,
+  and the host must keep to DNS's lengths (253 characters in all, 63 to a
+  label). After the host's `:` a variable must be a port number. A
+  variable that is the whole host, alone or with only a port after it
+  (`https://{host}/api`, `http://{host}:{port}/mcp`), lets the model
+  choose it, an IPv6 address such as `[::1]` too. Other schemes have no
+  host: `docs://page-{+p}` refuses `docs://page-/etc/passwd`. All of these
+  rules also apply to percent-encoded text, with spaces and invisible
+  characters taken off each segment's ends (`%20..` counts as `..`), and
+  `\` separates segments just as `/` does. No variable can hold
+  whitespace, a control character or U+FEFF unencoded, ASCII or not (a
+  tab, a no-break space, NEL), because URL parsers drop or trim some of
+  those (`.<tab>.` would be read as `..`), and so do servers that trim
+  text; percent-encode them (`%20`). Other invisible characters, such as
+  those inside emoji or the zero-width non-joiner in Persian, are fine in
+  names. A read refused for one of these reasons says so and names the
+  template it otherwise fits. Other template operators match nothing.
 - **Policy.** Each tool is allowed, held or denied (default: denied). When
   several rules match, the most restrictive wins. Denied tools are hidden
   from the model. A rule's `match` is a glob on the whole tool name (`*`,
@@ -415,7 +443,9 @@ mcp-mandate audit verify policy.audit.jsonl
   its request, a batch, a request it would have blocked and its answer, a
   server's sampling request, even one it can't read that a lenient client
   would still take for one), and a tool call whose tool can't be read
-  counts as one that reads untrusted content.
+  counts as one that reads untrusted content. A server message that can't
+  be parsed as JSON at all taints the session if its text names
+  `sampling/createMessage` anywhere.
 
 A blocked tool call comes back to the agent as a tool error that says why
 (for example, "Blocked by mcp-mandate: tool `x` changed since it was
@@ -469,13 +499,14 @@ Agents connect to `https://<gateway>/servers/<name>/mcp`. Start from
   credential elsewhere. A server that echoes the credential back gets it
   redacted, in either mode and whatever `[secrets] redact_responses` says,
   in replies and event streams alike, inside a resource's base64 `blob`
-  too. A message the gate can't check that holds it, or holds a `blob`, is
-  read as JSON and, if a key repeats or the credential has to come out,
-  written out again with one copy of each key; one that can't be read in
-  full that way, or would take too much memory to, doesn't pass (the
-  request it answers gets an error saying why). What's redacted: the whole
-  header value,
-  the token after its scheme, the client secret, and every
+  too. A message the gate can't check that holds it, or has a `blob`
+  member that could hold it encoded, is read as JSON and, if a key repeats
+  or the credential has to come out, written out again with one copy of
+  each key. One that can't be read in full that way, or would take too
+  much memory to, doesn't pass: the request it answers gets an error
+  saying why, a request from the server is answered with an error, and
+  anything else is dropped. What's redacted: the whole header value, the
+  token after its scheme, the client secret, and every
   client-credential token that may still be valid: until the expiry the
   token endpoint gave (`expires_in`), or for a day when it gave none, the
   16 newest at most. An event's id isn't a message, so the gate doesn't

@@ -72,6 +72,9 @@ pub struct Session {
     closed: watch::Sender<bool>,
     /// A check panicked, so the gate may be half-updated.
     broken: Arc<AtomicBool>,
+    /// The server has opened an event stream for this session at least
+    /// once, so it serves `GET`.
+    streamed: AtomicBool,
     requests: Arc<Semaphore>,
     messages: Arc<Semaphore>,
     streams: Arc<Semaphore>,
@@ -105,6 +108,7 @@ impl Session {
             last_used: Mutex::new(Instant::now()),
             closed: watch::Sender::new(false),
             broken: Arc::default(),
+            streamed: AtomicBool::new(false),
             requests: Arc::new(Semaphore::new(MAX_REQUESTS_PER_SESSION)),
             messages: Arc::new(Semaphore::new(MAX_MESSAGES_PER_SESSION)),
             streams: Arc::new(Semaphore::new(MAX_STREAMS_PER_SESSION)),
@@ -200,6 +204,16 @@ impl Session {
     /// Counts a new server stream; `None` when the session has too many.
     pub fn open_stream(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.streams).try_acquire_owned().ok()
+    }
+
+    /// Notes that the server opened an event stream for this session.
+    pub fn note_streamed(&self) {
+        self.streamed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the server has opened an event stream for this session.
+    pub fn has_streamed(&self) -> bool {
+        self.streamed.load(Ordering::SeqCst)
     }
 
     /// Counts an answer being sent to the server, once fewer than the most

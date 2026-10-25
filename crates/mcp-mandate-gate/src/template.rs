@@ -43,7 +43,10 @@
 //!   `https://{tenant}.example.com`), it holds only letters and digits
 //!   (`münchen` too), `-`, `.` and `_`: URL parsers differ on what else
 //!   ends a host (Node's legacy `url.parse` ends it at `;`, `|` or `%`), so
-//!   percent-encoded host text is refused too. After the host's `:`
+//!   percent-encoded host text is refused too. The host then keeps to
+//!   DNS's lengths (253 in all, 63 to a label): Node's legacy `url.parse`
+//!   empties a longer one, and `http.get` then goes to `localhost`. After
+//!   the host's `:`
 //!   (`https://localhost:{port}/api`) it is a port number. A variable that
 //!   is the whole host, alone or with only a port after it
 //!   (`https://{host}/api`, `http://{host}:{port}/mcp`), already lets the
@@ -109,6 +112,32 @@ const AFTER_HOST: &[char] = &['/', '\\', '?', '#'];
 /// any percent-encoded text, so decoding it can add nothing.
 fn in_host_name(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '-' | '.' | '_')
+}
+
+/// The longest host name DNS allows, and the longest label in one, counted
+/// in UTF-16 code units as JavaScript's `length` counts them.
+const MAX_HOST: usize = 253;
+const MAX_LABEL: usize = 63;
+
+/// Whether the host of `uri` (from `://` to its path, query or fragment,
+/// without a user name or port) keeps to DNS's lengths: at most
+/// [`MAX_HOST`] in all (a final `.` left out) and [`MAX_LABEL`] to a label.
+fn host_fits(uri: &str) -> bool {
+    let Some((_, rest)) = uri.split_once("://") else {
+        return true;
+    };
+    let authority = &rest[..rest.find(AFTER_HOST).unwrap_or(rest.len())];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    // A port follows the last `:`, unless that's inside an IPv6 address.
+    let host = match host.rsplit_once(':') {
+        Some((name, _)) if !host.starts_with('[') || name.ends_with(']') => name,
+        _ => host,
+    };
+    let length = |text: &str| text.chars().map(char::len_utf16).sum::<usize>();
+    let name = host.strip_suffix('.').unwrap_or(host);
+    length(name) <= MAX_HOST && name.split('.').all(|label| length(label) <= MAX_LABEL)
 }
 
 /// Whether `text`, a host's own text after a variable that has none
@@ -218,7 +247,7 @@ impl Misfit {
                 "a variable starts with `/` or `\\`, or makes a segment that starts with a drive such as `C:` or an empty `//` segment, which could reach outside the template"
             }
             Self::Host => {
-                "a variable could change the URI's host: right after the host it must be empty or start with `/`, within the host it can hold only letters, digits, `-`, `.` and `_` (nothing percent-encoded), and after the host's `:` it must be a port number"
+                "a variable could change the URI's host: right after the host it must be empty or start with `/`, within the host it can hold only letters, digits, `-`, `.` and `_` (nothing percent-encoded, and the host at most 253 characters, 63 to a label), and after the host's `:` it must be a port number"
             }
         }
     }
@@ -350,6 +379,12 @@ impl Template {
         // after a host could point the URI elsewhere (`@evil.example`).
         for ((_, place), raw) in variables.iter().zip(&values) {
             fits_place(raw, *place)?;
+        }
+        // A host a variable is part of keeps to DNS's lengths: Node's
+        // legacy `url.parse` empties a longer one, and its `http.get` then
+        // goes to `localhost`.
+        if variables.iter().any(|(_, place)| *place == Place::Host) && !host_fits(uri) {
+            return Err(Misfit::Host);
         }
         // Empty segments and drives are counted over the whole URI, like
         // dot segments: a variable can make an empty one at its edge
@@ -1148,6 +1183,44 @@ mod tests {
         ] {
             assert!(Template::parse(template).matches(uri), "{template} {uri}");
         }
+    }
+
+    #[test]
+    fn a_host_a_variable_is_part_of_keeps_to_dns_lengths() {
+        // Node's legacy `url.parse` empties a host longer than 255, and
+        // `http.get` then goes to `localhost`.
+        let template = Template::parse("http://{tenant}.example.com/v1");
+        let label = |length: usize| "a".repeat(length);
+        let long = [label(63), label(63), label(63), label(63)].join(".");
+        assert_eq!(
+            template.check(&format!("http://{long}.example.com/v1")),
+            Err(Misfit::Host)
+        );
+        assert_eq!(
+            template.check(&format!("http://{}.example.com/v1", label(64))),
+            Err(Misfit::Host)
+        );
+        // Counted as JavaScript counts: a letter outside the BMP is two.
+        assert_eq!(
+            template.check(&format!("http://{}.example.com/v1", "𝒶".repeat(32))),
+            Err(Misfit::Host)
+        );
+        assert!(template.matches(&format!("http://{}.example.com/v1", label(63))));
+        let longest = [label(63), label(63), label(63), label(49)].join(".");
+        assert!(template.matches(&format!("http://{longest}.example.com/v1")));
+        // With a user name and a port around it, only the host counts.
+        let template = Template::parse("http://user@{tenant}.example.com:8080/v1");
+        assert!(template.matches(&format!("http://user@{}.example.com:8080/v1", label(63))));
+        assert_eq!(
+            template.check(&format!("http://user@{}.example.com:8080/v1", label(64))),
+            Err(Misfit::Host)
+        );
+        // A template whose variables are all outside the host isn't held to
+        // it.
+        assert!(
+            Template::parse("https://api.example.com/{+path}")
+                .matches(&format!("https://api.example.com/{}", label(300)))
+        );
     }
 
     #[test]

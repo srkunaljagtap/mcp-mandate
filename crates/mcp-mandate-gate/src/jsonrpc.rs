@@ -183,7 +183,8 @@ pub fn batch_heads(frame: &[u8], mut each: impl FnMut(Option<Message>)) -> bool 
 /// read as infinity; a lone surrogate or a byte that isn't UTF-8, read as
 /// U+FFFD; another message after this one), what comes after it can't be
 /// read here, and could be another copy of `method`: then the name
-/// anywhere in the text, escapes written out, counts.
+/// anywhere in the text, escapes written out, counts, with or without the
+/// U+FFFD a byte that isn't UTF-8 becomes (a client may drop such bytes).
 pub fn names_sampling(frame: &[u8]) -> bool {
     let found = Cell::new(false);
     let mut deserializer = serde_json::Deserializer::from_slice(trim_json_whitespace(frame));
@@ -193,7 +194,15 @@ pub fn names_sampling(frame: &[u8]) -> bool {
     }
     .deserialize(&mut deserializer)
     .and_then(|()| deserializer.end());
-    found.get() || (read.is_err() && unescaped(frame).contains("sampling/createMessage"))
+    if found.get() {
+        return true;
+    }
+    if read.is_ok() {
+        return false;
+    }
+    const NAME: &str = "sampling/createMessage";
+    let text = unescaped(frame);
+    text.contains(NAME) || text.replace('\u{FFFD}', "").contains(NAME)
 }
 
 /// Whether reading `frame` in full would take no more memory than
@@ -1053,6 +1062,10 @@ mod tests {
             &b"{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"\xff\",\"method\":\"sampling/createMessage\"}"[..],
             b"[{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"\xff\",\"method\":\"sampling/createMessage\"}]",
             b"[\"\xff\",{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"sampling/createMessage\"}]",
+            // In the name itself, which a client that drops such bytes reads
+            // whole.
+            b"{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"sampling/create\xffMessage\"}",
+            b"{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":1e999,\"method\":\"sampling/create\xffMessage\"}",
         ] {
             let text = String::from_utf8_lossy(frame);
             assert!(names_sampling(frame), "{text}");

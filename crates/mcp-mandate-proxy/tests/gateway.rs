@@ -1994,19 +1994,42 @@ async fn a_client_that_only_listens_is_told_when_the_server_forgets_its_session(
     let world = world().await;
     let token = world.token("alice", json!({}));
     let session = world.initialize("gamma", &token).await;
-    // The server refuses the stream: it no longer has the session.
+    // Before the server has opened a stream for the session, a `404` may
+    // only mean it serves no `GET` (Express's default answer): the client
+    // is told so, and the session goes on.
+    let refused = world.resume_stream(&token, &session, "forgot").await;
+    assert_eq!(refused.status(), 405);
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let listed = world
+        .post("gamma", Some(&token), Some(&session), list)
+        .await;
+    assert_eq!(listed.status(), 200);
+    // Once it has opened one, it refuses the stream because it no longer
+    // has the session.
+    let streaming = world.resume_stream(&token, &session, "").await;
+    assert_eq!(streaming.status(), 200);
+    drop(streaming);
     let opened = world.resume_stream(&token, &session, "forgot").await;
     assert_eq!(opened.status(), 404);
     let text = opened.text().await.unwrap();
     assert!(text.contains("the MCP server ended the session"), "{text}");
     // The session is closed here too, so the client starts over.
-    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let lists = || {
+        world
+            .seen()
+            .iter()
+            .filter(|seen| seen.method == "tools/list")
+            .count()
+    };
+    let before = lists();
+    let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
     let listed = world
         .post("gamma", Some(&token), Some(&session), list)
         .await;
     assert_eq!(listed.status(), 404);
-    assert!(
-        !world.seen().iter().any(|seen| seen.method == "tools/list"),
+    assert_eq!(
+        lists(),
+        before,
         "the closed session sent nothing more to the server"
     );
     world.initialize("gamma", &token).await;

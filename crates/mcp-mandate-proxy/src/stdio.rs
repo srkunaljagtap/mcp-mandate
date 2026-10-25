@@ -174,11 +174,14 @@ fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
     let secret_option = is_option(word)
         && (secret_name(option_name(word))
             || split_option(word).is_some_and(|(_, _, value)| secret_property(value).is_some()));
+    let property = secret_property(word);
     // A URL, wherever it is in the word (`name@git+https://…`), unless it's
     // in a value masked as such (`DATABASE_URL=postgres://…`,
-    // `--token:https://…`).
-    let url = find_url(word)
-        .filter(|&(start, _)| start == 0 || (assignment(word).is_none() && !secret_option));
+    // `--token:https://…`), or the word sets a secret property, which masks
+    // it whole (`App;RepositoryUrl=https://…;Token=…`).
+    let url = find_url(word).filter(|&(start, _)| {
+        property.is_none() && (start == 0 || (assignment(word).is_none() && !secret_option))
+    });
     let (shown, run) = if let Some(url) = url {
         (without_credentials(word, url), Run::No)
     } else if let Some((name, separator, value)) = assignment(word) {
@@ -210,16 +213,16 @@ fn redact_word(word: &str, secrets: &SecretDetector) -> (String, Run) {
             ),
             _ => (word.to_owned(), Run::Value(1)),
         }
-    } else if let Some(value) = secret_property(word) {
+    } else if let Some(property) = property {
         // The rest of a property list, split off by a space in an earlier
         // value: `App;Password=value` in `/p:Title=My App;Password=value`.
         // Where the list started doesn't matter, so a word naming a secret
         // property among others is masked wherever it is. A quote before
-        // the property closes an earlier value's; one in its value opens it
-        // (`App";Password="a b"`).
+        // the property closes an earlier value's; one from its name on
+        // opens its value (`App";Password="a b"`, `App";"Password=a b"`).
         (
             MASK.to_owned(),
-            open_quote(value).map_or(Run::Rest, Run::Quote),
+            open_quote(property).map_or(Run::Rest, Run::Quote),
         )
     } else {
         (word.to_owned(), Run::No)
@@ -360,7 +363,8 @@ fn is_option(word: &str) -> bool {
 }
 
 /// Whether `value` sets a property named like a secret, and if so, `value`
-/// from that property's value on (the first such property's): MSBuild's
+/// from that property on (the first such property, with any quote before
+/// its name, as in `"Password=a b"`): MSBuild's
 /// `-p:` and `/p:` take a list of them, `Name=value` separated by `;` or
 /// `,`, and only the first name is in the option's own. A name is letters,
 /// digits, `_`, `-` and `.`, so a URL's query (`?api_key=…`) isn't taken
@@ -376,8 +380,8 @@ fn secret_property(value: &str) -> Option<&str> {
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
                 && secret_name(name)
         });
-        if let Some((name, _)) = secret {
-            return Some(&value[start + name.len() + 1..]);
+        if secret.is_some() {
+            return Some(&value[start..]);
         }
         // Past the property and the separator after it.
         start += property.len() + 1;
@@ -1512,6 +1516,28 @@ mod tests {
                 ]
             ),
             "sh -c dotnet run /p:Title=\"My *** ***\" server.csproj"
+        );
+        // Or a secret property quoted whole, the quote before its name.
+        assert_eq!(
+            shown(
+                "sh",
+                &[
+                    "-c",
+                    "dotnet build /p:Title=\"My App\";\"ApiToken=ab -cd\" server.csproj"
+                ]
+            ),
+            "sh -c dotnet build /p:Title=\"My *** ***\" server.csproj"
+        );
+        // A URL in an earlier value doesn't make the word a URL to show.
+        assert_eq!(
+            shown(
+                "dotnet",
+                &[
+                    "run",
+                    "/p:Title=My App;RepositoryUrl=https://github.com/acme/x;DeployToken=abcdef1234567",
+                ]
+            ),
+            "dotnet run /p:Title=My ***"
         );
         // A list with no secret in it is shown.
         assert_eq!(
