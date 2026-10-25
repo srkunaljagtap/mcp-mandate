@@ -16,7 +16,7 @@ RUN cargo build --release --locked --bin mcp-mandate \
  && cp target/release/mcp-mandate /mcp-mandate \
  && mkdir /audit
 
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
 # The release workflow adds labels for the source repository, the version
 # and the commit, and uses the repository's About text as the description.
 LABEL org.opencontainers.image.description="Scout reviews MCP servers before you trust them, a hash-chained audit log records every decision, and a security gate checks every call between AI agents and their MCP tools" \
