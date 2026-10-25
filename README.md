@@ -63,10 +63,10 @@ on any branch, would pass.
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify mcp-mandate-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify mcp-mandate-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo srkunaljagtap/mcp-mandate \
   --signer-workflow srkunaljagtap/mcp-mandate/.github/workflows/release.yml \
-  --source-ref refs/tags/v0.1.0 --deny-self-hosted-runners
+  --source-ref refs/tags/v0.2.0 --deny-self-hosted-runners
 ```
 
 The Windows binary isn't code-signed yet. SmartScreen may say "Windows
@@ -78,7 +78,7 @@ use mcp-mandate under WSL instead.
 **From source**, with [rustup](https://rustup.rs):
 
 ```sh
-cargo install --locked --git https://github.com/srkunaljagtap/mcp-mandate --tag v0.1.0 mcp-mandate
+cargo install --locked --git https://github.com/srkunaljagtap/mcp-mandate --tag v0.2.0 mcp-mandate
 ```
 
 **Container image** (linux/amd64), for the [HTTPS gateway](#the-https-gateway):
@@ -86,11 +86,11 @@ cargo install --locked --git https://github.com/srkunaljagtap/mcp-mandate --tag 
 ```sh
 docker run --rm -p 8443:8443 \
   -v "$PWD/config:/config:ro" -v mcp-mandate-audit:/audit \
-  ghcr.io/srkunaljagtap/mcp-mandate:0.1.0 gate --config /config/gateway.toml
-gh attestation verify oci://ghcr.io/srkunaljagtap/mcp-mandate:0.1.0 \
+  ghcr.io/srkunaljagtap/mcp-mandate:0.2.0 gate --config /config/gateway.toml
+gh attestation verify oci://ghcr.io/srkunaljagtap/mcp-mandate:0.2.0 \
   --repo srkunaljagtap/mcp-mandate \
   --signer-workflow srkunaljagtap/mcp-mandate/.github/workflows/release.yml \
-  --source-ref refs/tags/v0.1.0 --deny-self-hosted-runners
+  --source-ref refs/tags/v0.2.0 --deny-self-hosted-runners
 ```
 
 The image runs as a non-root user, with no shell. Mount the configuration

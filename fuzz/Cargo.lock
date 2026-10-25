@@ -1030,7 +1030,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-mandate-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nix",
  "same-file",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-gate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jsonschema",
  "mcp-mandate-audit",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-pin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "globset",
  "regex",
@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-taint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "regex",

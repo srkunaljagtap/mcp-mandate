@@ -1205,7 +1205,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-mandate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "dotenvy",
@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nix",
  "proptest",
@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-gate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jsonschema",
  "mcp-mandate-audit",
@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-pin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "globset",
  "proptest",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-scout"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mcp-mandate-pin",
  "mcp-mandate-policy",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-mandate-taint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "regex",
@@ -2037,9 +2037,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -2889,9 +2889,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
 ]
