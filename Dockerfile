@@ -6,7 +6,7 @@
 #   docker run --rm mcp-mandate --version
 
 # Base images are pinned by digest, so a rebuild uses exactly the same ones.
-FROM rust:1.99.1-trixie@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a AS build
+FROM rust:1.99.1-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137 AS build
 # The image's own toolchain is the one rust-toolchain.toml pins, so rustup
 # has nothing to download.
 ENV RUSTUP_TOOLCHAIN=1.99.1 CARGO_TERM_COLOR=never
