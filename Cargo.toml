@@ -34,7 +34,7 @@ hyper = { version = "1.12.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
 # No default features: they would let a server's schema `$ref` make the gate
 # fetch URLs or read local files.
-jsonschema = { version = "0.59.0", default-features = false }
+jsonschema = { version = "0.60.0", default-features = false }
 # Only the aws-lc-rs backend: the other one relies on the `rsa` crate, which
 # has an unfixed timing side channel (RUSTSEC-2023-0071).
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
